@@ -7,6 +7,7 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
+#include <cstdlib>
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "rccl_vector_types.h"
@@ -306,9 +307,9 @@ __global__ void NvlAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
 // (AlltoAllNvlCopySelect). Same constant bounds the NVL fast path in AlltoAllGinAdaptiveLocalCopy:
 // per-rank slices smaller than this use AlltoAllNvlCopyOptimized; larger slices use AlltoAllLsaCopy.
 constexpr size_t kAlltoAllPeerParallelByteThreshold = 128 * 1024;
-// Rank-slice bytes below which GinAdaptiveAlltoAllKernel uses one CTA (latency); larger uses
-// deviceCtaCount CTAs (see alltoall_perf -V).
-static constexpr size_t kAlltoAllSmallMessageRankSliceBytes = 128 * 1024;
+
+// GinAdaptiveAlltoAllKernel (-D 5) host launch: max per-peer rank slice for a single-CTA launch is
+// set at runtime via RCCL_GIN_1_CTA_MAX_KB (see rcclTestsGinAdaptiveSingleCtaMaxBytesFromEnv).
 
 // Hybrid GIN path: pipeline remote SDMA puts with local LSA copy. Larger chunks reduce
 // signal/wait rounds vs 1 MiB while keeping pipelining for overlap (tune with Anvil SDMA chunk env).
@@ -769,6 +770,21 @@ __global__ void GinAdaptiveAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffse
 #endif
 #endif
 
+// RCCL_GIN_1_CTA_MAX_KB: max per-peer rank slice (KiB) for which GinAdaptiveAlltoAll (-D 5) uses one
+// CTA. Unset → 16 KiB. 0 → always use deviceCtaCount (disable single-CTA path). Invalid → 16 KiB.
+static size_t rcclTestsGinAdaptiveSingleCtaMaxBytesFromEnv(void) {
+  const char* env = getenv("RCCL_GIN_1_CTA_MAX_KB");
+  const size_t kDefaultBytes = 16u * 1024u;
+  if (env == nullptr || env[0] == '\0') return kDefaultBytes;
+  char* end = nullptr;
+  long kb = strtol(env, &end, 0);
+  if (end == env || kb < 0) return kDefaultBytes;
+  if (kb == 0) return 0;
+  const long kMaxKb = 1024L * 1024L;
+  if (kb > kMaxKb) kb = kMaxKb;
+  return (size_t)kb * 1024u;
+}
+
 testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
   if (deviceImpl == 0) {
     char* sptr = (char*)sendbuff + sendoffset;
@@ -832,8 +848,9 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
         ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
         size_t rankSliceBytes = count * wordSize(type);
-        // Latency-bound slices: one CTA avoids 16x LSA barrier tax; large slices keep peer striping.
-        int ctas = (rankSliceBytes < kAlltoAllSmallMessageRankSliceBytes) ? 1 : deviceCtaCount;
+        // RCCL_GIN_1_CTA_MAX_KB (KiB): max per-peer slice for single-CTA launch; see rcclTestsGinAdaptiveSingleCtaMaxBytesFromEnv.
+        size_t max1CtaBytes = rcclTestsGinAdaptiveSingleCtaMaxBytesFromEnv();
+        int ctas = (max1CtaBytes > 0 && rankSliceBytes <= max1CtaBytes) ? 1 : deviceCtaCount;
         constexpr int kGinAdaptiveThreads = 512;
         ginAdaptiveKernel<<<ctas, kGinAdaptiveThreads, 0, stream>>>(
             sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
