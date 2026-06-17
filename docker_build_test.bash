@@ -20,6 +20,8 @@ TARGET_GPU_ARCH=${5:-gfx950}
 
 DOCKERFILE="Dockerfile-rccl-gin-anvil"
 DOCKER_IMAGE="gin-anvil:latest"
+# Dockerfile USE_LOCAL_SRC: 1 = COPY projects/* from build context; 0 = clone sparse checkout in image.
+USE_LOCAL_SRC="${USE_LOCAL_SRC:-1}"
 
 # Derived sizes / shared docker+mpirun settings (expand on host, not inside container).
 MAX_BYTES=$((${NP} * ${MSG_SIZE}))
