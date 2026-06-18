@@ -189,8 +189,9 @@ fi
 
 if [ 1 -eq 1 ]; then
 #####
-# RCCL AlltoAll: -D 2, GIN host proxy (NCCL_GIN_TYPE=2, intra-node only)
-echo "=== Test#4: RCCL AlltoAll: -D 2, GIN host proxy (NCCL_GIN_TYPE=2, intra-node only) np=${NP} max_bytes=${MAX_BYTES} ==="
+# RCCL AlltoAll: -D 3 (GinAlltoAllKernel), GIN host proxy (NCCL_GIN_TYPE=2). IB must stay enabled
+# so built-in ncclGinIb can initialize; NCCL_IB_DISABLE=1 yields ginType NONE and -D 3 fails AlltoAllCommHasGin.
+echo "=== Test#4: RCCL AlltoAll: -D 3, GIN host proxy (NCCL_GIN_TYPE=2, IB for plugin init) np=${NP} max_bytes=${MAX_BYTES} ==="
 set -x
 docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   mpirun ${MPIRUN_BASE} \
@@ -199,7 +200,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x RCCL_ROCSHMEM_ENABLE=0 \
   -x NCCL_GIN_ENABLE=1 \
   -x NCCL_GIN_TYPE=2 \
-  -x NCCL_IB_DISABLE=1 \
+  -x NCCL_IB_DISABLE=0 \
   -x NCCL_DEBUG_SUBSYS=INIT,NET \
   -x NCCL_CUMEM_ENABLE=1 \
   -x RCCL_ENABLE_INTRANET=1 \
