@@ -213,7 +213,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->ginSignalCount = deviceCtaCount;
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       return testSuccess;
-    case 5: // GinAdaptiveAlltoAllKernel (LSA small intra-node; GIN/Anvil SDMA large intra-node; hybrid inter-node)
+    case 5: // GinAdaptiveAlltoAllKernel (LSA-only intra-node + hybrid inter-node)
       if (!AlltoAllCommHasGin(commProperties)) {
         fprintf(stderr,
                 "This test requires GIN support, but ncclCommQueryProperties reports no GIN type "
@@ -222,8 +222,11 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
                 "Built-in GIN in gin-anvil is usually NCCL_GIN_TYPE=4 or 5.\n");
         return testInternalError;
       }
-      // Single- and multi-node: hybrid devComm (signals + world barriers) for gin.put / wait / flush.
-      AlltoAllSetGinHybridDevCommReqs(reqs);
+      if (commProperties->nLsaTeams == 1) {
+        AlltoAllSetSingleNodeTransportDevCommReqs(reqs);
+      } else {
+        AlltoAllSetGinHybridDevCommReqs(reqs);
+      }
       return testSuccess;
     default:
       return testNotImplemented;
@@ -255,7 +258,7 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
       reqs->ginSignalCount = deviceCtaCount;
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       return true;
-    case 5: // GinAdaptive: hybrid devComm (Track C intra-node SDMA uses signals + world barriers)
+    case 5: // GinAdaptiveAlltoAllKernel (LSA-only intra-node + hybrid inter-node)
       reqs->ginContextCount = 1;
       reqs->lsaBarrierCount = deviceCtaCount;
       reqs->barrierCount = deviceCtaCount;
@@ -305,8 +308,6 @@ __global__ void NvlAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
 // per-rank slices smaller than this use AlltoAllNvlCopyOptimized; larger slices use AlltoAllLsaCopy.
 constexpr size_t kAlltoAllPeerParallelByteThreshold = 128 * 1024;
 
-// GinAdaptive (-D 5) single-node: below this per-peer rank slice uses LSA/NVL copy; at or above uses
-// Track C (gin.put / Anvil SDMA). Host launch also reads RCCL_GIN_1_CTA_MAX_KB for CTA count.
 // Hybrid GIN path: pipeline remote SDMA puts with local LSA copy. Larger chunks reduce
 // signal/wait rounds vs 1 MiB while keeping pipelining for overlap (tune with Anvil SDMA chunk env).
 constexpr size_t kAlltoAllGinPipelineChunkBytes = 4 << 20;
@@ -636,68 +637,6 @@ __device__ __forceinline__ void AlltoAllHybridGinPipelined(ncclGin& gin, ncclTea
   }
 }
 
-// Track C: single-node all-to-all using gin.put (Anvil SDMA) to every peer != myRank, plus local
-// diagonal copy. Mirrors hybrid pipelining (chunk size kAlltoAllGinPipelineChunkBytes).
-template <typename T>
-__device__ __forceinline__ void AlltoAllGinPutIntraAllPeersSlice(ncclGin& gin, ncclTeam world, int myRank,
-    ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
-    size_t rankSliceBytes, size_t sliceOff, size_t sliceBytes, int tid, int nthreads,
-    unsigned int signalIndex) {
-  for (int r = tid; r < world.nRanks; r += nthreads) {
-    if (r == myRank) continue;
-    gin.put(world, r,
-        recvwin, recvoffset + (size_t)myRank * rankSliceBytes + sliceOff,
-        sendwin, sendoffset + (size_t)r * rankSliceBytes + sliceOff,
-        sliceBytes, ncclGin_SignalInc{signalIndex});
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ void AlltoAllCopySelfSlice(ncclWindow_t sendwin, size_t sendoffset,
-    ncclWindow_t recvwin, size_t recvoffset, size_t count, size_t elemOff, size_t elemLen,
-    int myRank, int tid, int nthreads) {
-  T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-  T* recvLocal = (T*)ncclGetLocalPointer(recvwin, recvoffset);
-  T* s = sendLocal + myRank * count + elemOff;
-  T* d = recvLocal + myRank * count + elemOff;
-  for (size_t i = tid; i < elemLen; i += nthreads)
-    d[i] = s[i];
-}
-
-template <typename T>
-__device__ __forceinline__ void AlltoAllIntraNodeSdmaPipelined(ncclGin& gin, ncclTeam world, int myRank,
-    ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count,
-    int tid, int nthreads, unsigned int signalIndex, unsigned int blockIdx_x, unsigned int gridDim_x,
-    unsigned int blockDim_x) {
-  (void)gridDim_x;
-  const size_t rankSliceBytes = count * sizeof(T);
-  if (rankSliceBytes <= kAlltoAllGinPipelineChunkBytes) {
-    AlltoAllGinPutIntraAllPeersSlice<T>(gin, world, myRank, sendwin, sendoffset, recvwin, recvoffset,
-        rankSliceBytes, 0, rankSliceBytes, tid, nthreads, signalIndex);
-    if (blockIdx_x == 0) {
-      int selfTid = (int)(tid - blockIdx_x * blockDim_x);
-      AlltoAllCopySelfSlice<T>(sendwin, sendoffset, recvwin, recvoffset, count, 0, count, myRank, selfTid,
-                               (int)blockDim_x);
-    }
-    return;
-  }
-
-  size_t elemPerChunk = kAlltoAllGinPipelineChunkBytes / sizeof(T);
-  if (elemPerChunk == 0) elemPerChunk = 1;
-  for (size_t elemOff = 0; elemOff < count; elemOff += elemPerChunk) {
-    size_t elemLen = min(elemPerChunk, count - elemOff);
-    size_t sliceBytes = elemLen * sizeof(T);
-    size_t sliceOff = elemOff * sizeof(T);
-    AlltoAllGinPutIntraAllPeersSlice<T>(gin, world, myRank, sendwin, sendoffset, recvwin, recvoffset,
-        rankSliceBytes, sliceOff, sliceBytes, tid, nthreads, signalIndex);
-    if (blockIdx_x == 0) {
-      int selfTid = (int)(tid - blockIdx_x * blockDim_x);
-      AlltoAllCopySelfSlice<T>(sendwin, sendoffset, recvwin, recvoffset, count, elemOff, elemLen, myRank,
-                               selfTid, (int)blockDim_x);
-    }
-  }
-}
-
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   constexpr int ginContext = 0;
@@ -778,9 +717,10 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
 }
 
 // Device implementation #5 - adaptive GIN alltoall:
-//   single-node small: LSA barriers + NVL-style copy (no gin.put).
-//   single-node large (Track C): world GIN barriers + pipelined gin.put to all peers + self slice.
+//   single-node (all LSA peers): LSA barriers + NVL-style copy (no gin.put for bulk data).
 //   multi-node: hybrid GIN puts for remote peers + LSA copy for local peers (like -D 4).
+// Note: A naive single-node gin.put/SDMA path for all peers was tried and regressed bandwidth badly
+// (signal latency, few SDMA channels vs bisection). Prefer NVL here; tune Anvil in librccl for Put-heavy workloads.
 template <typename T>
 __global__ void GinAdaptiveAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   ncclTeam world = ncclTeamWorld(devComm);
@@ -794,40 +734,15 @@ __global__ void GinAdaptiveAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffse
   int nthreads = blockDim.x * gridDim.x;
 
   if (allLocal) {
-    const size_t rankSliceBytes = count * sizeof(T);
-    if (rankSliceBytes < kAlltoAllPeerParallelByteThreshold) {
-      ncclLsaBarrierSession<ncclCoopCta> lsaBar {
-        ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x};
-      lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar {
+      ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x};
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
-      AlltoAllGinAdaptiveLocalCopy<T>(sendwin, sendoffset, recvwin, recvoffset, count,
-                                      world.rank, startLsa, lsa.nRanks, world.rank, world.nRanks,
-                                      blockIdx.x, gridDim.x, tid, nthreads);
+    AlltoAllGinAdaptiveLocalCopy<T>(sendwin, sendoffset, recvwin, recvoffset, count,
+                                    world.rank, startLsa, lsa.nRanks, world.rank, world.nRanks,
+                                    blockIdx.x, gridDim.x, tid, nthreads);
 
-      lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
-      return;
-    }
-
-    // Track C: intra-node Anvil SDMA puts for large per-peer slices.
-    int ginContext = (devComm.ginContextCount > 0) ? (blockIdx.x % devComm.ginContextCount) : 0;
-    ncclGin gin { devComm, ginContext };
-    unsigned int signalIndex = 0;
-    uint64_t signalValue = gin.readSignal(signalIndex);
-
-    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-
-    const size_t size = count * sizeof(T);
-    const int numInboundPeers = world.nRanks - 1;
-    int numChunks = (int)((size + kAlltoAllGinPipelineChunkBytes - 1) / kAlltoAllGinPipelineChunkBytes);
-    int totalSignals = numInboundPeers * numChunks;
-    AlltoAllIntraNodeSdmaPipelined<T>(gin, world, world.rank, sendwin, sendoffset, recvwin, recvoffset,
-                                      count, tid, nthreads, signalIndex, blockIdx.x, gridDim.x, blockDim.x);
-
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + totalSignals);
-    gin.flush(ncclCoopCta());
-
-    bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
     return;
   }
 
