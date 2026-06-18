@@ -60,6 +60,13 @@ RCCL_ENV_COMMON="-x HSA_FORCE_FINE_GRAIN_PCIE=1 -x NCCL_DEBUG=VERSION"
 # GIN_HOST_USE_EXTERNAL_PLUGIN=1 so we do not pass NCCL_GIN_PLUGIN=none.
 # GIN_ANVIL is NCCL_GIN_TYPE=5 (built-in); no IB needed. Skip host-proxy stanzas with RUN_GIN_HOST_PROXY=0.
 
+# NCCL_GIN_TYPE=2 + -D 3: without this, RCCL tries libnccl-gin.so first; a mismatched image DSO can prevent
+# built-in ncclGinIb from assigning → ncclCommQueryProperties ginType/railedGinType stay NONE and alltoall_perf fails.
+NCCL_GIN_PROXY_PLUGIN_MPIRUN=()
+if [[ "${GIN_HOST_USE_EXTERNAL_PLUGIN:-}" != 1 ]]; then
+  NCCL_GIN_PROXY_PLUGIN_MPIRUN=(-x NCCL_GIN_PLUGIN=none)
+fi
+
 # rccl-tests alltoall_perf: -R is local_register (0=off, 1=local, 2=symmetric ncclCommWindowRegister).
 # common.cu requires -R 2 whenever -D>0 (device/GIN kernels use ncclWindow_t from symmetric collective windows).
 # GIN_ANVIL (NCCL_GIN_TYPE=5, -D 5) relies on that path; use the same -R for host -D 0 baselines so large-message
@@ -200,6 +207,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x RCCL_ROCSHMEM_ENABLE=0 \
   -x NCCL_GIN_ENABLE=1 \
   -x NCCL_GIN_TYPE=2 \
+  "${NCCL_GIN_PROXY_PLUGIN_MPIRUN[@]}" \
   -x NCCL_IB_DISABLE=0 \
   -x NCCL_DEBUG_SUBSYS=INIT,NET \
   -x NCCL_CUMEM_ENABLE=1 \
@@ -227,6 +235,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x RCCL_ROCSHMEM_ENABLE=0 \
   -x NCCL_GIN_ENABLE=1 \
   -x NCCL_GIN_TYPE=2 \
+  "${NCCL_GIN_PROXY_PLUGIN_MPIRUN[@]}" \
   -x NCCL_IB_DISABLE=0 \
   -x NCCL_DEBUG_SUBSYS=INIT,NET \
   -x NCCL_CUMEM_ENABLE=1 \
