@@ -157,6 +157,15 @@ static inline void AlltoAllSetSingleNodeTransportDevCommReqs(ncclDevCommRequirem
   reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 }
 
+// GinAlltoAllKernel when all ranks share one LSA team (numRemotePeers==0) only uses LSA barriers +
+// NVL-style copy; it never touches GIN. Do not request GIN transport so ncclDevCommCreate succeeds
+// when NCCL_GIN_TYPE=2 (IB proxy) has no HCAs in-container and globalGinSupport stays NONE.
+static inline void AlltoAllSetSingleNodeGinKernelLsaOnlyReqs(ncclDevCommRequirements* reqs) {
+  reqs->lsaBarrierCount = deviceCtaCount;
+  reqs->ginContextCount = 0;
+  reqs->ginConnectionType = NCCL_GIN_CONNECTION_NONE;
+}
+
 static inline void AlltoAllSetGinHybridDevCommReqs(ncclDevCommRequirements* reqs) {
   reqs->ginContextCount = 1;
   reqs->lsaBarrierCount = deviceCtaCount;
@@ -169,8 +178,9 @@ static inline void AlltoAllSetGinHybridDevCommReqs(ncclDevCommRequirements* reqs
 // ncclCommQueryProperties fills ginType via getGlobalGinType, which reports NCCL_GIN_TYPE_NONE
 // unless comm->globalGinSupport == NCCL_GIN_CONNECTION_FULL. Single-node jobs often use
 // NCCL_GIN_CONNECTION_RAIL; the active GIN type is then only visible on railedGinType
-// (getGlobalRailedGinType). Do not infer GIN from NCCL_GIN_* env alone: if properties stay
-// NONE, ncclDevCommCreate will reject GIN devComm requirements (ncclInvalidArgument).
+// (getGlobalRailedGinType). When nLsaTeams==1 but no GIN is attached (e.g. TYPE=2 without IB),
+// -D 3 / -D 5 still use an all-local kernel path that only needs LSA barriers; see
+// AlltoAllSetSingleNodeGinKernelLsaOnlyReqs and GinAlltoAllKernel when numRemotePeers==0.
 static inline bool AlltoAllCommHasGin(ncclCommProperties_t const* cp) {
   return cp->ginType != NCCL_GIN_TYPE_NONE || cp->railedGinType != NCCL_GIN_TYPE_NONE;
 }
@@ -185,6 +195,13 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
     case 3: // GinAlltoAllKernel — testLaunchDeviceKernel uses deviceCtaCount CTAs
+      if (commProperties->nLsaTeams == 1 && !AlltoAllCommHasGin(commProperties)) {
+        // Single LSA team + no GIN in comm (e.g. NCCL_GIN_TYPE=2 but no IB HCAs): kernel all-local path
+        // uses LSA only (GinAlltoAllKernel when numRemotePeers==0). Skip GIN transport so ncclDevCommCreate
+        // does not require globalGinSupport.
+        AlltoAllSetSingleNodeGinKernelLsaOnlyReqs(reqs);
+        return testSuccess;
+      }
       if (!AlltoAllCommHasGin(commProperties)) {
         fprintf(stderr,
                 "This test requires GIN support, but ncclCommQueryProperties reports no GIN type "
@@ -214,6 +231,10 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       return testSuccess;
     case 5: // GinAdaptiveAlltoAllKernel (LSA-only intra-node + hybrid inter-node)
+      if (commProperties->nLsaTeams == 1 && !AlltoAllCommHasGin(commProperties)) {
+        AlltoAllSetSingleNodeGinKernelLsaOnlyReqs(reqs);
+        return testSuccess;
+      }
       if (!AlltoAllCommHasGin(commProperties)) {
         fprintf(stderr,
                 "This test requires GIN support, but ncclCommQueryProperties reports no GIN type "
