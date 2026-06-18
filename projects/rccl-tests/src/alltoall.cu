@@ -309,8 +309,9 @@ __global__ void NvlAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
 constexpr size_t kAlltoAllPeerParallelByteThreshold = 128 * 1024;
 
 // Hybrid GIN path: pipeline remote SDMA puts with local LSA copy. Larger chunks reduce
-// signal/wait rounds vs 1 MiB while keeping pipelining for overlap (tune with Anvil SDMA chunk env).
-constexpr size_t kAlltoAllGinPipelineChunkBytes = 4 << 20;
+// signal/wait rounds vs 1 MiB while keeping pipelining for overlap (match common
+// NCCL_GIN_ANVIL_SDMA_CHUNK_MB=16 tuning in gin-anvil perf runs).
+constexpr size_t kAlltoAllGinPipelineChunkBytes = 16 << 20;
 
 // Vectorized copy of one rank-slice to one peer (used by peer-parallel alltoall).
 template <typename T>

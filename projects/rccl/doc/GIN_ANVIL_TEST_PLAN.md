@@ -8,7 +8,7 @@ This document describes the **GIN_ANVIL** (GIN over MI300-class xGMI Anvil SDMA)
 
 - **Single-node GPU-initiated transport**: Provide a GIN backend (`NCCL_NET_DEVICE_GIN_ANVIL` / `NCCL_GIN_TYPE_ANVIL = 5`) that uses **Anvil SDMA queues** between peer GPUs on one node, avoiding IB proxy progress where the design allows.
 - **Correctness with LSA-style symmetric windows**: Collective windows registered through the devr LSA flat layout expose a **rank-0 base** and **stride** so device code can form peer VAs via `ncclGinAnvilRankPtr`.
-- **Latency vs throughput policy**: Transfers **smaller than 256 bytes** use **GPU load/store** on peer-mapped memory; larger transfers use **SDMA** with **configurable chunking** (`NCCL_GIN_ANVIL_SDMA_CHUNK_MB`, with in-kernel clamp/fallback).
+- **Latency vs throughput policy**: Transfers **smaller than 256 bytes** use **GPU load/store** on peer-mapped memory; larger transfers use **SDMA** with **configurable chunking** (`NCCL_GIN_ANVIL_SDMA_CHUNK_MB`, with in-kernel clamp/fallback). Indexed **Inc** / **Add(+1)** signals on the SDMA path use **fused `putSignal` on the final chunk** (or `signal()` when `bytes==0`) so the completion is issued from the SDMA queue instead of a separate GPU global atomic on the peer when possible; arbitrary **Add** values still use the GPU atomic fallback.
 - **Signaling and counters**: Indexed signals use **pinned shareable cuMem** on the host path so SDMA fused signal or GPU atomic fallback can target the same VA; optional **completion counters** integrate with `putCounter` when no signal is fused.
 - **Flush / ordering**: `ncclGinApi_Flush` tracks a **dirty bitmask per peer** across SDMA channels and issues `quiet` on queues that were used.
 

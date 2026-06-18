@@ -65,6 +65,34 @@ NCCL_DEVICE_INLINE static void ncclGinAnvilSdmaPutChunks(rocshmem::anvil::SdmaQu
   rocshmem::anvil::put(*q, d, s, bytes);
 }
 
+// Like SdmaPutChunks, but completes with SDMA-driven signal (putSignal / signal) instead of a
+// separate GPU global atomic on the peer. Matches common ncclGinSignalInc / Add(+1) semantics,
+// improves peak BW vs chunked COPY + RemoteGpuSignalOp (host proxy closes gap via progress engine).
+NCCL_DEVICE_INLINE static void ncclGinAnvilSdmaPutChunksSignalLast(rocshmem::anvil::SdmaQueueDeviceHandle* q,
+                                                                 void* dst, void* src, size_t bytes,
+                                                                 size_t chunkBytes, uint64_t* sigPtr) {
+  if (sigPtr == nullptr) return;
+  if (bytes == 0) {
+    rocshmem::anvil::signal(*q, sigPtr);
+    return;
+  }
+  if (chunkBytes == 0) chunkBytes = ncclGinAnvilSdmaChunkBytesDefault;
+  if (chunkBytes < 65536) chunkBytes = 65536;
+  char* d = (char*)dst;
+  char* s = (char*)src;
+  if (bytes <= chunkBytes) {
+    rocshmem::anvil::putSignal(*q, d, s, bytes, sigPtr);
+    return;
+  }
+  while (bytes > chunkBytes) {
+    rocshmem::anvil::put(*q, d, s, chunkBytes);
+    d += chunkBytes;
+    s += chunkBytes;
+    bytes -= chunkBytes;
+  }
+  rocshmem::anvil::putSignal(*q, d, s, bytes, sigPtr);
+}
+
 // Intra-rank / local-LSA copy (Put self path and sub-threshold remote puts).
 NCCL_DEVICE_INLINE static void ncclGinAnvilMemcpy(void* dst, void const* src, size_t bytes) {
   if (bytes == 0) return;
@@ -228,8 +256,17 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL> {
 
     size_t chunkBytes = (size_t)loadConst(&aCtx->sdmaChunkBytes);
     if (hasSignal) {
-      ncclGinAnvilSdmaPutChunks(q, dst, src, bytes, chunkBytes);
-      ncclGinAnvilRemoteGpuSignalOp(sigPtr, signalOp, signalOpArg);
+      // SDMA fused / queue atomic path for +1-style signals; arbitrary Add still uses GPU atomic.
+      const bool sdmaFusedIncStyleSignal =
+          !hasCounter &&
+          (signalOp == ncclGinSignalInc ||
+           (signalOp == ncclGinSignalAdd && signalOpArg == 1ULL));
+      if (sdmaFusedIncStyleSignal) {
+        ncclGinAnvilSdmaPutChunksSignalLast(q, dst, src, bytes, chunkBytes, sigPtr);
+      } else {
+        ncclGinAnvilSdmaPutChunks(q, dst, src, bytes, chunkBytes);
+        ncclGinAnvilRemoteGpuSignalOp(sigPtr, signalOp, signalOpArg);
+      }
       if (hasCounter) atomicAdd((unsigned long long*)counterPtr, 1ULL);
     } else if (hasCounter) {
       // putCounter does not support chunking; use single packet when counter is required.
