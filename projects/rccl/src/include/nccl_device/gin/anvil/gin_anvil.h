@@ -65,6 +65,35 @@ NCCL_DEVICE_INLINE static void ncclGinAnvilSdmaPutChunks(rocshmem::anvil::SdmaQu
   rocshmem::anvil::put(*q, d, s, bytes);
 }
 
+// Like ncclGinAnvilSdmaPutChunks, but completes with putSignal on the last chunk when the
+// completion is a plain +1 (Inc or Add(1)). On MI4 (OSS7), rocshmem fuses copy+signal in
+// hardware, avoiding a separate COPY + GPU atomic and reducing queue depth vs put+atomic.
+NCCL_DEVICE_INLINE static void ncclGinAnvilSdmaPutChunksWithIncSignal(
+    rocshmem::anvil::SdmaQueueDeviceHandle* q, void* dst, void* src, size_t bytes, size_t chunkBytes,
+    uint64_t* sigPtr, ncclGinSignalOp_t signalOp, uint64_t signalOpArg) {
+  if (bytes == 0) return;
+  if (chunkBytes == 0) chunkBytes = ncclGinAnvilSdmaChunkBytesDefault;
+  if (chunkBytes < 65536) chunkBytes = 65536;
+  char* d = (char*)dst;
+  char* s = (char*)src;
+  const bool hwFusedSignal =
+      sigPtr != nullptr &&
+      (signalOp == ncclGinSignalInc ||
+       (signalOp == ncclGinSignalAdd && signalOpArg == 1));
+  while (bytes > chunkBytes) {
+    rocshmem::anvil::put(*q, d, s, chunkBytes);
+    d += chunkBytes;
+    s += chunkBytes;
+    bytes -= chunkBytes;
+  }
+  if (hwFusedSignal) {
+    rocshmem::anvil::putSignal(*q, d, s, bytes, sigPtr);
+  } else {
+    rocshmem::anvil::put(*q, d, s, bytes);
+    if (sigPtr != nullptr) ncclGinAnvilRemoteGpuSignalOp(sigPtr, signalOp, signalOpArg);
+  }
+}
+
 // Intra-rank / local-LSA copy (Put self path and sub-threshold remote puts).
 NCCL_DEVICE_INLINE static void ncclGinAnvilMemcpy(void* dst, void const* src, size_t bytes) {
   if (bytes == 0) return;
@@ -227,9 +256,16 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL> {
 
     size_t chunkBytes = (size_t)loadConst(&aCtx->sdmaChunkBytes);
     if (hasSignal) {
-      ncclGinAnvilSdmaPutChunks(q, dst, src, bytes, chunkBytes);
-      ncclGinAnvilRemoteGpuSignalOp(sigPtr, signalOp, signalOpArg);
-      if (hasCounter) atomicAdd((unsigned long long*)counterPtr, 1ULL);
+      if (!hasCounter &&
+          (signalOp == ncclGinSignalInc ||
+           (signalOp == ncclGinSignalAdd && signalOpArg == 1))) {
+        ncclGinAnvilSdmaPutChunksWithIncSignal(q, dst, src, bytes, chunkBytes, sigPtr, signalOp,
+                                               signalOpArg);
+      } else {
+        ncclGinAnvilSdmaPutChunks(q, dst, src, bytes, chunkBytes);
+        ncclGinAnvilRemoteGpuSignalOp(sigPtr, signalOp, signalOpArg);
+        if (hasCounter) atomicAdd((unsigned long long*)counterPtr, 1ULL);
+      }
     } else if (hasCounter) {
       // putCounter does not support chunking; use single packet when counter is required.
       rocshmem::anvil::putCounter(*q, dst, src, bytes, counterPtr);

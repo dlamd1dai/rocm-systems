@@ -98,7 +98,7 @@ All cases live in `test/device/GinAnvilDeviceTests.cpp` (GoogleTest, HIP kernels
 ## 4. Coverage gaps
 
 1. **Real SDMA submission**: `rocshmem::anvil::put`, `putCounter`, `quiet` — require MI300-class Anvil setup and valid queues from `rocshmem::anvil::anvil.getSdmaQueue`.
-2. **`ncclGinAnvilSdmaPutChunks`**: non-zero `bytes` branches (while-loop over chunks, `chunkBytes == 0` defaulting to 8 MiB, clamp `chunkBytes < 65536`).
+2. **`ncclGinAnvilSdmaPutChunks`** / **`ncclGinAnvilSdmaPutChunksWithIncSignal`** (chunked `put` + final `putSignal` for Inc/Add(1)): non-zero `bytes` branches (while-loop over chunks, `chunkBytes == 0` defaulting to 8 MiB, clamp `chunkBytes < 65536`).
 3. **`ncclGinApi_Put` peer branch** for `bytes >= ncclGinAnvilSdmaThresholdBytes`: all three combinations of `(hasSignal, hasCounter)` that call into SDMA helpers.
 4. **Host-only paths** in `gin_host_anvil.cc`: `ginAnvilParseNumSdmaChannels`, `ginAnvilParseSdmaChunkBytes`, `ginAnvilAlignSignalCuMemBytes`, `ginAnvilGrantSignalPeerAccess`, `setupSignalBases` failure modes, `ncclGinAnvilCreateContext`/`Register`/`Destroy` integration.
 5. **`ncclGinAnvilQueryLastError` / `hasError` flag** mutation (currently no producer sets `hasError` in the shown code).

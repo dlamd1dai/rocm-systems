@@ -380,7 +380,7 @@ __device__ __forceinline__ void AlltoAllNvlCopyOptimized(ncclWindow_t sendwin, s
   using TN = typename VectorTypeMapping<T>::Type;
   constexpr int VECTOR_FACTOR = sizeof(TN) / sizeof(T);
   constexpr int UNROLL_FACTOR = 128/sizeof(TN);
-  constexpr int PEER_UNROLL = 2;
+  constexpr int PEER_UNROLL = 4;
 
   T* sendPtr = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
 
@@ -496,7 +496,7 @@ __device__ __forceinline__ void AlltoAllLsaCopy(ncclWindow_t sendwin, size_t sen
   using TN = typename VectorTypeMapping<T>::Type;
   constexpr int VECTOR_FACTOR = sizeof(TN) / sizeof(T);
   constexpr int UNROLL_FACTOR = 128/sizeof(TN);
-  constexpr int PEER_UNROLL = 2;
+  constexpr int PEER_UNROLL = 4;
 
   T* sendLocal = (T*)ncclGetLocalPointer(sendwin, sendoffset);
 
