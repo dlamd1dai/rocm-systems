@@ -7,6 +7,7 @@ if [[ $# -lt 2 ]]; then
   echo "Rebuild gin-anvil after changing rocSHMEM tests (e.g. tester_arguments -v parsing):"
   echo "  $0 ... true   # or docker build --build-arg ROCSHMEM_CACHE_BUST=N ..."
   echo "External GIN DSO: place projects/rccl/docker-gin-plugin/libnccl-gin.so then rebuild; export GIN_HOST_USE_EXTERNAL_PLUGIN=1 for TYPE=2."
+  echo "Optional alltoall_perf diagnosis: RCCL_ALLTOALL_SMOOTH=1 | RCCL_ALLTOALL_PERF_EXTRA='-w 30 -n 120' | RCCL_ALLTOALL_SPLIT_INOUT=1"
   exit 1
 fi
 
@@ -60,6 +61,25 @@ RCCL_ENV_COMMON="-x HSA_FORCE_FINE_GRAIN_PCIE=1 -x NCCL_DEBUG=VERSION"
 # common.cu requires -R 2 whenever -D>0 (device/GIN kernels use ncclWindow_t from symmetric collective windows).
 # GIN_ANVIL (NCCL_GIN_TYPE=5, -D 5) relies on that path; use the same -R for host -D 0 baselines so large-message
 # numbers are comparable to symmetric-buffer runs (e.g. tuned -D 0 with -R 2), not dominated by unregistered buffers.
+#
+# alltoall_perf (rccl-tests common.cu): -w/--warmup_iters, -n/--iters (defaults 1 and 20 if unset).
+# Smoother curves / less variance: export RCCL_ALLTOALL_SMOOTH=1 (uses -w 20 -n 100 unless overridden), or set
+#   RCCL_ALLTOALL_PERF_EXTRA="-w 30 -n 120" for full control. Optional: RCCL_ALLTOALL_SPLIT_INOUT=1 adds two
+# runs after Test#11 (2ch): out-of-place only (-O 1) and in-place only (-O 0) for the same sweep.
+# rocprof single-size spot check (host; wrap mpirun), 64 KiB out-of-place example:
+#   rocprof --hip-trace -o /tmp/a2a_64k_oop.hipfk docker run ... ${DOCKER_IMAGE} mpirun ... \\
+#     /workspace/rccl-tests/alltoall_perf -w 5 -n 2 -b 65536 -e 65536 -f 1 -g 1 -R 2 -D 5 -A 1 -O 1
+# Same with -O 0 for in-place; use -e 262144 for 256 KiB total message size.
+
+if [[ -n "${RCCL_ALLTOALL_PERF_EXTRA:-}" ]]; then
+  :
+elif [[ "${RCCL_ALLTOALL_SMOOTH:-}" == 1 ]]; then
+  _a2a_w="${RCCL_ALLTOALL_WARMUP_ITERS:-20}"
+  _a2a_n="${RCCL_ALLTOALL_ITERS:-100}"
+  RCCL_ALLTOALL_PERF_EXTRA="-w ${_a2a_w} -n ${_a2a_n}"
+else
+  RCCL_ALLTOALL_PERF_EXTRA=""
+fi
 
 if [ -x scontrol ]; then
     scontrol show hostnames "$SLURM_JOB_NODELIST" | awk '{print $1 " slots='${PPN}'"}' > ${HFILE}
@@ -130,6 +150,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1
 set +x
 fi
@@ -158,6 +179,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x NCCL_MSCCL_ENABLE=0 \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1 -M 1
 set +x
 fi
@@ -183,6 +205,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 2 -A 1
 set +x
 fi
@@ -209,6 +232,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
 set +x
 fi
@@ -236,6 +260,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
 set +x
 fi
@@ -262,6 +287,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1
 set +x
 fi
@@ -285,6 +311,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
 set +x
 fi
@@ -308,6 +335,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1
 set +x
 fi
@@ -336,6 +364,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1
 set +x
 fi
@@ -358,7 +387,51 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1
+set +x
+fi
+
+if [[ "${RCCL_ALLTOALL_SPLIT_INOUT:-}" == 1 ]]; then
+echo "=== Test#11-OOP: RCCL AlltoAll: -D 5, GIN_ANVIL (SDMA ch=2) out-of-place only (-O 1) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -O 1
+set +x
+echo "=== Test#11-IP: RCCL AlltoAll: -D 5, GIN_ANVIL (SDMA ch=2) in-place only (-O 0) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -O 0
 set +x
 fi
 
@@ -385,6 +458,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1
 set +x
 else
@@ -406,6 +480,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1
 set +x
 fi
