@@ -178,7 +178,8 @@ static inline void AlltoAllSetGinHybridDevCommReqs(ncclDevCommRequirements* reqs
 // ncclCommQueryProperties fills ginType via getGlobalGinType, which reports NCCL_GIN_TYPE_NONE
 // unless comm->globalGinSupport == NCCL_GIN_CONNECTION_FULL. Single-node jobs often use
 // NCCL_GIN_CONNECTION_RAIL; the active GIN type is then only visible on railedGinType
-// (getGlobalRailedGinType). When nLsaTeams==1 but no GIN is attached (e.g. TYPE=2 without IB),
+// (getGlobalRailedGinType). When nLsaTeams<=1 but no GIN is attached (e.g. TYPE=2 without IB),
+// or nLsaTeams was unset (0) before RCCL populated devrState.nLsaTeams (AICOMRCCL / gin-anvil),
 // -D 3 / -D 5 still use an all-local kernel path that only needs LSA barriers; see
 // AlltoAllSetSingleNodeGinKernelLsaOnlyReqs and GinAlltoAllKernel when numRemotePeers==0.
 static inline bool AlltoAllCommHasGin(ncclCommProperties_t const* cp) {
@@ -195,7 +196,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
     case 3: // GinAlltoAllKernel — testLaunchDeviceKernel uses deviceCtaCount CTAs
-      if (commProperties->nLsaTeams == 1 && !AlltoAllCommHasGin(commProperties)) {
+      if (commProperties->nLsaTeams <= 1 && !AlltoAllCommHasGin(commProperties)) {
         // Single LSA team + no GIN in comm (e.g. NCCL_GIN_TYPE=2 but no IB HCAs): kernel all-local path
         // uses LSA only (GinAlltoAllKernel when numRemotePeers==0). Skip GIN transport so ncclDevCommCreate
         // does not require globalGinSupport.
@@ -231,7 +232,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       return testSuccess;
     case 5: // GinAdaptiveAlltoAllKernel (LSA-only intra-node + hybrid inter-node)
-      if (commProperties->nLsaTeams == 1 && !AlltoAllCommHasGin(commProperties)) {
+      if (commProperties->nLsaTeams <= 1 && !AlltoAllCommHasGin(commProperties)) {
         AlltoAllSetSingleNodeGinKernelLsaOnlyReqs(reqs);
         return testSuccess;
       }

@@ -93,6 +93,14 @@ ncclResult_t ncclDevrInitOnce(struct ncclComm* comm) {
   }
   lsaSize = gcd(lsaSize, nodeSize);
   devr->lsaSize = lsaSize;
+  // ncclCommQueryProperties exposes this; callers (e.g. rccl-tests alltoall -D 3) need a
+  // non-zero value to distinguish single-team vs multi-team layouts. Matches ncclTeamRail:
+  // world ranks / lsaSize when the communicator partitions evenly.
+  if (lsaSize > 0 && (comm->nRanks % lsaSize) == 0) {
+    devr->nLsaTeams = comm->nRanks / lsaSize;
+  } else {
+    devr->nLsaTeams = 1;
+  }
   devr->lsaSelf = comm->rank % lsaSize;
   devr->lsaRankList = (int*)malloc(devr->lsaSize*sizeof(int));
   for (int i=0; i < devr->lsaSize; i++) {
