@@ -147,8 +147,8 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x NCCL_GIN_TYPE=0 \
   -x NCCL_DEBUG_SUBSYS=INIT,NET \
   -x NCCL_CUMEM_ENABLE=1 \
-  -x RCCL_ENABLE_INTRANET=1 \
-  -x NCCL_DMABUF_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=0 \
+  -x NCCL_DMABUF_ENABLE=0 \
   -x NCCL_MSCCL_ENABLE=0 \
   -x HSA_NO_SCRATCH_RECLAIM=1 \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
@@ -199,7 +199,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x RCCL_ROCSHMEM_ENABLE=0 \
   -x NCCL_GIN_ENABLE=1 \
   -x NCCL_GIN_TYPE=2 \
-  -x NCCL_IB_DISABLE=0 \
+  -x NCCL_IB_DISABLE=1 \
   -x NCCL_DEBUG_SUBSYS=INIT,NET \
   -x NCCL_CUMEM_ENABLE=1 \
   -x RCCL_ENABLE_INTRANET=1 \
@@ -209,7 +209,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 2 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 fi
 
@@ -236,7 +236,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 fi
 
@@ -264,14 +264,14 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 fi
 
 if [ 1 -eq 1 ]; then
 #####
-# RCCL AlltoAll: -D 4, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA path
-echo "=== Test#7: RCCL AlltoAll: -D 4, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA np=${NP} max_bytes=${MAX_BYTES} ==="
+# RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA path
+echo "=== Test#7: RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA np=${NP} max_bytes=${MAX_BYTES} ==="
 set -x
 docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   mpirun ${MPIRUN_BASE} \
@@ -291,11 +291,11 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 fi
 
-if [ 0 -eq 1 ]; then
+if [ 1 -eq 1 ]; then
 # --- RCCL AlltoAll with GIN_ANVIL (NCCL_GIN_TYPE=5, intra-node MI300 xGMI SDMA)
 # Matches Dockerfile-rccl-gin-anvil example; single-node only (no IB device required).
 echo "=== Test#8: RCCL AlltoAll: -D 3, GIN_ANVIL (NCCL_GIN_TYPE=5) np=${NP} max_bytes=${MAX_BYTES} ==="
@@ -315,7 +315,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 fi
 
@@ -339,7 +339,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
   /workspace/rccl-tests/alltoall_perf \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
-  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1 -V 1
 set +x
 fi
 
