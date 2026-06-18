@@ -312,7 +312,7 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
 set +x
 fi
 
-if [ 0 -eq 1 ]; then
+if [ 1 -eq 1 ]; then
 # --- RCCL AlltoAll with GIN_ANVIL (NCCL_GIN_TYPE=5, intra-node MI300 xGMI SDMA)
 # Symmetric collective windows (-R 2) are required for -D 5 and feed ncclGinAnvilRegister LSA resolution.
 # Single-node -D 5 uses cooperative AlltoAllLsaCopy for large slices; do not raise -V beyond defaults
