@@ -100,10 +100,15 @@ fi
 # Mount hostfile so mpirun sees current nodes without rebuilding the image.
 DOCKER_GPU="${DOCKER_GPU} -v $(pwd)/${HFILE}:/workspace/${HFILE}:ro"
 
+# docker build: BuildKit attaches RUN steps to the default bridge. Some hosts have no docker0
+# ("network bridge not found"). --network=host avoids that. Override: DOCKER_BUILD_NETWORK=default
+# when the bridge exists and you want isolated build networking.
+DOCKER_BUILD_NETWORK="${DOCKER_BUILD_NETWORK:-host}"
+
 # --- build
 if ${BUILD_FLAG}; then
   N=1
-  sudo docker build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
+  sudo docker build --network="${DOCKER_BUILD_NETWORK}" -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --no-cache \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=1 \

@@ -23,10 +23,10 @@ FROM ubuntu:24.04
 #docker run -it --rm --shm-size 64G   --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged  rccl-gingda mpirun -n 8 -mca pml ob1 -mca btl ^openib rocshmem/bin/rocshmem_functional_tests -a 19 -w 1 -z 256 -v $((128*1024*1024)) -noverif
 
 ## creating scratch space
-ENV WORKDIR /workspace
+ENV WORKDIR=/workspace
 RUN mkdir -p ${WORKDIR}
 WORKDIR ${WORKDIR}
-ENV SRC /src
+ENV SRC=/src
 RUN mkdir -p ${SRC}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -242,7 +242,7 @@ RUN mkdir rccl-tests \
 
 ## set environment variables
 ENV PATH="${MPI_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
 ENV UCX_WARN_UNUSED_ENV_VARS=n
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
