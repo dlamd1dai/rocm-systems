@@ -1,0 +1,502 @@
+#! /usr/bin/env bash
+
+set -euxo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <nnodes> <ppn> <msg_size> [<build-flag> [<gpu-arch>]]"
+  echo "Rebuild gin-anvil after changing rocSHMEM tests (e.g. tester_arguments -v parsing):"
+  echo "  $0 ... true   # or sudo docker build --build-arg ROCSHMEM_CACHE_BUST=N ..."
+  echo "External GIN DSO: place projects/rccl/docker-gin-plugin/libnccl-gin.so then rebuild; export GIN_HOST_USE_EXTERNAL_PLUGIN=1 for TYPE=2."
+  echo "Optional alltoall_perf diagnosis: RCCL_ALLTOALL_SMOOTH=1 | RCCL_ALLTOALL_PERF_EXTRA='-w 30 -n 120' | RCCL_ALLTOALL_SPLIT_INOUT=1"
+  exit 1
+fi
+
+NNODES=${1}
+PPN=${2}
+NP=$(( ${NNODES} * ${PPN} ))
+MSG_SIZE=${3}
+BUILD_FLAG=${4:-false}
+TARGET_GPU_ARCH=${5:-gfx950}
+# TARGET_GPU_ARCH=${5:-gfx942}
+
+DOCKERFILE="Dockerfile-rccl-gin-anvil"
+DOCKER_IMAGE="gin-anvil:latest"
+# Dockerfile USE_LOCAL_SRC: 1 = COPY projects/* from build context; 0 = clone sparse checkout in image.
+USE_LOCAL_SRC="${USE_LOCAL_SRC:-1}"
+
+# Derived sizes / shared docker+mpirun settings (expand on host, not inside container).
+MAX_BYTES=$((${NP} * ${MSG_SIZE}))
+# rocshmem_functional_tests -a 19 (TeamAllToAll): two symmetric-heap buffers each ≈ max_volume bytes
+# (char); dlmalloc needs extra headroom — 2*MAX_BYTES + 2GiB pad is safer than +512MiB alone.
+# Default ROCSHMEM_HEAP_SIZE is 1GiB/pe (see rocshmem envvar.cpp). Export via docker -e and mpirun -x
+# so heap is set before rocshmem_init even if a launcher strips one path.
+MIN_ROCSHMEM_HEAP=$((1 << 30))
+HEAP_PAD=$((2 * 1024 * 1024 * 1024))
+ROCSHMEM_HEAP_SIZE=$((2 * MAX_BYTES + HEAP_PAD))
+if [ "${ROCSHMEM_HEAP_SIZE}" -lt "${MIN_ROCSHMEM_HEAP}" ]; then
+  ROCSHMEM_HEAP_SIZE=${MIN_ROCSHMEM_HEAP}
+fi
+# Inject into every perf container so rocshmem_init sees it before symmetric allocations.
+DOCKER_ROCSHMEM_EXTRA="-e ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE}"
+# No -it: script is often run over non-interactive SSH.
+# --init: PID 1 reaps children so ranks exit more cleanly (reduces NCCL IPC/socket teardown WARNs).
+# Expose GPUs via bind-mount of /dev/dri (all card*/renderD* nodes). On some Docker engines, --device
+# /dev/dri alone does not pass every render node; multi-rank HIP then fails with invalid device pointer /
+# "IPC Client Import: Invalid IPC handle". --group-add render matches Ubuntu DRI render node ACLs.
+DOCKER_GPU="--rm --init --shm-size 64G --network host -v /dev/dri:/dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
+HFILE="my_hostfile"
+MPIRUN_BASE="-n ${NP} --allow-run-as-root -mca pml ob1 -mca btl ^openib"
+MPIRUN_BASE_HFILE="-n ${NP} --hostfile /workspace/${HFILE} --allow-run-as-root -mca pml ob1 -mca btl ^openib"
+# Quiets RCCL init.cc when built without HIP_UNCACHED_MEMORY. NCCL_DEBUG=VERSION avoids printing
+# NCCL_LOG_WARN teardown lines (e.g. socket/IPC deregister) that appear when NCCL_DEBUG=WARN is set.
+# Avoid a duplicate -D 0 run mixing NCCL_GIN_ENABLE=1 with -D 0 and NCCL_DEBUG=WARN (see ddai-a2a-1gb-perf-try2.log).
+RCCL_ENV_COMMON="-x HSA_FORCE_FINE_GRAIN_PCIE=1 -x NCCL_DEBUG=VERSION"
+
+# NCCL_GIN_TYPE=2 (host IB proxy): RCCL defaults to loading libnccl-gin.so (external slot name; not
+# librccl-gin.so). If that DSO is absent, NCCL_GIN_PLUGIN=none avoids reserving that slot so built-in
+# ncclGinIb can be used (IB still required: DOCKER_GPU includes --device /dev/infiniband).
+# If you bake projects/rccl/docker-gin-plugin/libnccl-gin.so into the image (Dockerfile-rccl-gin-anvil), set
+# GIN_HOST_USE_EXTERNAL_PLUGIN=1 so we do not pass NCCL_GIN_PLUGIN=none.
+# GIN_ANVIL is NCCL_GIN_TYPE=5 (built-in); no IB needed. Skip host-proxy stanzas with RUN_GIN_HOST_PROXY=0.
+
+# NCCL_GIN_TYPE=2 + -D 3: without this, RCCL tries libnccl-gin.so first; a mismatched image DSO can prevent
+# built-in ncclGinIb from assigning → ncclCommQueryProperties ginType/railedGinType stay NONE and alltoall_perf fails.
+NCCL_GIN_PROXY_PLUGIN_MPIRUN=()
+if [[ "${GIN_HOST_USE_EXTERNAL_PLUGIN:-}" != 1 ]]; then
+  NCCL_GIN_PROXY_PLUGIN_MPIRUN=(-x NCCL_GIN_PLUGIN=none)
+fi
+
+# rccl-tests alltoall_perf: -R is local_register (0=off, 1=local, 2=symmetric ncclCommWindowRegister).
+# common.cu requires -R 2 whenever -D>0 (device/GIN kernels use ncclWindow_t from symmetric collective windows).
+# GIN_ANVIL (NCCL_GIN_TYPE=5, -D 5) relies on that path; use the same -R for host -D 0 baselines so large-message
+# numbers are comparable to symmetric-buffer runs (e.g. tuned -D 0 with -R 2), not dominated by unregistered buffers.
+#
+# alltoall_perf (rccl-tests common.cu): -w/--warmup_iters, -n/--iters (defaults 1 and 20 if unset).
+# Smoother curves / less variance: export RCCL_ALLTOALL_SMOOTH=1 (uses -w 20 -n 100 unless overridden), or set
+#   RCCL_ALLTOALL_PERF_EXTRA="-w 30 -n 120" for full control. Optional: RCCL_ALLTOALL_SPLIT_INOUT=1 adds two
+# runs after Test#11 (2ch): out-of-place only (-O 1) and in-place only (-O 0) for the same sweep.
+# rocprof single-size spot check (host; wrap mpirun), 64 KiB out-of-place example:
+#   rocprof --hip-trace -o /tmp/a2a_64k_oop.hipfk docker run ... ${DOCKER_IMAGE} mpirun ... \\
+#     /workspace/rccl-tests/alltoall_perf -w 5 -n 2 -b 65536 -e 65536 -f 1 -g 1 -R 2 -D 5 -A 1 -O 1
+# Same with -O 0 for in-place; use -e 262144 for 256 KiB total message size.
+
+if [[ -n "${RCCL_ALLTOALL_PERF_EXTRA:-}" ]]; then
+  :
+elif [[ "${RCCL_ALLTOALL_SMOOTH:-}" == 1 ]]; then
+  _a2a_w="${RCCL_ALLTOALL_WARMUP_ITERS:-20}"
+  _a2a_n="${RCCL_ALLTOALL_ITERS:-100}"
+  RCCL_ALLTOALL_PERF_EXTRA="-w ${_a2a_w} -n ${_a2a_n}"
+else
+  RCCL_ALLTOALL_PERF_EXTRA=""
+fi
+
+if [ -x scontrol ]; then
+    scontrol show hostnames "$SLURM_JOB_NODELIST" | awk '{print $1 " slots='${PPN}'"}' > ${HFILE}
+else
+    echo "$(hostname) slots=${PPN}" > ${HFILE}
+fi
+
+# Mount hostfile so mpirun sees current nodes without rebuilding the image.
+DOCKER_GPU="${DOCKER_GPU} -v $(pwd)/${HFILE}:/workspace/${HFILE}:ro"
+
+# --- build
+if ${BUILD_FLAG}; then
+  N=1
+  sudo docker build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
+    --no-cache \
+    --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
+    --build-arg USE_LOCAL_SRC=1 \
+    --build-arg ROCSHMEM_CACHE_BUST=$((N++)) .
+  sudo docker image inspect "${DOCKER_IMAGE}" >/dev/null
+fi
+
+# --- sanity: image layout
+sudo docker run --rm ${DOCKER_IMAGE} bash -lc "
+  echo '=== workspace ==='
+  pwd
+  ls -la /workspace 2>/dev/null || true
+  cat /workspace/my_hostfile 2>/dev/null || true
+  ls -la /workspace/rocshmem/bin 2>/dev/null || true
+  ls -la /workspace/rccl/lib 2>/dev/null || true
+  ls -la /workspace/rccl-tests/alltoall_perf 2>/dev/null || true
+  # echo '=== alltoall_perf anvil symbol export ==='
+  # nm -D /workspace/rccl-tests/alltoall_perf 2>/dev/null | grep anvil || echo 'MISSING anvil symbols'
+"
+
+if [ 0 -eq 1 ]; then
+#####
+# rocSHMEM IPC alltoall (reference)
+echo "=== Test#1: rocSHMEM IPC alltoall np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  -x ROCSHMEM_TEST_UUID=1 \
+  -x ROCSHMEM_BACKEND=ipc \
+  -x ROCSHMEM_SDMA_ENABLED=1 \
+  -x ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE} \
+  -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
+  /workspace/rocshmem/bin/rocshmem_functional_tests \
+  -a 19 -w 1 -z 256 -v ${MAX_BYTES} -n 100 -noverif
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+#####
+# RCCL AlltoAll: -D 0, (host-initiated, inter-node capable)
+echo "=== Test#2: RCCL AlltoAll: -D 0, non-GIN (inter-node capable) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=0 \
+  -x NCCL_GIN_TYPE=0 \
+  -x NCCL_DEBUG_SUBSYS=INIT,NET \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=0 \
+  -x NCCL_DMABUF_ENABLE=0 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1
+set +x
+fi
+
+if [ 0 -eq 1 ]; then
+# RCCL AlltoAll: -D 0, (host-initiated, inter-node capable)
+echo "=== Test#3: RCCL AlltoAll: -D 0, non-GIN (inter-node capable) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+# srun --jobid=14348 -N 1 -n 8 --ntasks-per-node=8 --mpi=pmix --export=ALL,LD_LIBRARY_PATH=/opt/sre-tools/ompi/lib:/home/prmuruge/ROCm/rocm-systems/workspace/rccl/lib:/apps/prmuruge/rocm-7.13/lib:${LD_LIBRARY_PATH:-},UCX_TLS=tcp,UCX_NET_DEVICES=fenic0,NCCL_SOCKET_IFNAME=fenic0,ROCSHMEM_BACKEND=ipc,ROCSHMEM_DISABLE_MIXED_IPC=1,RCCL_ROCSHMEM_ENABLE=0,ROCSHMEM_SDMA_ENABLED=1,ROCSHMEM_GDA_ENABLE_DMABUF=0,RCCL_ROCSHMEM_THRESHOLD=134217728,NCCL_DEBUG=WARN,NCCL_GIN_ENABLE=1,NCCL_GIN_TYPE=5,NCCL_DEBUG_SUBSYS=INIT,NET,NCCL_CUMEM_ENABLE=1,RCCL_ENABLE_INTRANET=1,NCCL_DMABUF_ENABLE=1,NCCL_MSCCL_ENABLE=0,HSA_NO_SCRATCH_RECLAIM=1 /home/prmuruge/ROCm/rocm-systems/workspace/rccl-tests/alltoall_perf -b 128 -e 128M -f 2 -g 1 -R 2 -D 0 -A 1 -M 1
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x ROCSHMEM_BACKEND=ipc \
+  -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x ROCSHMEM_SDMA_ENABLED=1 \
+  -x ROCSHMEM_GDA_ENABLE_DMABUF=0 \
+  -x RCCL_ROCSHMEM_THRESHOLD=134217728 \
+  -x NCCL_DEBUG=WARN \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_DEBUG_SUBSYS=INIT,NET \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1 -M 1
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+#####
+# RCCL AlltoAll: -D 3 (GinAlltoAllKernel), GIN host proxy (NCCL_GIN_TYPE=2). IB must stay enabled
+# so built-in ncclGinIb can initialize; NCCL_IB_DISABLE=1 yields ginType NONE and -D 3 fails AlltoAllCommHasGin.
+echo "=== Test#4: RCCL AlltoAll: -D 3, GIN host proxy (NCCL_GIN_TYPE=2, IB for plugin init) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x NCCL_DEBUG=VERSION \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=2 \
+  "${NCCL_GIN_PROXY_PLUGIN_MPIRUN[@]}" \
+  -x NCCL_IB_DISABLE=0 \
+  -x NCCL_DEBUG_SUBSYS=INIT,NET \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
+
+# NCCL_GIN_TYPE=2 + -D 3: same host-proxy plugin as above; compare timing to GIN_ANVIL (-D 3/5, TYPE=5) below.
+if [ 0 -eq 1 ]; then
+#####
+# RCCL AlltoAll: -D 3, GIN host proxy (NCCL_GIN_TYPE=2, intra-node only)
+echo "=== Test#5: RCCL AlltoAll: -D 3, GIN host proxy (NCCL_GIN_TYPE=2, intra-node only) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x NCCL_DEBUG=VERSION \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=2 \
+  "${NCCL_GIN_PROXY_PLUGIN_MPIRUN[@]}" \
+  -x NCCL_IB_DISABLE=0 \
+  -x NCCL_DEBUG_SUBSYS=INIT,NET \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
+
+
+if [ 0 -eq 1 ]; then
+#####
+# RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA path
+echo "=== Test#6: RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x ROCSHMEM_BACKEND=ipc \
+  -x ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE} \
+  -x ROCSHMEM_SDMA_ENABLED=1 \
+  -x NCCL_GIN_TYPE=4 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+#####
+# RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA path
+echo "=== Test#7: RCCL AlltoAll: -D 3, GIN_ROCSHMEM (NCCL_GIN_TYPE=4) + rocSHMEM SDMA np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x ROCSHMEM_BACKEND=ipc \
+  -x ROCSHMEM_HEAP_SIZE=${ROCSHMEM_HEAP_SIZE} \
+  -x ROCSHMEM_SDMA_ENABLED=1 \
+  -x NCCL_GIN_TYPE=4 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+# --- RCCL AlltoAll with GIN_ANVIL (NCCL_GIN_TYPE=5, intra-node MI300 xGMI SDMA)
+# Matches Dockerfile-rccl-gin-anvil example; single-node only (no IB device required).
+echo "=== Test#8: RCCL AlltoAll: -D 3, GIN_ANVIL (NCCL_GIN_TYPE=5) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+# --- RCCL AlltoAll with GIN_ANVIL (NCCL_GIN_TYPE=5, intra-node MI300 xGMI SDMA)
+# Matches Dockerfile-rccl-gin-anvil example; single-node only (no IB device required).
+echo "=== Test#9: RCCL AlltoAll: -D 4, GIN_ANVIL (NCCL_GIN_TYPE=5) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 4 -A 1 -V 1
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+# --- RCCL AlltoAll with GIN_ANVIL (NCCL_GIN_TYPE=5, intra-node MI300 xGMI SDMA)
+# Symmetric collective windows (-R 2) are required for -D 5 and feed ncclGinAnvilRegister LSA resolution.
+# Single-node -D 5 uses cooperative AlltoAllLsaCopy for large slices; do not raise -V beyond defaults
+# without matching devComm barrier counts — oversubscribing CTAs regresses badly on MI355-class nodes.
+# Matches Dockerfile-rccl-gin-anvil example; single-node only (no IB device required).
+echo "=== Test#10: RCCL AlltoAll: -D 5, GIN_ANVIL (NCCL_GIN_TYPE=5) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=4 \
+  -x NCCL_GIN_ANVIL_SDMA_CHUNK_MB=16 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -V 128
+set +x
+fi
+
+if [ 1 -eq 1 ]; then
+echo "=== Test#11: RCCL AlltoAll: -D 5, GIN_ANVIL (NCCL_GIN_TYPE=5, NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -V 128
+set +x
+fi
+
+if [[ "${RCCL_ALLTOALL_SPLIT_INOUT:-}" == 1 ]]; then
+echo "=== Test#11-OOP: RCCL AlltoAll: -D 5, GIN_ANVIL (SDMA ch=2) out-of-place only (-O 1) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -O 1 -V 128
+set +x
+
+echo "=== Test#11-IP: RCCL AlltoAll: -D 5, GIN_ANVIL (SDMA ch=2) in-place only (-O 0) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=2 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1 -O 0 -V 128
+set +x
+fi
+
+#
+if [ 0 -eq 1 ]; then
+# Example: 2 nodes × 8 GPUs = 16 ranks (adjust -n and --hostfile)
+#
+# GIN_ANVIL (NCCL_GIN_TYPE=5) is single-node only (gin_host_anvil.cc). With nnodes>1, RCCL
+# emits WARN + ncclInvalidUsage. Multi-node: run standard alltoall (-D 0) instead.
+if [[ "${NNODES}" -gt 1 ]]; then
+echo "=== Test#12: RCCL AlltoAll: -D 0 (hostfile, nnodes=${NNODES} PPN=${PPN}; GIN_ANVIL skipped, single-node only) max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE_HFILE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=0 \
+  -x NCCL_GIN_TYPE=0 \
+  -x NCCL_DEBUG_SUBSYS=INIT,NET \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 0 -A 1
+set +x
+else
+echo "=== Test#13: RCCL AlltoAll: -D 5, GIN_ANVIL (NCCL_GIN_TYPE=5) nnodes=${NNODES} PPN=${PPN} max_bytes=${MAX_BYTES} ==="
+set -x
+sudo docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE_HFILE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=4 \
+  -x NCCL_GIN_ANVIL_SDMA_CHUNK_MB=16 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 5 -A 1
+set +x
+fi
+fi
+
