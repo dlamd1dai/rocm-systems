@@ -7,6 +7,7 @@ if [[ $# -lt 2 ]]; then
   echo "Rebuild gin-anvil after changing rocSHMEM tests (e.g. tester_arguments -v parsing):"
   echo "  $0 ... true   # or docker build --build-arg ROCSHMEM_CACHE_BUST=N ..."
   echo "External GIN DSO: place projects/rccl/docker-gin-plugin/libnccl-gin.so then rebuild; export GIN_HOST_USE_EXTERNAL_PLUGIN=1 for TYPE=2."
+  echo "Test#4 default: GIN_ANVIL (-D 3, NCCL_GIN_TYPE=5). Host IB proxy (TYPE=2): export RUN_GIN_HOST_PROXY=1."
   echo "Optional alltoall_perf diagnosis: RCCL_ALLTOALL_SMOOTH=1 | RCCL_ALLTOALL_PERF_EXTRA='-w 30 -n 120' | RCCL_ALLTOALL_SPLIT_INOUT=1"
   exit 1
 fi
@@ -200,8 +201,8 @@ fi
 
 if [ 1 -eq 1 ]; then
 #####
-# RCCL AlltoAll: -D 3 (GinAlltoAllKernel), GIN host proxy (NCCL_GIN_TYPE=2). IB must stay enabled
-# so built-in ncclGinIb can initialize; NCCL_IB_DISABLE=1 yields ginType NONE and -D 3 fails AlltoAllCommHasGin.
+# Test#4: see ruby_docker_build_test.bash — default GIN_ANVIL (-D 3, TYPE=5); RUN_GIN_HOST_PROXY=1 for TYPE=2.
+if [[ "${RUN_GIN_HOST_PROXY:-0}" == 1 ]]; then
 echo "=== Test#4: RCCL AlltoAll: -D 3, GIN host proxy (NCCL_GIN_TYPE=2, IB for plugin init) np=${NP} max_bytes=${MAX_BYTES} ==="
 set -x
 docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
@@ -224,6 +225,27 @@ docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
   ${RCCL_ALLTOALL_PERF_EXTRA} \
   -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
+else
+echo "=== Test#4: RCCL AlltoAll: -D 3, GIN_ANVIL smoke (NCCL_GIN_TYPE=5; RUN_GIN_HOST_PROXY=1 for TYPE=2) np=${NP} max_bytes=${MAX_BYTES} ==="
+set -x
+docker run ${DOCKER_GPU} ${DOCKER_ROCSHMEM_EXTRA} ${DOCKER_IMAGE} \
+  mpirun ${MPIRUN_BASE} \
+  ${RCCL_ENV_COMMON} \
+  -x RCCL_ROCSHMEM_ENABLE=0 \
+  -x NCCL_GIN_ENABLE=1 \
+  -x NCCL_GIN_TYPE=5 \
+  -x NCCL_DEBUG_SUBSYS=INIT \
+  -x NCCL_CUMEM_ENABLE=1 \
+  -x RCCL_ENABLE_INTRANET=1 \
+  -x NCCL_DMABUF_ENABLE=1 \
+  -x NCCL_MSCCL_ENABLE=0 \
+  -x HSA_NO_SCRATCH_RECLAIM=1 \
+  -x LD_LIBRARY_PATH=${RCCL_LD_PATH} \
+  /workspace/rccl-tests/alltoall_perf \
+  ${RCCL_ALLTOALL_PERF_EXTRA} \
+  -b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+fi
 fi
 
 # NCCL_GIN_TYPE=2 + -D 3: same host-proxy plugin as above; compare timing to GIN_ANVIL (-D 3/5, TYPE=5) below.
