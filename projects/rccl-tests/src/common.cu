@@ -1380,6 +1380,16 @@ testResult_t threadInit(struct threadArgs* args) {
   TESTCHECK(threadRunTests(args));
 
   // Cleanup: deregister buffers and destroy communicators
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+  if (deviceImpl) {
+    for (int i = 0; i < args->nGpus; i++) {
+      if (args->streams[i] != nullptr) {
+        CUDACHECK(cudaSetDevice(args->gpus[i]));
+        CUDACHECK(cudaStreamSynchronize(args->streams[i]));
+      }
+    }
+  }
+#endif
   for (int i=0; i<args->nGpus; i++) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
@@ -2237,6 +2247,18 @@ testResult_t run() {
 #endif
 
   if (!parallel_init) {
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+    // Drain user streams before devComm/comm teardown. Without this, some GIN device paths
+    // (e.g. -D 3 GinAlltoAllKernel) can rarely hang in ncclDevCommDestroy / MPI_Barrier on exit.
+    if (deviceImpl) {
+      for (int i = 0; i < nGpus * nThreads; ++i) {
+        if (streams[i] != nullptr) {
+          CUDACHECK(cudaSetDevice(gpus[i]));
+          CUDACHECK(cudaStreamSynchronize(streams[i]));
+        }
+      }
+    }
+#endif
     for(int i=0; i<nGpus*nThreads; ++i) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
