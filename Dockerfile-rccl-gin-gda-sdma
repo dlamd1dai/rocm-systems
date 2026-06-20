@@ -137,7 +137,7 @@ ARG USE_LOCAL_SRC=0
 ARG DEBUG_BUILD=0
 
 # ROCSHMEM_USE_SDMA=1 (default): rocSHMEM cmake USE_SDMA=ON. Required for GIN Anvil-SDMA
-# (NCCL_GIN_TYPE=6) exercised by docker-gin-gda-sdma-test.bash Test#5.
+# (NCCL_GIN_TYPE=5) exercised by docker-gin-gda-sdma-test.bash / docker-gin-gda-sdma-ruby-test.bash Test#5.
 # The Dockerfile upgrades rdma-core/libmlx5 from ${VERSION_CODENAME}-updates (when available).
 # Optional: --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 fails the build unless those MLX5 symbols exist.
 # Set --build-arg ROCSHMEM_USE_SDMA=0 if you do not need Test#5 and want a slightly leaner build.
@@ -170,7 +170,7 @@ RUN cd rocshmem/src/projects/rocshmem \
       -DGPU_TARGETS=${GPU_TARGETS} \
       -DCMAKE_INSTALL_PREFIX=${ROCSHMEM_INSTALL_DIR} \
       -DUSE_IPC=ON \
-      -DUSE_SDMA=ON \
+      -DUSE_SDMA=$([ "${ROCSHMEM_USE_SDMA}" = "1" ] && echo ON || echo OFF) \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug")
 
 ## building RCCL
