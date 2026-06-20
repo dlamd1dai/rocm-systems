@@ -15,7 +15,7 @@
 #   RCCL_GIN_GDA_DOCKER_RDMA_GROUP=0 → do not add --group-add rdma when host has that group
 #   RCCL_GIN_GDA_TEST4_MODE=auto   → GIN GDA (Test#4): auto-skip if host bnxt_en fw < min (default auto; run|skip)
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _GNU_DIRS / _IB_SYSFS / _BIND_HOST_DEV_INFINIBAND / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-test.bash header
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _MLX5_SO / _GNU_DIRS / _IB_SYSFS / _BIND_HOST_DEV_INFINIBAND / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-test.bash header
 #
 # If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
 # the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
@@ -131,12 +131,20 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_dst_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  if [[ -n "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE+x}" ]]; then
+    _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  else
+    _rccl_t2_mlx5_part=""
+    if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-0}" != 0 ]]; then
+      _rccl_t2_mlx5_part="libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 "
+    fi
+    _rccl_t2_bases="${_rccl_t2_mlx5_part}libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3 ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  fi
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
-  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted
+  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted _rccl_t2_mlx5_part
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
   for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do

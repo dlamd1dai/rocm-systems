@@ -14,8 +14,9 @@
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
-#       (same path in container) so mlx5/verbs match the NIC without replacing libc/libstdc++ (see ddai-gin-perf.log).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default includes libmlx5.so/.so.1, libmlx5-infiniband.so.1, libmlx5dv…, libibverbs…).
+#       (same path in container) for verbs/rdmacm without replacing libc (see ddai-gin-perf.log).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → if unset, default omits host libmlx5* (use image libmlx5 for MLX5_1.25 / mlx5dv_* with RCCL 2.30+; ddai-gin-perf.log).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO=1 → include host libmlx5.so, .so.1, libmlx5-infiniband, libmlx5dv (when image rdma is older than host NIC).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
@@ -133,13 +134,21 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_dst_mounted=""
-  # RCCL dlopens libmlx5.so; mlx5dv_* may be MLX5_1.25 on host libmlx5 / libmlx5dv (ddai-gin-perf.log).
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  if [[ -n "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE+x}" ]]; then
+    _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  else
+    _rccl_t2_mlx5_part=""
+    # Host libmlx5* often lacks MLX5_1.25 symbols RCCL dlvsym's (ddai-gin-perf.log); keep image libmlx5 unless explicitly overridden.
+    if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-0}" != 0 ]]; then
+      _rccl_t2_mlx5_part="libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 "
+    fi
+    _rccl_t2_bases="${_rccl_t2_mlx5_part}libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3 ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  fi
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
-  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted
+  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted _rccl_t2_mlx5_part
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
   for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do
