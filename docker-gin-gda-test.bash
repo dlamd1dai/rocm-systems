@@ -20,6 +20,8 @@
 #       adjacent (default): bind libmlx5* from the same directory as resolved host libibverbs.so.1 (pairs rdma-core with verbs; ddai-gin-perf.log).
 #       1: legacy — search RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS for libmlx5* (can pick a mismatched older .so).
 #       0: do not bind host libmlx5* (image libmlx5 only).
+#   RCCL_GIN_GDA_TEST2_HOST_MLX5_MIN_SO1_MINOR (default 25) → adjacent policy only: skip host libmlx5* when
+#       resolved libmlx5.so.1.N.* has N < min (host mlx5 too old for RCCL MLX5_1.25 dlvsym; ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
@@ -126,9 +128,10 @@ _rccl_gin_gda_host_so_mount_from_base() {
 
 # Bind host libmlx5* from the directory of resolved libibverbs.so.1 (same rdma-core install). RCCL dlopens
 # "libmlx5.so" and dlvsym's MLX5_1.25 — image libmlx5 can be too old while host libibverbs is new (ddai-gin-perf.log).
+# Host adjacent libmlx5.so.1.N.* with small N can also be too old vs RCCL while the image mlx5 is new (ddai-gin-perf.log).
 _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
-  local d cand verbs_real vbdir mlx cand2 real
+  local d cand verbs_real vbdir mlx cand2 real check cand5 bn min_impl impl_n
   verbs_real=""
   for d in ${_dirs}; do
     cand="${d}/libibverbs.so.1"
@@ -139,6 +142,24 @@ _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   done
   [[ -n "${verbs_real}" ]] || return 0
   vbdir=$(dirname "${verbs_real}")
+  min_impl="${RCCL_GIN_GDA_TEST2_HOST_MLX5_MIN_SO1_MINOR:-25}"
+  check=""
+  for cand5 in "${vbdir}/libmlx5.so.1" "${vbdir}/libmlx5.so"; do
+    [[ -e "${cand5}" ]] || continue
+    check=$(readlink -f "${cand5}" 2>/dev/null || true)
+    [[ -z "${check}" || ! -e "${check}" ]] && check="${cand5}"
+    break
+  done
+  if [[ -n "${check}" ]]; then
+    bn=$(basename "${check}")
+    if [[ "${bn}" =~ ^libmlx5.*\.so\.1\.([0-9]+) ]]; then
+      impl_n="${BASH_REMATCH[1]}"
+      if (( 10#${impl_n} < 10#${min_impl} )); then
+        echo "=== RCCL_GIN_GDA: Test#2 skipping adjacent host libmlx5* bind (${bn}; impl ${impl_n} < ${min_impl}; RCCL MLX5_1.25 dlvsym — using image libmlx5; ddai-gin-perf.log). ===" >&2
+        return 0
+      fi
+    fi
+  fi
   for mlx in libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1; do
     cand2="${vbdir}/${mlx}"
     [[ -e "${cand2}" ]] || continue
