@@ -6,7 +6,7 @@
 # Optional env (same semantics as docker-gin-gda-ruby-test.bash where noted):
 #   RCCL_GIN_GDA_DOCKER_IT=1          → add docker -it (interactive TTY)
 #   RCCL_GIN_GDA_DOCKER_ULIMIT_MEMLOCK=0 → omit --ulimit memlock=-1:-1
-#   RCCL_GIN_GDA_DOCKER_UVERBS=0      → omit per-uverbs --device (Ib proxy / Test#2)
+#   RCCL_GIN_GDA_DOCKER_UVERBS=0      → omit per-uverbs --device (Ib proxy / Test#2; default: readlink -f + nullglob on /dev/infiniband/uverbs* and /dev/uverbs*, numeric fallback)
 #   RCCL_GIN_GDA_DOCKER_RDMA_GROUP=0  → omit --group-add rdma
 #   RCCL_GIN_GDA_DOCKER_EXTRA         → extra docker run flags
 #   RCCL_GIN_GDA_MPI_MCA_EXTRA        → extra mpirun -mca tokens
@@ -38,11 +38,44 @@ fi
 
 DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${RCCL_GIN_GDA_DOCKER_EXTRA:-}"
 
+# Without per-uverbs --device, ibverbs sees no HCAs and GIN IB proxy stays off (ddai-gin-perf.log).
+# Use nullglob; resolve with readlink -f before [[ -c ]] — /dev/infiniband/uverbs* are often symlinks
+# and bash -c is false on the symlink path even when the target is a char dev (ddai-gin-perf.log).
+RCCL_GIN_GDA_UVERBS_ADDED=0
+_rccl_gin_gda_uverbs_real_seen=""
+_rccl_gin_gda_docker_add_uverbs_resolved() {
+  local p="$1" rp
+  [[ -e "${p}" ]] || return 1
+  rp=$(readlink -f "${p}" 2>/dev/null) || return 1
+  [[ -n "${rp}" ]] || rp="${p}"
+  [[ -c "${rp}" ]] || return 1
+  if [[ " ${_rccl_gin_gda_uverbs_real_seen} " == *" ${rp} "* ]]; then
+    return 0
+  fi
+  DOCKER_GPU_COMMON+=" --device ${rp}"
+  _rccl_gin_gda_uverbs_real_seen+=" ${rp} "
+  RCCL_GIN_GDA_UVERBS_ADDED=$((RCCL_GIN_GDA_UVERBS_ADDED + 1))
+}
 if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]]; then
-  for _rccl_uverbs in /dev/infiniband/uverbs*; do
-    [[ -c "$_rccl_uverbs" ]] && DOCKER_GPU_COMMON+=" --device ${_rccl_uverbs}"
+  shopt -s nullglob
+  for _rccl_uverbs in /dev/infiniband/uverbs* /dev/uverbs*; do
+    _rccl_gin_gda_docker_add_uverbs_resolved "${_rccl_uverbs}" || true
   done
+  shopt -u nullglob
+  if [[ "${RCCL_GIN_GDA_UVERBS_ADDED}" -eq 0 ]]; then
+    for _rccl_uvi in $(seq 0 31); do
+      _rccl_gin_gda_docker_add_uverbs_resolved "/dev/infiniband/uverbs${_rccl_uvi}" || true
+      _rccl_gin_gda_docker_add_uverbs_resolved "/dev/uverbs${_rccl_uvi}" || true
+    done
+  fi
 fi
+if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED}" -eq 0 ]]; then
+  _rccl_gin_uv_msg="warning: RCCL_GIN_GDA: no RDMA uverbs char devices added to docker (checked /dev/infiniband/uverbs*, /dev/uverbs*, resolved symlinks); GIN IB proxy (Test#2) needs them on the host."
+  echo "${_rccl_gin_uv_msg}" >&2
+  echo "${_rccl_gin_uv_msg}"
+  unset _rccl_gin_uv_msg
+fi
+unset _rccl_gin_gda_uverbs_real_seen
 if [[ "${RCCL_GIN_GDA_DOCKER_RDMA_GROUP:-1}" != 0 ]] && getent group rdma >/dev/null 2>&1; then
   DOCKER_GPU_COMMON+=" --group-add rdma"
 fi
@@ -201,6 +234,10 @@ set +x
 
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
+  if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
+    echo "=== RCCL_GIN_GDA: WARNING: Test#2 docker line has no uverbs --device; IB GIN will likely fail. ===" >&2
+    echo "=== RCCL_GIN_GDA: WARNING: Test#2 docker line has no uverbs --device; IB GIN will likely fail. ==="
+  fi
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -214,7 +251,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=VERSION \
+    -x NCCL_DEBUG=INFO \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=2 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
