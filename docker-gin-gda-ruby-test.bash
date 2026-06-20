@@ -152,12 +152,8 @@ case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
   on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
   off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
   auto)
-    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
-      if [[ -d /dev/infiniband ]]; then
-        _rccl_gin_gda_t2_dev_inf_bind=1
-      elif [[ -d /sys/class/infiniband ]] && compgen -G '/sys/class/infiniband/*' >/dev/null; then
-        _rccl_gin_gda_t2_dev_inf_bind=1
-      fi
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && { [[ -d /dev/infiniband ]] || [[ -d /sys/class/infiniband ]]; }; then
+      _rccl_gin_gda_t2_dev_inf_bind=1
     fi
     ;;
   *)

@@ -22,7 +22,7 @@
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS=1 (default) → Test#2: -v host /sys/class/infiniband and /etc/libibverbs.d (ro) so
 #       ibverbs can enumerate HCAs inside Docker (fixes GIN off when libs are correct; ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND=auto|on|off (default auto) → Test#2: if no uverbs --device, -v
-#       /dev/infiniband:/dev/infiniband when /dev/infiniband is a dir OR /sys/class/infiniband has entries (Slurm; ddai-gin-perf.log).
+#       /dev/infiniband:/dev/infiniband when /dev/infiniband or /sys/class/infiniband exists (no sysfs glob; ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS → dirs to resolve RDMA .so basenames (default includes lib64 paths).
 #
 
@@ -155,13 +155,10 @@ case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
   on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
   off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
   auto)
-    # Slurm/cgroups often hide /dev/infiniband from the shell even when MLX exists in sysfs (ddai-gin-perf.log).
-    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
-      if [[ -d /dev/infiniband ]]; then
-        _rccl_gin_gda_t2_dev_inf_bind=1
-      elif [[ -d /sys/class/infiniband ]] && compgen -G '/sys/class/infiniband/*' >/dev/null; then
-        _rccl_gin_gda_t2_dev_inf_bind=1
-      fi
+    # Slurm/cgroups often hide /dev/infiniband and /sys/class/infiniband/* from globs; dockerd still
+    # has the real tree — bind when either path exists (ddai-gin-perf.log: compgen on sysfs was false).
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && { [[ -d /dev/infiniband ]] || [[ -d /sys/class/infiniband ]]; }; then
+      _rccl_gin_gda_t2_dev_inf_bind=1
     fi
     ;;
   *)
