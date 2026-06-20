@@ -3,7 +3,7 @@
 # Single-node GIN / alltoall_perf harness (non-Ruby nodes: uses `docker` not `sudo docker`).
 # See docs/docker-gin-gda-ruby-gin-backends-and-tests.md for GIN design (types vs -D).
 #
-# Optional env (same semantics as docker-gin-gda-ruby-test.bash where noted):
+# Optional env (same semantics as docker-gin-gda-sdma-ruby-test.bash where noted):
 #   RCCL_GIN_GDA_DOCKER_IT=1          → add docker -it (interactive TTY)
 #   RCCL_GIN_GDA_DOCKER_ULIMIT_MEMLOCK=0 → omit --ulimit memlock=-1:-1
 #   RCCL_GIN_GDA_DOCKER_UVERBS=0      → omit per-uverbs --device (Ib proxy / Test#2; default: readlink -f + nullglob on /dev/infiniband/uverbs* and /dev/uverbs*, numeric fallback)
@@ -12,6 +12,8 @@
 #   RCCL_GIN_GDA_MPI_MCA_EXTRA        → extra mpirun -mca tokens
 #   RCCL_GIN_GDA_TEST4_MODE=auto|run|skip → GIN GDA (Test#4): auto-skip if no bnxt_en or fw < min
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
+#   RCCL_GIN_GDA_TEST5_MODE=skip      → skip Test#5 (GIN Anvil SDMA / NCCL_GIN_TYPE=6; default run)
+#   RCCL_GIN_GDA_TEST5_NUM_CHANNELS → NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS for Test#5 (default 1)
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) for verbs/rdmacm without replacing libc (see ddai-gin-perf.log).
@@ -383,6 +385,37 @@ set -x
     -x HSA_NO_SCRATCH_RECLAIM=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
+
+if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" != "skip" ]]; then
+set -x
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=6) ==="
+  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    -x OMPI_ALLOW_RUN_AS_ROOT=1 \
+    -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
+    -x RCCL_ROCSHMEM_ENABLE=0 \
+    -x ROCSHMEM_BACKEND=ipc \
+    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
+    -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
+    -x NCCL_DEBUG=VERSION \
+    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_TYPE=6 \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_GDA_TEST5_NUM_CHANNELS:-1}" \
+    -x NCCL_DEBUG_SUBSYS=INIT,NET \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x RCCL_ENABLE_INTRANET=1 \
+    -x NCCL_DMABUF_ENABLE=1 \
+    -x NCCL_MSCCL_ENABLE=0 \
+    -x HSA_NO_SCRATCH_RECLAIM=1 \
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+else
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (skipped; RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
+fi
 
 if [ 0 -eq 1 ]; then
 if [[ "${RCCL_GIN_GDA_RUN_TEST4}" == 0 ]]; then

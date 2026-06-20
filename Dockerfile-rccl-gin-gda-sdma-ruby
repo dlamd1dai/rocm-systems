@@ -5,22 +5,22 @@
 FROM ubuntu:24.04
 
 #Example build: from a github pull
-#docker build -f Dockerfile-rccl-gin-gda -t rccl-gingda713 --build-arg GPU_TARGETS=gfx950  .
+#docker build -f Dockerfile-rccl-gin-gda-sdma-ruby -t rccl-gingda713 --build-arg GPU_TARGETS=gfx950  .
 #--build-arg ROCSHMEM_CACHE_BUST=N: increase N to force pull rocSHMEM and rebuilding
 #--build-arg RCCL_CACHE_BUST=N: increase N to force pull RCCL and RCCL-test and rebuilding
 #--build-arg ROCSHMEM_BRANCH=users/abouteiller/gin-stage2 (RCCL_BRANCH): pull and build that specific branch from github
 # Example build: from local sources, CWD in the rocm-systems pull
-#docker build -f Dockerfile-rccl-gin-gda -t rccl-gingda713 --build-arg GPU_TARGETS=gfx950 --build-arg ROCSHMEM_CACHE_BUST=5 --build-arg USE_LOCAL_SRC=1  .
+#docker build -f Dockerfile-rccl-gin-gda-sdma-ruby -t rccl-gingda713 --build-arg GPU_TARGETS=gfx950 --build-arg ROCSHMEM_CACHE_BUST=5 --build-arg USE_LOCAL_SRC=1  .
 
 # Example command lines:
 #docker run -it --rm --shm-size 64G   --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged  rccl-gingda mpirun -n 8 -mca pml ob1 -mca btl ^openib -x RCCL_ROCSHMEM_ENABLE=0 -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) -x NCCL_DEBUG=VERSION -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=2 -x NCCL_DEBUG_SUBSYS=INIT,NET -x NCCL_CUMEM_ENABLE=1 -x RCCL_ENABLE_INTRANET=1  -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 rccl-tests/alltoall_perf -b 128 -e 128M -f 2 -g 1 -R 2 -D 3 -A 1
 #docker run -it --rm --shm-size 64G   --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged  rccl-gingda mpirun -n 8 -mca pml ob1 -mca btl ^openib rocshmem/bin/rocshmem_functional_tests -a 19 -w 1 -z 256 -v $((128*1024*1024)) -noverif
 
 ## creating scratch space
-ENV WORKDIR /workspace
+ENV WORKDIR=/workspace
 RUN mkdir -p ${WORKDIR}
 WORKDIR ${WORKDIR}
-ENV SRC /src
+ENV SRC=/src
 RUN mkdir -p ${SRC}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -81,6 +81,10 @@ RUN apt-get install -y --no-install-recommends \
 
 ## Set ROCm path
 ENV ROCM_PATH=/opt/rocm
+# System OpenMPI from apt (custom /opt/ompi build is commented out above). Needed for
+# rocSHMEM MPI_ROOT, rccl-tests CMAKE_PREFIX_PATH, and final PATH/LD_LIBRARY_PATH.
+ENV MPI_INSTALL_PREFIX=/usr
+ENV MPI_INSTALL_DIR=/usr
 
 # We use MPI only as a launcher, any MPI will do, use system install
 ## Install UCX
@@ -133,6 +137,11 @@ ARG USE_LOCAL_SRC=0
 # DEBUG_BUILD=1: build all components with debug symbols (-g, Debug).
 ARG DEBUG_BUILD=0
 
+# ROCSHMEM_USE_SDMA=1 (default): rocSHMEM cmake USE_SDMA=ON. Required for GIN Anvil-SDMA
+# (NCCL_GIN_TYPE=6) exercised by docker-gin-gda-sdma-ruby-test.bash / docker-gin-gda-sdma-test.bash Test#5.
+# Set --build-arg ROCSHMEM_USE_SDMA=0 if you do not need Test#5 and want a slightly leaner build.
+ARG ROCSHMEM_USE_SDMA=1
+
 ## building rocSHMEM
 ARG ROCSHMEM_BRANCH=users/abouteiller/gin-stage2
 ARG ROCSHMEM_CACHE_BUST=1
@@ -155,11 +164,12 @@ RUN cd rocshmem/src/projects/rocshmem \
  && mkdir -p build && cd build \
  && ../scripts/build_configs/all_backends \
       -DBUILD_DEBUG_TRACE_DEVICE=ON -DBUILD_DEBUG_DEVICE=ON -DBUILD_DEBUG_TRACE_HOST=ON \
-      -DMPI_ROOT=${MPI_INSTALL_DIR} \
+      -DMPI_ROOT=${MPI_INSTALL_PREFIX} \
       -DUSE_EXTERNAL_MPI=OFF \
       -DGPU_TARGETS=${GPU_TARGETS} \
       -DCMAKE_INSTALL_PREFIX=${ROCSHMEM_INSTALL_DIR} \
-      -DUSE_IPC=ON -DUSE_SDMA=ON \
+      -DUSE_IPC=ON \
+      -DUSE_SDMA=$([ "${ROCSHMEM_USE_SDMA}" = "1" ] && echo ON || echo OFF) \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug")
 
 ## building RCCL
@@ -214,11 +224,11 @@ RUN mkdir rccl-tests \
 
 ## set environment variables
 ENV PATH="${MPI_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
 ENV UCX_WARN_UNUSED_ENV_VARS=n
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-ENV NCL_DEBUG=VERSION
+ENV NCCL_DEBUG=VERSION
 ENV ROCSHMEM_DEBUG_LEVEL=info:noversion
 ENV ROCSHMEM_TEST_UUID=1
 
