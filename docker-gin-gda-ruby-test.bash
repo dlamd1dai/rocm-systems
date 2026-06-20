@@ -90,14 +90,14 @@ if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
   GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
 fi
 
-_rccl_gin_gda_host_so_add_mount() {
-  local p="$1"
-  [[ -n "$p" && -e "$p" ]] || return 0
-  if [[ " ${_rccl_t2_mounted} " == *" ${p} "* ]]; then
+_rccl_gin_gda_host_so_add_bind() {
+  local src="$1" dst="$2"
+  [[ -n "${src}" && -e "${src}" && -n "${dst}" ]] || return 0
+  if [[ " ${_rccl_t2_dst_mounted} " == *" ${dst} "* ]]; then
     return 0
   fi
-  DOCKER_TEST2_VOLUMES+=" -v ${p}:${p}:ro"
-  _rccl_t2_mounted+=" ${p} "
+  DOCKER_TEST2_VOLUMES+=" -v ${src}:${dst}:ro"
+  _rccl_t2_dst_mounted+=" ${dst} "
 }
 
 _rccl_gin_gda_host_so_mount_from_base() {
@@ -106,9 +106,12 @@ _rccl_gin_gda_host_so_mount_from_base() {
   for d in ${_dirs}; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
-    _rccl_gin_gda_host_so_add_mount "${cand}"
     real=$(readlink -f "${cand}" 2>/dev/null || true)
-    [[ -n "${real}" && "${real}" != "${cand}" ]] && _rccl_gin_gda_host_so_add_mount "${real}"
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${cand}"
+    _rccl_gin_gda_host_so_add_bind "${real}" "${cand}"
+    if [[ "${real}" != "${cand}" ]]; then
+      _rccl_gin_gda_host_so_add_bind "${real}" "${real}"
+    fi
     return 0
   done
   return 1
@@ -126,13 +129,13 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   unset _rccl_t2_d _rccl_t2_libdirs
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
-  _rccl_t2_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  _rccl_t2_dst_mounted=""
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
-  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_mounted
+  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
   for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do
@@ -148,7 +151,7 @@ case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
   on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
   off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
   auto)
-    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]] && compgen -G '/dev/infiniband/*' >/dev/null; then
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]]; then
       _rccl_gin_gda_t2_dev_inf_bind=1
     fi
     ;;
