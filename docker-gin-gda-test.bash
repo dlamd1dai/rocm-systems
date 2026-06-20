@@ -15,14 +15,14 @@
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) so mlx5/verbs match the NIC without replacing libc/libstdc++ (see ddai-gin-perf.log).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default includes libmlx5.so + .so.1, libibverbs.so + .so.1, …).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default includes libmlx5.so/.so.1, libmlx5dv.so/.so.1, libibverbs…).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS=1 (default) → Test#2: -v host /sys/class/infiniband and /etc/libibverbs.d (ro) so
 #       ibverbs can enumerate HCAs inside Docker (fixes GIN off when libs are correct; ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND=auto|on|off (default auto) → Test#2: if no uverbs --device was added, -v
-#       /dev/infiniband:/dev/infiniband so cgroup/Slurm jobs still see host uverbs (ddai-gin-perf.log).
+#       /dev/infiniband:/dev/infiniband (auto whenever /dev/infiniband exists; Slurm may hide entries from compgen but dockerd still sees devices; ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS → dirs to resolve RDMA .so basenames (default includes lib64 paths).
 #
 
@@ -90,16 +90,16 @@ if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
   GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
 fi
 
-# Test#2 (GIN IB proxy): per-host .so mounts. Mount the *soname path* (e.g. libmlx5.so.1), not only readlink -f target,
-# or the loader still follows the container's symlink to the image's older mlx5 (GIN stays off; ddai-gin-perf.log).
-_rccl_gin_gda_host_so_add_mount() {
-  local p="$1"
-  [[ -n "$p" && -e "$p" ]] || return 0
-  if [[ " ${_rccl_t2_mounted} " == *" ${p} "* ]]; then
+# Test#2 (GIN IB proxy): bind host *resolved* ELF onto each logical path (ddai-gin-perf.log: libmlx5.so is often a symlink;
+# -v symlink:symlink leaves wrong mlx5dv_*; use -v readlink -f(libmlx5.so):libmlx5.so).
+_rccl_gin_gda_host_so_add_bind() {
+  local src="$1" dst="$2"
+  [[ -n "${src}" && -e "${src}" && -n "${dst}" ]] || return 0
+  if [[ " ${_rccl_t2_dst_mounted} " == *" ${dst} "* ]]; then
     return 0
   fi
-  DOCKER_TEST2_VOLUMES+=" -v ${p}:${p}:ro"
-  _rccl_t2_mounted+=" ${p} "
+  DOCKER_TEST2_VOLUMES+=" -v ${src}:${dst}:ro"
+  _rccl_t2_dst_mounted+=" ${dst} "
 }
 
 _rccl_gin_gda_host_so_mount_from_base() {
@@ -108,9 +108,12 @@ _rccl_gin_gda_host_so_mount_from_base() {
   for d in ${_dirs}; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
-    _rccl_gin_gda_host_so_add_mount "${cand}"
     real=$(readlink -f "${cand}" 2>/dev/null || true)
-    [[ -n "${real}" && "${real}" != "${cand}" ]] && _rccl_gin_gda_host_so_add_mount "${real}"
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${cand}"
+    _rccl_gin_gda_host_so_add_bind "${real}" "${cand}"
+    if [[ "${real}" != "${cand}" ]]; then
+      _rccl_gin_gda_host_so_add_bind "${real}" "${real}"
+    fi
     return 0
   done
   return 1
@@ -128,14 +131,14 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   unset _rccl_t2_d _rccl_t2_libdirs
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
-  _rccl_t2_mounted=""
-  # RCCL dlopens libmlx5.so (unversioned); mounting only .so.1 leaves image libmlx5.so → missing mlx5dv_* (ddai-gin-perf.log).
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  _rccl_t2_dst_mounted=""
+  # RCCL dlopens libmlx5.so; mlx5dv_* may be MLX5_1.25 on host libmlx5 / libmlx5dv (ddai-gin-perf.log).
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
-  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_mounted
+  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
   for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do
@@ -151,7 +154,7 @@ case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
   on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
   off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
   auto)
-    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]] && compgen -G '/dev/infiniband/*' >/dev/null; then
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]]; then
       _rccl_gin_gda_t2_dev_inf_bind=1
     fi
     ;;
