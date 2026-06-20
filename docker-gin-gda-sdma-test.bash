@@ -412,14 +412,7 @@ fi
 
 if [ 0 -eq 1 ]; then
 set -x
-  echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
-  if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
-    if [[ "${RCCL_GIN_GDA_TEST2_DEV_INF_MOUNTED:-0}" -eq 1 ]]; then
-      echo "=== RCCL_GIN_GDA: Test#2 bind-mounts host /dev/infiniband (no uverbs --device from this shell; cgroup/Slurm)." >&2
-    else
-      echo "=== RCCL_GIN_GDA: WARNING: Test#2 has no uverbs --device and no /dev/infiniband bind; IB GIN will likely fail (see RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND)." >&2
-    fi
-  fi
+  echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (-D 3) ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -447,9 +440,9 @@ set -x
 set +x
 fi
 
-if [ 1 -eq 1 ]; then
-set -x
-  echo "=== Test#3: A2A, ${NP} gpus, GIN ROCSHMEM+SDMA ==="
+if [ 0 -eq 1 ]; then
+  set -x
+  echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -472,40 +465,12 @@ set -x
     -x NCCL_MSCCL_ENABLE=0 \
     -x HSA_NO_SCRATCH_RECLAIM=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
-set +x
-fi
-
-if [ 0 -eq 1 ]; then
-  set -x
-  echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
-    mpirun -n "${NP}" ${MPI_OPT} \
-    -x OMPI_ALLOW_RUN_AS_ROOT=1 \
-    -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-    "${GIN_PLUGIN_X[@]}" \
-    -x NCCL_NET_PLUGIN=none \
-    -x RCCL_ROCSHMEM_ENABLE=0 \
-    -x ROCSHMEM_BACKEND=ipc \
-    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
-    -x ROCSHMEM_SDMA_ENABLED=1 \
-    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
-    -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=VERSION \
-    -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=5 \
-    -x NCCL_DEBUG_SUBSYS=INIT,NET \
-    -x NCCL_CUMEM_ENABLE=1 \
-    -x RCCL_ENABLE_INTRANET=1 \
-    -x NCCL_DMABUF_ENABLE=1 \
-    -x NCCL_MSCCL_ENABLE=0 \
-    -x HSA_NO_SCRATCH_RECLAIM=1 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
 fi
 
 if [ 1 -eq 1 ]; then
 set -x
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=6) ==="
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=5) ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -520,7 +485,7 @@ set -x
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
     -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=6 \
+    -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_SDMA_TEST5_NUM_CHANNELS:-1}" \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
     -x NCCL_CUMEM_ENABLE=1 \
