@@ -274,7 +274,7 @@ static void initPluginLibsOnceFunc() {
     ginPluginLibs[pluginCounter].ncclGinPluginState = ncclGinPluginStateInitReady;
     pluginCounter++;
   }
-  // Add internal SDMA Anvil plugin (GIN_TYPE=6)
+  // Add internal SDMA Anvil plugin (GIN_TYPE=5)
   {
     extern ncclGin_t ncclGinRocshmemAnvilPlugin;
     ginPluginLibs[pluginCounter].ncclGin = &ncclGinRocshmemAnvilPlugin;

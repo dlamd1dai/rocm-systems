@@ -7,7 +7,7 @@
 #ifdef ENABLE_ROCSHMEM_GIN
 
 /**
- * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
+ * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=5).
  * Host flow mirrors GIN-GDA (connect builds transport resources, regMrSym exchanges
  * addressing metadata, createContext wires device context). Data movement uses
  * rocSHMEM's Anvil SDMA helpers (anvil::put / quiet / signal) directly — not rocshmem_putmem.
