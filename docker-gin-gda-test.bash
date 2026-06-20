@@ -15,12 +15,14 @@
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) so mlx5/verbs match the NIC without replacing libc/libstdc++ (see ddai-gin-perf.log).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default libmlx5.so.1 libibverbs.so.1 …).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default includes libmlx5.so + .so.1, libibverbs.so + .so.1, …).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS=1 (default) → Test#2: -v host /sys/class/infiniband and /etc/libibverbs.d (ro) so
 #       ibverbs can enumerate HCAs inside Docker (fixes GIN off when libs are correct; ddai-gin-perf.log).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND=auto|on|off (default auto) → Test#2: if no uverbs --device was added, -v
+#       /dev/infiniband:/dev/infiniband so cgroup/Slurm jobs still see host uverbs (ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS → dirs to resolve RDMA .so basenames (default includes lib64 paths).
 #
 
@@ -68,12 +70,6 @@ if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]]; then
       _rccl_gin_gda_docker_add_uverbs_resolved "/dev/uverbs${_rccl_uvi}" || true
     done
   fi
-fi
-if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED}" -eq 0 ]]; then
-  _rccl_gin_uv_msg="warning: RCCL_GIN_GDA: no RDMA uverbs char devices added to docker (checked /dev/infiniband/uverbs*, /dev/uverbs*, resolved symlinks); GIN IB proxy (Test#2) needs them on the host."
-  echo "${_rccl_gin_uv_msg}" >&2
-  echo "${_rccl_gin_uv_msg}"
-  unset _rccl_gin_uv_msg
 fi
 unset _rccl_gin_gda_uverbs_real_seen
 if [[ "${RCCL_GIN_GDA_DOCKER_RDMA_GROUP:-1}" != 0 ]] && getent group rdma >/dev/null 2>&1; then
@@ -133,7 +129,8 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  # RCCL dlopens libmlx5.so (unversioned); mounting only .so.1 leaves image libmlx5.so → missing mlx5dv_* (ddai-gin-perf.log).
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
@@ -146,6 +143,28 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
   done
   unset _rccl_ibsys
 fi
+
+RCCL_GIN_GDA_TEST2_DEV_INF_MOUNTED=0
+RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND="${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND:-auto}"
+_rccl_gin_gda_t2_dev_inf_bind=0
+case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
+  on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
+  off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
+  auto)
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]] && compgen -G '/dev/infiniband/*' >/dev/null; then
+      _rccl_gin_gda_t2_dev_inf_bind=1
+    fi
+    ;;
+  *)
+    echo "error: RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND must be auto, on, or off (got: ${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND})" >&2
+    exit 1
+    ;;
+esac
+if [[ "${_rccl_gin_gda_t2_dev_inf_bind}" -eq 1 ]]; then
+  DOCKER_TEST2_VOLUMES+=" -v /dev/infiniband:/dev/infiniband"
+  RCCL_GIN_GDA_TEST2_DEV_INF_MOUNTED=1
+fi
+unset _rccl_gin_gda_t2_dev_inf_bind
 
 # True (status 0) if dotted version $1 >= $2 (four numeric fields).
 _rccl_gin_gda_ver_ge() {
@@ -235,8 +254,11 @@ set +x
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
   if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
-    echo "=== RCCL_GIN_GDA: WARNING: Test#2 docker line has no uverbs --device; IB GIN will likely fail. ===" >&2
-    echo "=== RCCL_GIN_GDA: WARNING: Test#2 docker line has no uverbs --device; IB GIN will likely fail. ==="
+    if [[ "${RCCL_GIN_GDA_TEST2_DEV_INF_MOUNTED:-0}" -eq 1 ]]; then
+      echo "=== RCCL_GIN_GDA: Test#2 bind-mounts host /dev/infiniband (no uverbs --device from this shell; cgroup/Slurm)." >&2
+    else
+      echo "=== RCCL_GIN_GDA: WARNING: Test#2 has no uverbs --device and no /dev/infiniband bind; IB GIN will likely fail (see RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND)." >&2
+    fi
   fi
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
