@@ -11,6 +11,8 @@
 #   RCCL_GIN_GDA_PREFLIGHT=0       → skip docker preflight (default 1: mpirun hostname + rocm-smi)
 #   RCCL_GIN_GDA_MPI_MCA_EXTRA     → extra mpirun -mca ... tokens (quoted on your shell if needed)
 #   RCCL_GIN_GDA_DOCKER_EXTRA      → extra docker run flags (e.g. --pid=host)
+#   RCCL_GIN_GDA_TEST4_MODE=auto   → GIN GDA (Test#4): auto-skip if host bnxt_en fw < min (default auto; run|skip)
+#   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
 #
 # If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
 # the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
@@ -60,6 +62,45 @@ if [[ "${MPI_OPT}" != *"--allow-run-as-root"* ]]; then
   exit 1
 fi
 
+# True (status 0) if dotted version $1 >= $2 (four numeric fields).
+_rccl_gin_gda_ver_ge() {
+  local IFS=.
+  local -a a b
+  read -r -a a <<< "$1"
+  read -r -a b <<< "$2"
+  local i ai bi
+  for i in 0 1 2 3; do
+    ai=${a[i]:-0}
+    bi=${b[i]:-0}
+    (( 10#$ai > 10#$bi )) && return 0
+    (( 10#$ai < 10#$bi )) && return 1
+  done
+  return 0
+}
+
+# Returns 0 → skip Test#4; 1 → run Test#4 (auto mode only).
+_rccl_gin_gda_should_skip_test4_auto() {
+  command -v ethtool >/dev/null 2>&1 || return 1
+  local nic driver fw
+  local min="${RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA:-233.2.104.0}"
+  for nic in /sys/class/net/*; do
+    [[ -e "$nic" ]] || continue
+    nic=${nic##*/}
+    [[ "$nic" == lo ]] && continue
+    driver=$(readlink -f "/sys/class/net/$nic/device/driver" 2>/dev/null)
+    driver=${driver##*/}
+    [[ "$driver" == bnxt_en ]] || continue
+    fw=$(ethtool -i "$nic" 2>/dev/null | awk -F': +' '/firmware-version:/{v=$2; gsub(/ .*/,"",v); gsub(/\/.*/,"",v); print v; exit}')
+    [[ -n "$fw" ]] || continue
+    if ! _rccl_gin_gda_ver_ge "$fw" "$min"; then
+      echo "=== RCCL_GIN_GDA: bnxt NIC '${nic}' firmware ${fw} < ${min} (RCCL GIN GDA probe minimum). Skipping Test#4. ===" >&2
+      echo "=== Upgrade BNXT firmware or force: RCCL_GIN_GDA_TEST4_MODE=run ===" >&2
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ "${RCCL_GIN_GDA_PREFLIGHT:-1}" == 1 ]]; then
   echo "=== Preflight: container, rocm-smi, mpirun hostname (RCCL_GIN_GDA_PREFLIGHT=0 to skip) ===" >&2
   ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
@@ -88,7 +129,7 @@ set -x
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
     -x NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG}" \
-    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
     -x NCCL_CUMEM_ENABLE=1 \
@@ -147,7 +188,25 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 
-set -x
+RCCL_GIN_GDA_RUN_TEST4=1
+case "${RCCL_GIN_GDA_TEST4_MODE:-auto}" in
+  skip) RCCL_GIN_GDA_RUN_TEST4=0 ;;
+  run) RCCL_GIN_GDA_RUN_TEST4=1 ;;
+  auto)
+    if _rccl_gin_gda_should_skip_test4_auto; then
+      RCCL_GIN_GDA_RUN_TEST4=0
+    fi
+    ;;
+  *)
+    echo "error: RCCL_GIN_GDA_TEST4_MODE must be auto, run, or skip (got: ${RCCL_GIN_GDA_TEST4_MODE})" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${RCCL_GIN_GDA_RUN_TEST4}" == 0 ]]; then
+  echo "=== Test#4: A2A, ${NP} gpus, GIN GDA (skipped) ===" >&2
+else
+  set -x
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \
     mpirun -n ${NP} ${MPI_OPT} \
@@ -169,7 +228,8 @@ set -x
     -x NCCL_MSCCL_ENABLE=0 \
     -x HSA_NO_SCRATCH_RECLAIM=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
-set +x
+  set +x
+fi
 
 # done
 
