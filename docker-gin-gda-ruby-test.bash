@@ -101,19 +101,20 @@ _rccl_gin_gda_host_so_add_bind() {
 }
 
 _rccl_gin_gda_host_so_mount_from_base() {
-  local base="$1" d cand real
+  local base="$1" d cand real any=0
   local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
   for d in ${_dirs}; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
+    any=1
     real=$(readlink -f "${cand}" 2>/dev/null || true)
     [[ -z "${real}" || ! -e "${real}" ]] && real="${cand}"
     _rccl_gin_gda_host_so_add_bind "${real}" "${cand}"
     if [[ "${real}" != "${cand}" ]]; then
       _rccl_gin_gda_host_so_add_bind "${real}" "${real}"
     fi
-    return 0
   done
+  [[ "${any}" -eq 1 ]] && return 0
   return 1
 }
 
@@ -130,7 +131,7 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_dst_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
@@ -151,8 +152,12 @@ case "${RCCL_GIN_GDA_TEST2_BIND_HOST_DEV_INFINIBAND}" in
   on) _rccl_gin_gda_t2_dev_inf_bind=1 ;;
   off) _rccl_gin_gda_t2_dev_inf_bind=0 ;;
   auto)
-    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]] && [[ -d /dev/infiniband ]]; then
-      _rccl_gin_gda_t2_dev_inf_bind=1
+    if [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
+      if [[ -d /dev/infiniband ]]; then
+        _rccl_gin_gda_t2_dev_inf_bind=1
+      elif [[ -d /sys/class/infiniband ]] && compgen -G '/sys/class/infiniband/*' >/dev/null; then
+        _rccl_gin_gda_t2_dev_inf_bind=1
+      fi
     fi
     ;;
   *)
