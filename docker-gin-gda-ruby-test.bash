@@ -161,7 +161,7 @@ set -x
     -x NCCL_DMABUF_ENABLE=1 \
     -x NCCL_MSCCL_ENABLE=0 \
     -x HSA_NO_SCRATCH_RECLAIM=1 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 2 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 
 set -x
