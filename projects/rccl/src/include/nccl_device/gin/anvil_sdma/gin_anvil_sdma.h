@@ -60,51 +60,6 @@ NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
 }  // namespace gin
 }  // namespace nccl
 
-namespace nccl {
-namespace gin {
-namespace anvil {
-namespace detail {
-
-using nccl::utility::loadConst;
-
-NCCL_DEVICE_INLINE void markSdmaDirty(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int numCh,
-                                      int effCh) {
-  uint64_t bit = 1ULL << (peer * numCh + effCh);
-  __hip_atomic_fetch_or(rsCtx->sdmaDirty, bit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-}
-
-NCCL_DEVICE_INLINE rocshmem::anvil::SdmaQueueDeviceHandle* queueHandle(
-    ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int effCh) {
-  int numCh = loadConst(&rsCtx->numChannels);
-  auto** handles = (rocshmem::anvil::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
-  return loadConst(handles + peer * numCh + effCh);
-}
-
-// Remote signal completion via symmetric rocSHMEM atomics (matches GIN rocSHMEM API path).
-NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
-                                        ncclGinSignal_t signalId, uint64_t value) {
-  rocshmem::rocshmem_uint64_atomic_add(loadConst(&rsCtx->signals) + signalId, value, peer);
-}
-
-NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
-                                              rocshmem::anvil::SdmaQueueDeviceHandle* handle,
-                                              bool hasCounter) {
-  if (hasCounter) {
-    if (sdmaDataPath && handle != nullptr) {
-      rocshmem::anvil::quiet(*handle);
-    } else {
-      rocshmem::rocshmem_fence();
-    }
-  } else {
-    rocshmem::rocshmem_fence();
-  }
-}
-
-}  // namespace detail
-}  // namespace anvil
-}  // namespace gin
-}  // namespace nccl
-
 template <>
 struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   template <typename Coop>
