@@ -9,14 +9,21 @@ MAX_BYTES="${RCCL_GIN_GDA_MAX_BYTES:-1024M}"
 
 # See docker-gin-gda-ruby-test.bash: avoid docker -it without a TTY. RCCL_GIN_GDA_DOCKER_IT=1 for interactive.
 RCCL_GIN_GDA_NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG:-VERSION}"
-if [[ "${RCCL_GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
-  DOCKER_GPU="-it --rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+if [[ "${RCCL_GIN_GDA_DOCKER_ULIMIT_MEMLOCK:-1}" != 0 ]]; then
+  D_MEMLOCK=(--ulimit memlock=-1:-1)
 else
-  DOCKER_GPU="--rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+  D_MEMLOCK=()
 fi
-MPI_OPT="--allow-run-as-root -mca pml ob1 -mca btl ^openib"
+DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${RCCL_GIN_GDA_DOCKER_EXTRA:-}"
+if [[ "${RCCL_GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
+  DOCKER_GPU="-it --rm --init ${DOCKER_GPU_COMMON}"
+else
+  DOCKER_GPU="--rm --init ${DOCKER_GPU_COMMON}"
+fi
+MPI_CORE_MCA="-mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none ${RCCL_GIN_GDA_MPI_MCA_EXTRA:-}"
+MPI_OPT="--allow-run-as-root ${MPI_CORE_MCA}"
 if [[ "${RCCL_GIN_GDA_DEBUG_MPI:-0}" == 1 ]]; then
-  MPI_OPT="--allow-run-as-root --tag-output --display-map --report-bindings -mca pml ob1 -mca btl ^openib"
+  MPI_OPT="--allow-run-as-root --tag-output --display-map --report-bindings ${MPI_CORE_MCA}"
 fi
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
 # HFILE="my_hostfile"
@@ -24,6 +31,17 @@ fi
 # MPIRUN_BASE_HFILE="-n ${NP} --hostfile /workspace/${HFILE} --allow-run-as-root -mca pml ob1 -mca btl ^openib"
 
 # for ((NP = 2; NP <= 8; NP <<= 1)); do
+if [[ "${RCCL_GIN_GDA_PREFLIGHT:-0}" == 1 ]]; then
+  echo "=== Preflight (RCCL_GIN_GDA_PREFLIGHT=1) ===" >&2
+  ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
+set -e
+cd /workspace
+command -v rocm-smi >/dev/null 2>&1 && rocm-smi -l || true
+mpirun -n 2 --allow-run-as-root ${MPI_CORE_MCA} -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 hostname
+echo '[preflight] ok'
+" || exit 2
+fi
+
 set -x
   echo "=== Test#1: A2A, ${NP} gpus, Host Initiated ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \

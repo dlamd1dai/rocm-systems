@@ -8,28 +8,44 @@
 #   RCCL_GIN_GDA_DEBUG_MPI=1       → mpirun --tag-output --display-map --report-bindings
 #   RCCL_GIN_GDA_MAX_BYTES=32M     → smaller -e for smoke (default 1024M)
 #   RCCL_GIN_GDA_NCCL_DEBUG=INFO   → louder RCCL logs for Test#1
+#   RCCL_GIN_GDA_PREFLIGHT=0       → skip docker preflight (default 1: mpirun hostname + rocm-smi)
+#   RCCL_GIN_GDA_MPI_MCA_EXTRA     → extra mpirun -mca ... tokens (quoted on your shell if needed)
+#   RCCL_GIN_GDA_DOCKER_EXTRA      → extra docker run flags (e.g. --pid=host)
+#
+# If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
+# the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
 #
 
 NP=${1:-8}
 
 DOCKER_CMD="sudo docker"
 DOCKER_IMAGE="rccl-gingda713"
-RCCL_GIN_GDA_SCRIPT_MARK="${RCCL_GIN_GDA_SCRIPT_MARK:-ruby-20260618d}"
+RCCL_GIN_GDA_SCRIPT_MARK="${RCCL_GIN_GDA_SCRIPT_MARK:-ruby-20260618e}"
 MAX_BYTES="${RCCL_GIN_GDA_MAX_BYTES:-1024M}"
 
 # Batch / Slurm / non-interactive SSH: do not use docker -it (no TTY → docker can appear hung).
 # For an interactive shell: export RCCL_GIN_GDA_DOCKER_IT=1 before running this script.
 # Default NCCL log level for perf runs: VERSION (quiet). Deep debug: RCCL_GIN_GDA_NCCL_DEBUG=TRACE
 RCCL_GIN_GDA_NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG:-VERSION}"
-if [[ "${RCCL_GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
-  DOCKER_GPU="-it --rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+# memlock: IB / pinned host memory paths often need unlimited lock inside the container.
+# Set RCCL_GIN_GDA_DOCKER_ULIMIT_MEMLOCK=0 if your docker rejects --ulimit memlock=-1:-1.
+if [[ "${RCCL_GIN_GDA_DOCKER_ULIMIT_MEMLOCK:-1}" != 0 ]]; then
+  D_MEMLOCK=(--ulimit memlock=-1:-1)
 else
-  DOCKER_GPU="--rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+  D_MEMLOCK=()
 fi
+DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${RCCL_GIN_GDA_DOCKER_EXTRA:-}"
+if [[ "${RCCL_GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
+  DOCKER_GPU="-it --rm --init ${DOCKER_GPU_COMMON}"
+else
+  DOCKER_GPU="--rm --init ${DOCKER_GPU_COMMON}"
+fi
+# Explicit BTL + vader single-copy + no hwloc binding: fewer silent hangs in ROCm+Docker than bare "^openib".
+MPI_CORE_MCA="-mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none ${RCCL_GIN_GDA_MPI_MCA_EXTRA:-}"
 # Root inside --privileged containers: without --allow-run-as-root, mpirun can block on the root warning.
-MPI_OPT="--allow-run-as-root -mca pml ob1 -mca btl ^openib"
+MPI_OPT="--allow-run-as-root ${MPI_CORE_MCA}"
 if [[ "${RCCL_GIN_GDA_DEBUG_MPI:-0}" == 1 ]]; then
-  MPI_OPT="--allow-run-as-root --tag-output --display-map --report-bindings -mca pml ob1 -mca btl ^openib"
+  MPI_OPT="--allow-run-as-root --tag-output --display-map --report-bindings ${MPI_CORE_MCA}"
 fi
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
 # HFILE="my_hostfile"
@@ -42,6 +58,21 @@ echo "If the next +sudo docker line omits --group-add render or mpirun --allow-r
 if [[ "${MPI_OPT}" != *"--allow-run-as-root"* ]]; then
   echo "error: MPI_OPT missing --allow-run-as-root (internal)" >&2
   exit 1
+fi
+
+if [[ "${RCCL_GIN_GDA_PREFLIGHT:-1}" == 1 ]]; then
+  echo "=== Preflight: container, rocm-smi, mpirun hostname (RCCL_GIN_GDA_PREFLIGHT=0 to skip) ===" >&2
+  ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
+set -e
+cd /workspace
+echo '[preflight] in-container cwd=/workspace'
+command -v rocm-smi >/dev/null 2>&1 && rocm-smi -l || echo '[preflight] rocm-smi unavailable'
+mpirun -n 2 --allow-run-as-root ${MPI_CORE_MCA} -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 hostname
+echo '[preflight] ok'
+" || {
+    echo "error: preflight failed — fix docker/rocm/openmpi before RCCL perf will run." >&2
+    exit 2
+  }
 fi
 
 set -x
