@@ -15,6 +15,8 @@
 #   RCCL_GIN_GDA_DOCKER_RDMA_GROUP=0 → do not add --group-add rdma when host has that group
 #   RCCL_GIN_GDA_TEST4_MODE=auto   → GIN GDA (Test#4): auto-skip if host bnxt_en fw < min (default auto; run|skip)
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS=1 (default) → Test#2: bind-mount host GNU lib dirs (see docker-gin-gda-test.bash header)
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS → space-separated list (default /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
 #
 # If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
 # the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
@@ -59,6 +61,23 @@ MPI_OPT="--allow-run-as-root ${MPI_CORE_MCA}"
 if [[ "${RCCL_GIN_GDA_DEBUG_MPI:-0}" == 1 ]]; then
   MPI_OPT="--allow-run-as-root --tag-output --display-map --report-bindings ${MPI_CORE_MCA}"
 fi
+
+GIN_PLUGIN_X=()
+if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
+  GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
+fi
+
+DOCKER_TEST2_VOLUMES=""
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS:-1}" != 0 ]]; then
+  _rccl_t2_libdirs="${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}"
+  for _rccl_t2_d in ${_rccl_t2_libdirs}; do
+    if [[ -d "${_rccl_t2_d}" ]]; then
+      DOCKER_TEST2_VOLUMES+=" -v ${_rccl_t2_d}:${_rccl_t2_d}:ro"
+    fi
+  done
+  unset _rccl_t2_d _rccl_t2_libdirs
+fi
+
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
 # HFILE="my_hostfile"
 # MPIRUN_BASE="-n ${NP} --allow-run-as-root -mca pml ob1 -mca btl ^openib"
@@ -158,10 +177,12 @@ set +x
 
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}  ${DOCKER_IMAGE} \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
@@ -187,6 +208,8 @@ set -x
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
@@ -229,6 +252,8 @@ else
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
