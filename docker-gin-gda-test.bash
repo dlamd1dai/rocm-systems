@@ -13,9 +13,13 @@
 #   RCCL_GIN_GDA_TEST4_MODE=auto|run|skip → GIN GDA (Test#4): auto-skip if no bnxt_en or fw < min
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS=1 (default) → Test#2: -v HOSTDIR:HOSTDIR:ro for dirs in
+#       RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS (default: /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
+#       so container sees host rdma-core/libmlx5 (fixes MLX5_1.25 dlvsym + 0 IB devices in ddai-gin-perf.log).
+#       Set to 0 if host/container glibc mismatch causes instability.
 #
 
-NP=${1:-8}
+NP=${1:-2}
 MAX_BYTES="${2:-128M}"
 
 DOCKER_CMD="${DOCKER_CMD:-docker}"
@@ -50,6 +54,18 @@ MPI_OPT="--allow-run-as-root ${MPI_CORE_MCA}"
 GIN_PLUGIN_X=()
 if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
   GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
+fi
+
+# Test#2 (GIN IB proxy): image rdma-core is often older than RCCL's IB path needs (mlx5dv_* @ MLX5_1.25).
+DOCKER_TEST2_VOLUMES=""
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS:-1}" != 0 ]]; then
+  _rccl_t2_libdirs="${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}"
+  for _rccl_t2_d in ${_rccl_t2_libdirs}; do
+    if [[ -d "${_rccl_t2_d}" ]]; then
+      DOCKER_TEST2_VOLUMES+=" -v ${_rccl_t2_d}:${_rccl_t2_d}:ro"
+    fi
+  done
+  unset _rccl_t2_d _rccl_t2_libdirs
 fi
 
 # True (status 0) if dotted version $1 >= $2 (four numeric fields).
@@ -139,11 +155,12 @@ set +x
 
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
@@ -170,6 +187,7 @@ set -x
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
@@ -198,6 +216,7 @@ else
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
