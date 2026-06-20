@@ -280,6 +280,24 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
       goto fail;
     }
     (void)hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals);
+
+    uintptr_t* addrs = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)ctx->nRanks);
+    if (!addrs) {
+      ret = ncclSystemError;
+      goto fail;
+    }
+    addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
+    bootstrapAllGather(cctx->comm->bootstrap, addrs, (int)sizeof(uintptr_t));
+
+    if (hipMalloc(&ctx->gpuCtxHost.signal_peer_addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks) !=
+        hipSuccess) {
+      free(addrs);
+      ret = ncclSystemError;
+      goto fail;
+    }
+    (void)hipMemcpy(ctx->gpuCtxHost.signal_peer_addrs, addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks,
+                    hipMemcpyHostToDevice);
+    free(addrs);
   }
 
   if (config->nCounters > 0) {
