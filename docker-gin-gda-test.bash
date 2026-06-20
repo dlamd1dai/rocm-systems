@@ -13,10 +13,12 @@
 #   RCCL_GIN_GDA_TEST4_MODE=auto|run|skip → GIN GDA (Test#4): auto-skip if no bnxt_en or fw < min
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS=1 (default) → Test#2: -v HOSTDIR:HOSTDIR:ro for dirs in
-#       RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS (default: /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu)
-#       so container sees host rdma-core/libmlx5 (fixes MLX5_1.25 dlvsym + 0 IB devices in ddai-gin-perf.log).
-#       Set to 0 if host/container glibc mismatch causes instability.
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
+#       (same path in container) so mlx5/verbs match the NIC without replacing libc/libstdc++ (see ddai-gin-perf.log).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default libmlx5.so.1 libibverbs.so.1 …).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames to mount from host.
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
 #
 
 NP=${1:-2}
@@ -56,9 +58,21 @@ if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
   GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
 fi
 
-# Test#2 (GIN IB proxy): image rdma-core is often older than RCCL's IB path needs (mlx5dv_* @ MLX5_1.25).
+# Test#2 (GIN IB proxy): prefer per-library host mounts (see docs); whole-GNU-dir mounts break librccl when host glibc is older.
+_rccl_gin_gda_host_so_path() {
+  local base="$1" d cand
+  for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+    cand="${d}/${base}"
+    [[ -e "${cand}" ]] || continue
+    readlink -f "${cand}" 2>/dev/null || echo "${cand}"
+    return 0
+  done
+  return 1
+}
+
 DOCKER_TEST2_VOLUMES=""
-if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS:-1}" != 0 ]]; then
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
+  echo "warning: RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 bind-mounts full GNU lib dirs; host libc older than the image breaks librccl (ddai-gin-perf.log)." >&2
   _rccl_t2_libdirs="${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBDIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}"
   for _rccl_t2_d in ${_rccl_t2_libdirs}; do
     if [[ -d "${_rccl_t2_d}" ]]; then
@@ -66,6 +80,16 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_LIBS:-1}" != 0 ]]; then
     fi
   done
   unset _rccl_t2_d _rccl_t2_libdirs
+fi
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-}"
+  for _rccl_t2_base in ${_rccl_t2_bases}; do
+    [[ -n "${_rccl_t2_base// }" ]] || continue
+    if _rccl_t2_hp=$(_rccl_gin_gda_host_so_path "${_rccl_t2_base}"); then
+      DOCKER_TEST2_VOLUMES+=" -v ${_rccl_t2_hp}:${_rccl_t2_hp}:ro"
+    fi
+  done
+  unset _rccl_t2_base _rccl_t2_hp _rccl_t2_bases
 fi
 
 # True (status 0) if dotted version $1 >= $2 (four numeric fields).
