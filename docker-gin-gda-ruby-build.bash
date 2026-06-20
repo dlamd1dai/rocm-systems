@@ -3,10 +3,10 @@
 # Hosts without docker0: BuildKit fails with "network bridge not found". Default: --network=host.
 # Override: DOCKER_BUILD_NETWORK=default
 
-DOCKER_CMD=docker
-DOCKERFILE="Dockerfile-rccl-gin-gda"
+DOCKER_CMD="sudo docker"
+DOCKERFILE="Dockerfile-rccl-gin-gda-ruby"
 DOCKER_IMAGE="rccl-gingda713"
-TARGET_GPU_ARCH=gfx950
+TARGET_GPU_ARCH="gfx950"
 USE_LOCAL_SRC=1
 
 N=1
