@@ -5,8 +5,15 @@ NP=${1:-8}
 DOCKER_CMD="sudo docker"
 DOCKER_IMAGE="rccl-gingda713"
 
-# DOCKER_GPU="--rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
-DOCKER_GPU="-it --rm --shm-size 64G   --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host   --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+# Batch / Slurm / non-interactive SSH: do not use docker -it (no TTY → docker can appear hung).
+# For an interactive shell: export RCCL_GIN_GDA_DOCKER_IT=1 before running this script.
+# Default NCCL log level for perf runs: VERSION (quiet). Deep debug: RCCL_GIN_GDA_NCCL_DEBUG=TRACE
+RCCL_GIN_GDA_NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG:-VERSION}"
+if [[ "${RCCL_GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
+  DOCKER_GPU="-it --rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+else
+  DOCKER_GPU="--rm --init --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
+fi
 MPI_OPT="-mca pml ob1 -mca btl ^openib"
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
 # HFILE="my_hostfile"
@@ -24,7 +31,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=TRACE \
+    -x NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG}" \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=0 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
