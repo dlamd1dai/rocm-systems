@@ -58,13 +58,26 @@ if [[ "${RCCL_GIN_USE_EXTERNAL_PLUGIN:-0}" != 1 ]]; then
   GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
 fi
 
-# Test#2 (GIN IB proxy): prefer per-library host mounts (see docs); whole-GNU-dir mounts break librccl when host glibc is older.
-_rccl_gin_gda_host_so_path() {
-  local base="$1" d cand
+# Test#2 (GIN IB proxy): per-host .so mounts. Mount the *soname path* (e.g. libmlx5.so.1), not only readlink -f target,
+# or the loader still follows the container's symlink to the image's older mlx5 (GIN stays off; ddai-gin-perf.log).
+_rccl_gin_gda_host_so_add_mount() {
+  local p="$1"
+  [[ -n "$p" && -e "$p" ]] || return 0
+  if [[ " ${_rccl_t2_mounted} " == *" ${p} "* ]]; then
+    return 0
+  fi
+  DOCKER_TEST2_VOLUMES+=" -v ${p}:${p}:ro"
+  _rccl_t2_mounted+=" ${p} "
+}
+
+_rccl_gin_gda_host_so_mount_from_base() {
+  local base="$1" d cand real
   for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
-    readlink -f "${cand}" 2>/dev/null || echo "${cand}"
+    _rccl_gin_gda_host_so_add_mount "${cand}"
+    real=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -n "${real}" && "${real}" != "${cand}" ]] && _rccl_gin_gda_host_so_add_mount "${real}"
     return 0
   done
   return 1
@@ -82,14 +95,13 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   unset _rccl_t2_d _rccl_t2_libdirs
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
+  _rccl_t2_mounted=""
   _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-}"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
-    if _rccl_t2_hp=$(_rccl_gin_gda_host_so_path "${_rccl_t2_base}"); then
-      DOCKER_TEST2_VOLUMES+=" -v ${_rccl_t2_hp}:${_rccl_t2_hp}:ro"
-    fi
+    _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
-  unset _rccl_t2_base _rccl_t2_hp _rccl_t2_bases
+  unset _rccl_t2_base _rccl_t2_bases _rccl_t2_mounted
 fi
 
 # True (status 0) if dotted version $1 >= $2 (four numeric fields).
