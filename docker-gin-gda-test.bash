@@ -16,9 +16,12 @@
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) so mlx5/verbs match the NIC without replacing libc/libstdc++ (see ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → space-separated basenames (default libmlx5.so.1 libibverbs.so.1 …).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames to mount from host.
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS=1 (default) → Test#2: -v host /sys/class/infiniband and /etc/libibverbs.d (ro) so
+#       ibverbs can enumerate HCAs inside Docker (fixes GIN off when libs are correct; ddai-gin-perf.log).
+#   RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS → dirs to resolve RDMA .so basenames (default includes lib64 paths).
 #
 
 NP=${1:-2}
@@ -72,7 +75,8 @@ _rccl_gin_gda_host_so_add_mount() {
 
 _rccl_gin_gda_host_so_mount_from_base() {
   local base="$1" d cand real
-  for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  for d in ${_dirs}; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
     _rccl_gin_gda_host_so_add_mount "${cand}"
@@ -96,12 +100,18 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-}"
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
   unset _rccl_t2_base _rccl_t2_bases _rccl_t2_mounted
+fi
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
+  for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do
+    [[ -e "${_rccl_ibsys}" ]] && DOCKER_TEST2_VOLUMES+=" -v ${_rccl_ibsys}:${_rccl_ibsys}:ro"
+  done
+  unset _rccl_ibsys
 fi
 
 # True (status 0) if dotted version $1 >= $2 (four numeric fields).
@@ -197,6 +207,7 @@ set -x
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     "${GIN_PLUGIN_X[@]}" \
     -x NCCL_NET_PLUGIN=none \
+    -x NCCL_ENV_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \

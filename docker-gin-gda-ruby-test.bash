@@ -15,7 +15,7 @@
 #   RCCL_GIN_GDA_DOCKER_RDMA_GROUP=0 → do not add --group-add rdma when host has that group
 #   RCCL_GIN_GDA_TEST4_MODE=auto   → GIN GDA (Test#4): auto-skip if host bnxt_en fw < min (default auto; run|skip)
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _GNU_DIRS → same as docker-gin-gda-test.bash (per-.so default)
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _GNU_DIRS / _IB_SYSFS / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-test.bash header
 #
 # If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
 # the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
@@ -78,7 +78,8 @@ _rccl_gin_gda_host_so_add_mount() {
 
 _rccl_gin_gda_host_so_mount_from_base() {
   local base="$1" d cand real
-  for d in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu; do
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  for d in ${_dirs}; do
     cand="${d}/${base}"
     [[ -e "${cand}" ]] || continue
     _rccl_gin_gda_host_so_add_mount "${cand}"
@@ -102,12 +103,18 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   _rccl_t2_mounted=""
-  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-}"
+  _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE:-libmlx5.so.1 libibverbs.so.1 librdmacm.so.1 libibumad.so.3} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   for _rccl_t2_base in ${_rccl_t2_bases}; do
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
   unset _rccl_t2_base _rccl_t2_bases _rccl_t2_mounted
+fi
+if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
+  for _rccl_ibsys in /sys/class/infiniband /etc/libibverbs.d; do
+    [[ -e "${_rccl_ibsys}" ]] && DOCKER_TEST2_VOLUMES+=" -v ${_rccl_ibsys}:${_rccl_ibsys}:ro"
+  done
+  unset _rccl_ibsys
 fi
 
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
@@ -215,6 +222,7 @@ set -x
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     "${GIN_PLUGIN_X[@]}" \
     -x NCCL_NET_PLUGIN=none \
+    -x NCCL_ENV_PLUGIN=none \
     -x RCCL_ROCSHMEM_ENABLE=0 \
     -x ROCSHMEM_BACKEND=ipc \
     -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
