@@ -1,6 +1,6 @@
 #! /usr/bin/env bash
 
-# Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=6) needs rocSHMEM built with USE_SDMA=ON. Default
+# Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=5) needs rocSHMEM built with USE_SDMA=ON. Default
 # ROCSHMEM_USE_SDMA=1 passes --build-arg to the Dockerfile; set ROCSHMEM_USE_SDMA=0 to opt out.
 # The Dockerfile upgrades rdma-core/libmlx5 from ${VERSION_CODENAME}-updates when available.
 # Optional CI: pass --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 to fail the build unless
@@ -20,6 +20,7 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
 mkdir -p extra-rdma-debs
 
+N=1
 ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --no-cache \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
@@ -29,4 +30,3 @@ ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --build-arg ROCSHMEM_CACHE_BUST=$((N++)) \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
-

@@ -12,7 +12,9 @@
 #   RCCL_GIN_GDA_MPI_MCA_EXTRA        → extra mpirun -mca tokens
 #   RCCL_GIN_GDA_TEST4_MODE=auto|run|skip → GIN GDA (Test#4): auto-skip if no bnxt_en or fw < min
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
+#   RCCL_GIN_GDA_TEST5_MODE=skip      → skip Test#5 (GIN Anvil SDMA / NCCL_GIN_TYPE=5; default run)
 #   RCCL_GIN_SDMA_TEST5_NUM_CHANNELS → NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS for Test#5 (default 1)
+#   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) for verbs/rdmacm without replacing libc (see ddai-gin-perf.log).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → explicit list of basenames (plus libnl defaults); does not change mlx5 policy below.
@@ -468,7 +470,7 @@ if [ 0 -eq 1 ]; then
   set +x
 fi
 
-if [ 1 -eq 1 ]; then
+if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" != "skip" ]]; then
 set -x
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=5) ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
@@ -496,5 +498,7 @@ set -x
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
+else
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (skipped; RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
 fi
 # done
