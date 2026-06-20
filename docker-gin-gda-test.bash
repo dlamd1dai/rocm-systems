@@ -15,8 +15,11 @@
 #   RCCL_GIN_USE_EXTERNAL_PLUGIN=1    → do NOT pass NCCL_GIN_PLUGIN=none (external libnccl-gin.so)
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=1 (default) → Test#2: bind-mount individual host RDMA .so files
 #       (same path in container) for verbs/rdmacm without replacing libc (see ddai-gin-perf.log).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → if unset, default omits host libmlx5* (use image libmlx5 for MLX5_1.25 / mlx5dv_* with RCCL 2.30+; ddai-gin-perf.log).
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO=1 → include host libmlx5.so, .so.1, libmlx5-infiniband, libmlx5dv (when image rdma is older than host NIC).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE → explicit list of basenames (plus libnl defaults); does not change mlx5 policy below.
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO=0|1|adjacent (default: adjacent) → Test#2 host libmlx5* policy:
+#       adjacent (default): bind libmlx5* from the same directory as resolved host libibverbs.so.1 (pairs rdma-core with verbs; ddai-gin-perf.log).
+#       1: legacy — search RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS for libmlx5* (can pick a mismatched older .so).
+#       0: do not bind host libmlx5* (image libmlx5 only).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA → more basenames before default libnl mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO=0 → disable per-.so mounts.
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 → dangerous: whole /lib/… and /usr/lib/…-gnu dirs (breaks GLIBC if host older).
@@ -121,6 +124,33 @@ _rccl_gin_gda_host_so_mount_from_base() {
   return 1
 }
 
+# Bind host libmlx5* from the directory of resolved libibverbs.so.1 (same rdma-core install). RCCL dlopens
+# "libmlx5.so" and dlvsym's MLX5_1.25 — image libmlx5 can be too old while host libibverbs is new (ddai-gin-perf.log).
+_rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d cand verbs_real vbdir mlx cand2 real
+  verbs_real=""
+  for d in ${_dirs}; do
+    cand="${d}/libibverbs.so.1"
+    [[ -e "${cand}" ]] || continue
+    verbs_real=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${verbs_real}" || ! -e "${verbs_real}" ]] && verbs_real="${cand}"
+    break
+  done
+  [[ -n "${verbs_real}" ]] || return 0
+  vbdir=$(dirname "${verbs_real}")
+  for mlx in libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1; do
+    cand2="${vbdir}/${mlx}"
+    [[ -e "${cand2}" ]] || continue
+    real=$(readlink -f "${cand2}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${cand2}"
+    for d in ${_dirs}; do
+      _rccl_gin_gda_host_so_add_bind "${real}" "${d}/${mlx}"
+    done
+    _rccl_gin_gda_host_so_add_bind "${real}" "${real}"
+  done
+}
+
 DOCKER_TEST2_VOLUMES=""
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   echo "warning: RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 bind-mounts full GNU lib dirs; host libc older than the image breaks librccl (ddai-gin-perf.log)." >&2
@@ -138,8 +168,8 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
     _rccl_t2_bases="${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_BASE} ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
   else
     _rccl_t2_mlx5_part=""
-    # Host libmlx5* often lacks MLX5_1.25 symbols RCCL dlvsym's (ddai-gin-perf.log); keep image libmlx5 unless explicitly overridden.
-    if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-0}" != 0 ]]; then
+    # MLX5_SO=1: legacy multi-dir search for libmlx5* (old behavior). Default / adjacent: pair mlx5 with libibverbs below.
+    if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" == 1 ]]; then
       _rccl_t2_mlx5_part="libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1 "
     fi
     _rccl_t2_bases="${_rccl_t2_mlx5_part}libibverbs.so libibverbs.so.1 librdmacm.so librdmacm.so.1 libibumad.so.3 ${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_EXTRA:-} libnl-3.so.200 libnl-route-3.so.200"
@@ -148,6 +178,10 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
     [[ -n "${_rccl_t2_base// }" ]] || continue
     _rccl_gin_gda_host_so_mount_from_base "${_rccl_t2_base}" || true
   done
+  # Adjacent mlx5: same rdma-core tree as host libibverbs (fixes RCCL dlvsym MLX5_1.25 on image-old libmlx5; ddai-gin-perf.log).
+  if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 0 ]] && [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 1 ]]; then
+    _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs
+  fi
   unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted _rccl_t2_mlx5_part
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
