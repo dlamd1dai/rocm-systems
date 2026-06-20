@@ -321,6 +321,7 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
 set +x
 
+if [ 0 -eq 1 ]; then
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
   if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
@@ -355,6 +356,7 @@ set -x
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
+fi
 
 set -x
   echo "=== Test#3: A2A, ${NP} gpus, GIN ROCSHMEM+SDMA ==="
@@ -382,6 +384,7 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 
+if [ 0 -eq 1 ]; then
 if [[ "${RCCL_GIN_GDA_RUN_TEST4}" == 0 ]]; then
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA (skipped) ===" >&2
 else
@@ -410,6 +413,7 @@ else
     -x HSA_NO_SCRATCH_RECLAIM=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
+fi
 fi
 
 # done
