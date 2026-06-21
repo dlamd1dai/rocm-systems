@@ -7,7 +7,7 @@
 
 DOCKER_CMD="sudo docker"
 DOCKERFILE="Dockerfile-rccl-gin-gda-sdma-ruby"
-DOCKER_IMAGE="rccl-gingda713"
+DOCKER_IMAGE="rccl-gin-gda-sdma-713"
 TARGET_GPU_ARCH="gfx950"
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA:-1}"
