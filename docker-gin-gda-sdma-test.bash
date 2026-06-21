@@ -548,7 +548,6 @@ if [ 0 -eq 1 ]; then
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
 fi
-fi
 
 if [ 1 -eq 1 ]; then
 set -x
