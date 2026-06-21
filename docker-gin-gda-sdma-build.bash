@@ -2,6 +2,8 @@
 
 # Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=6) needs rocSHMEM built with USE_SDMA=ON. Default
 # ROCSHMEM_USE_SDMA=1 passes --build-arg to the Dockerfile; set ROCSHMEM_USE_SDMA=0 to opt out.
+# The Dockerfile pulls rdma-core/libmlx5 from ${VERSION_CODENAME}-updates when available so
+# libmlx5 exports mlx5dv_reg_dmabuf_mr (MLX5_1.25); the image build fails early if symbols are missing.
 # ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA:-1}"
 
 DOCKER_CMD=docker
