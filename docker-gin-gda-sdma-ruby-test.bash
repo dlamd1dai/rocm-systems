@@ -17,6 +17,7 @@
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
 #   RCCL_GIN_GDA_TEST5_MODE=skip   → skip Test#5 (GIN Anvil SDMA direct path, NCCL_GIN_TYPE=5; default run)
 #   RCCL_GIN_SDMA_TEST5_NUM_CHANNELS → NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS for Test#5 (default 1)
+#   RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT=1 (default) → skip Test#5 if image libmlx5 lacks mlx5dv_reg_dmabuf_mr; 0 disables
 #   RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1 → always bind adjacent host libmlx5* (see docker-gin-gda-sdma-test.bash).
 #   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _MLX5_SO / _GNU_DIRS / _IB_SYSFS / _BIND_HOST_DEV_INFINIBAND / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-sdma-test.bash header
 #
@@ -369,6 +370,16 @@ _rccl_gin_gda_should_skip_test4_auto() {
   return 1
 }
 
+_rccl_gin_gda_test5_image_mlx5_dmabuf_ok() {
+  if [[ "${RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT:-1}" == 0 ]]; then
+    return 0
+  fi
+  ${DOCKER_CMD} run --rm "${DOCKER_IMAGE}" sh -lc \
+    'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
+     rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
+    >/dev/null 2>&1
+}
+
 if [[ "${RCCL_GIN_GDA_PREFLIGHT:-1}" == 1 ]]; then
   echo "=== Preflight: container, rocm-smi, mpirun hostname (RCCL_GIN_GDA_PREFLIGHT=0 to skip) ===" >&2
   ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
@@ -474,7 +485,12 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 
-if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" != "skip" ]]; then
+if [ 1 -eq 1 ]; then
+  if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" == "skip" ]]; then
+    echo "=== Test#5: skipped (RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
+  elif ! _rccl_gin_gda_test5_image_mlx5_dmabuf_ok; then
+    echo "=== RCCL_GIN_GDA: Test#5 skipped: image libmlx5 lacks mlx5dv_reg_dmabuf_mr (rebuild image / see Dockerfile). RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT=0 to force run. ===" >&2
+  else
 set -x
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=5) ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
@@ -502,8 +518,7 @@ set -x
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
-else
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (skipped; RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
+  fi
 fi
 
 if [ 0 -eq 1 ]; then
