@@ -477,7 +477,7 @@ set +x
 if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" != "skip" ]]; then
 set -x
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=5) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU} ${DOCKER_IMAGE} \
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
@@ -492,13 +492,14 @@ set -x
     -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=5 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_GDA_TEST5_NUM_CHANNELS:-1}" \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_SDMA_TEST5_NUM_CHANNELS:-1}" \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
     -x NCCL_CUMEM_ENABLE=1 \
     -x RCCL_ENABLE_INTRANET=1 \
     -x NCCL_DMABUF_ENABLE=1 \
     -x NCCL_MSCCL_ENABLE=0 \
     -x HSA_NO_SCRATCH_RECLAIM=1 \
+    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 else
@@ -550,36 +551,6 @@ else
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
 fi
-fi
-
-if [ 1 -eq 1 ]; then
-set -x
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=5) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
-    mpirun -n ${NP} ${MPI_OPT} \
-    -x OMPI_ALLOW_RUN_AS_ROOT=1 \
-    -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-    "${GIN_PLUGIN_X[@]}" \
-    -x NCCL_NET_PLUGIN=none \
-    -x RCCL_ROCSHMEM_ENABLE=0 \
-    -x ROCSHMEM_BACKEND=ipc \
-    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
-    -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
-    -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=VERSION \
-    -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=5 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_SDMA_TEST5_NUM_CHANNELS:-1}" \
-    -x NCCL_DEBUG_SUBSYS=INIT,NET \
-    -x NCCL_CUMEM_ENABLE=1 \
-    -x RCCL_ENABLE_INTRANET=1 \
-    -x NCCL_DMABUF_ENABLE=1 \
-    -x NCCL_MSCCL_ENABLE=0 \
-    -x HSA_NO_SCRATCH_RECLAIM=1 \
-    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
-set +x
 fi
 # done
 
