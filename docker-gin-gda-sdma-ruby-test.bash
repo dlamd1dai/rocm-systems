@@ -523,7 +523,7 @@ fi
 if [ 1 -eq 1 ]; then
 set -x
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=6) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
