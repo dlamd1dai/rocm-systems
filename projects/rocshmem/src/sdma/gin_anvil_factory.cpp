@@ -6,8 +6,6 @@
 
 #include <rocshmem/gin_anvil_factory.h>
 
-#if defined(USE_SDMA)
-
 #include "anvil.hpp"
 #include <hip/hip_runtime.h>
 #include <vector>
@@ -125,19 +123,3 @@ extern "C" int rocshmem_gin_anvil_get_num_channels(rocshmem_gin_anvil_handle_t h
   return handle ? handle->numChannels : 0;
 }
 
-#else  // !USE_SDMA
-
-extern "C" int rocshmem_gin_anvil_probe(void) { return 0; }
-
-extern "C" int rocshmem_gin_anvil_create(int, int, int, int (*)(void*, void*, size_t), void*, int,
-                                         rocshmem_gin_anvil_handle_t*, void**, uint64_t**) {
-  return -1;
-}
-
-extern "C" void rocshmem_gin_anvil_destroy(rocshmem_gin_anvil_handle_t) {}
-
-extern "C" int rocshmem_gin_anvil_get_n_ranks(rocshmem_gin_anvil_handle_t) { return 0; }
-
-extern "C" int rocshmem_gin_anvil_get_num_channels(rocshmem_gin_anvil_handle_t) { return 0; }
-
-#endif  // USE_SDMA
