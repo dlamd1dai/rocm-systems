@@ -20,6 +20,10 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 
 N=1
 DOCKER_BUILD_NETWORK="${DOCKER_BUILD_NETWORK:-host}"
+
+# Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
+mkdir -p extra-rdma-debs
+
 ${DOCKER_CMD} build --network="${DOCKER_BUILD_NETWORK}" -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --no-cache \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
