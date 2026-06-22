@@ -16,6 +16,7 @@
 #include "gin/gin_host_rocshmem_api.h"
 #include "gin/gin_host_rocshmem_anvil.h"
 #include "comm.h"
+#include "dev_runtime.h"
 #include "bootstrap.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include <rocshmem/gin_anvil_factory.h>
@@ -45,6 +46,7 @@ struct ginAnvilGinCtx {
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
+  void** signal_ipc_peer_ptrs;
 };
 
 struct ginAnvilMemHandle {
@@ -58,6 +60,18 @@ struct ginAnvilListenCtx {
 
 static int ginAnvilBootstrapAllgather(void* ctx, void* buf, size_t perRankSize) {
   return (bootstrapAllGather(ctx, buf, (int)perRankSize) == ncclSuccess) ? 0 : -1;
+}
+
+static void ginAnvilCloseSignalIpc(ginAnvilGinCtx* ctx) {
+  if (!ctx || !ctx->signal_ipc_peer_ptrs) return;
+  for (int p = 0; p < ctx->nRanks; ++p) {
+    if (p != ctx->rank && ctx->signal_ipc_peer_ptrs[p]) {
+      (void)hipIpcCloseMemHandle(ctx->signal_ipc_peer_ptrs[p]);
+      ctx->signal_ipc_peer_ptrs[p] = nullptr;
+    }
+  }
+  free(ctx->signal_ipc_peer_ptrs);
+  ctx->signal_ipc_peer_ptrs = nullptr;
 }
 
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
@@ -157,6 +171,10 @@ static ncclResult_t ginAnvilFinalize(void* ctx) {
 static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, int type, uint64_t mrFlags,
                                      void** mhandle, void** ginHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
+  struct ncclDevrState* devr = &cctx->comm->devrState;
+  void* lsaSelfAddr = nullptr;
+  NCCLCHECK(ncclDevrGetLsaSelfAddr(devr, data, &lsaSelfAddr));
+
   ginAnvilMemHandle* mh = nullptr;
   NCCLCHECK(ncclCalloc(&mh, 1));
 
@@ -171,8 +189,26 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
     free(mh);
     return ncclSystemError;
   }
-  vas_buf[cctx->rank] = (uintptr_t)data;
-  bootstrapAllGather(cctx->comm->bootstrap, vas_buf, (int)sizeof(uintptr_t));
+
+  const bool use_symmetric_flat =
+      lsaSelfAddr != nullptr && devr->bigSize > 1 && devr->lsaFlatBase != nullptr;
+  if (use_symmetric_flat) {
+    const int myLsaRank = devr->lsaSelf;
+    for (int p = 0; p < cctx->nranks; ++p) {
+      int peerLsaRank = 0;
+      NCCLCHECK(ncclDevrWorldToLsaRank(cctx->comm, p, &peerLsaRank));
+      vas_buf[p] = (uintptr_t)lsaSelfAddr +
+                   (ptrdiff_t)(peerLsaRank - myLsaRank) * (ptrdiff_t)devr->bigSize;
+    }
+    INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaSelf=%p size %zu", data, lsaSelfAddr,
+         size);
+  } else {
+    vas_buf[cctx->rank] = (uintptr_t)data;
+    NCCLCHECK(bootstrapAllGather(cctx->comm->bootstrap, vas_buf, (int)sizeof(uintptr_t)));
+    if (lsaSelfAddr == nullptr) {
+      WARN("GIN anvil-sdma: buffer %p not in symmetric VA; using allgathered local pointers", data);
+    }
+  }
 
   if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess) {
     free(vas_buf);
@@ -184,7 +220,7 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   free(vas_buf);
 
   ncclGinAnvilSdmaMemHandle hostMh;
-  hostMh.local_va = (uintptr_t)data;
+  hostMh.local_va = (uintptr_t)(lsaSelfAddr != nullptr ? lsaSelfAddr : data);
   hostMh.remote_vas = mh->remote_vas_dev;
   (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
 
@@ -220,6 +256,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
+  ctx->signal_ipc_peer_ptrs = nullptr;
 
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
@@ -249,22 +286,68 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
     (void)hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals);
 
     uintptr_t* addrs = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)ctx->nRanks);
+    hipIpcMemHandle_t* ipc_handles = nullptr;
     if (!addrs) {
       ret = ncclSystemError;
       goto fail;
     }
-    addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
-    bootstrapAllGather(cctx->comm->bootstrap, addrs, (int)sizeof(uintptr_t));
+
+    ipc_handles = (hipIpcMemHandle_t*)malloc(sizeof(hipIpcMemHandle_t) * (size_t)ctx->nRanks);
+    if (!ipc_handles) {
+      free(addrs);
+      ret = ncclSystemError;
+      goto fail;
+    }
+
+    const bool signal_ipc_ok =
+        hipIpcGetMemHandle(&ipc_handles[ctx->rank], ctx->gpuCtxHost.signals) == hipSuccess;
+    if (signal_ipc_ok) {
+      NCCLCHECKGOTO(bootstrapAllGather(cctx->comm->bootstrap, ipc_handles, sizeof(hipIpcMemHandle_t)),
+                    ret, signal_fail);
+      NCCLCHECKGOTO(ncclCalloc(&ctx->signal_ipc_peer_ptrs, ctx->nRanks), ret, signal_fail);
+      addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
+      for (int p = 0; p < ctx->nRanks; ++p) {
+        if (p == ctx->rank) continue;
+        void* peer_ptr = nullptr;
+        hipError_t hip_ret =
+            hipIpcOpenMemHandle(&peer_ptr, ipc_handles[p], hipIpcMemLazyEnablePeerAccess);
+        if (hip_ret != hipSuccess) {
+          WARN("GIN anvil-sdma: hipIpcOpenMemHandle(rank %d) failed: %s", p,
+               hipGetErrorString(hip_ret));
+          ret = ncclSystemError;
+          goto signal_fail;
+        }
+        ctx->signal_ipc_peer_ptrs[p] = peer_ptr;
+        addrs[p] = (uintptr_t)peer_ptr;
+      }
+    } else {
+      WARN("GIN anvil-sdma: hipIpcGetMemHandle failed for signals; using allgathered pointers");
+      addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
+      NCCLCHECKGOTO(bootstrapAllGather(cctx->comm->bootstrap, addrs, (int)sizeof(uintptr_t)), ret,
+                    signal_fail);
+    }
+    free(ipc_handles);
+    ipc_handles = nullptr;
 
     if (hipMalloc(&ctx->gpuCtxHost.signal_peer_addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks) !=
         hipSuccess) {
       free(addrs);
+      ginAnvilCloseSignalIpc(ctx);
       ret = ncclSystemError;
       goto fail;
     }
     (void)hipMemcpy(ctx->gpuCtxHost.signal_peer_addrs, addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks,
                     hipMemcpyHostToDevice);
     free(addrs);
+    goto signal_done;
+
+  signal_fail:
+    if (ipc_handles) free(ipc_handles);
+    free(addrs);
+    ginAnvilCloseSignalIpc(ctx);
+    goto fail;
+
+  signal_done:;
   }
 
   if (config->nCounters > 0) {
@@ -289,6 +372,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
 fail:
   if (ctx) {
+    ginAnvilCloseSignalIpc(ctx);
     if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
     if (ctx->gpuCtxHost.signal_peer_addrs) (void)hipFree(ctx->gpuCtxHost.signal_peer_addrs);
     if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
@@ -302,6 +386,7 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
+  ginAnvilCloseSignalIpc(ctx);
   if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
   if (ctx->gpuCtxHost.signal_peer_addrs) (void)hipFree(ctx->gpuCtxHost.signal_peer_addrs);
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
