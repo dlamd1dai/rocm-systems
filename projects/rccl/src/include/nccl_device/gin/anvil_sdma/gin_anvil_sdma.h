@@ -88,7 +88,8 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    bool useIpc = hasWins && !hasSignal && (bytes < threshold || handle == nullptr);
+    // Small data uses IPC even for signaled puts; remote completion stays on rocSHMEM atomics.
+    bool useIpc = hasWins && (bytes < threshold || handle == nullptr);
     bool sdmaDataPath = hasWins && !useIpc && handle != nullptr;
 
     if (hasWins) {
@@ -151,7 +152,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useIpc = !hasSignal && (bytes < threshold || handle == nullptr);
+    bool useIpc = bytes < threshold || handle == nullptr;
     bool sdmaDataPath = !useIpc && handle != nullptr;
 
     if (useIpc) {
