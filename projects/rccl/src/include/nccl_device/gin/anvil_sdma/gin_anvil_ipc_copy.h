@@ -8,7 +8,6 @@
 #define _NCCL_DEVICE_GIN_ANVIL_IPC_COPY_H_
 
 #include "../../hip_compat.h"
-#include "util.hpp"
 
 namespace nccl {
 namespace gin {
@@ -54,13 +53,23 @@ NCCL_DEVICE_INLINE void ipcPutScalar(void* dst, const void* src, size_t bytes) {
 }
 
 // IPC load/store path for transfers below the SDMA threshold (mirrors rocSHMEM IpcSdmaImpl).
+// Self-contained: do not include rocshmem util.hpp here (symbol clash with queue_pair_device.h).
 NCCL_DEVICE_INLINE void ipcPut(void* dst, const void* src, size_t bytes) {
   if (bytes == 0) return;
   if (bytes <= 8) {
     ipcPutScalar(dst, src, bytes);
     return;
   }
-  rocshmem::memcpy_lane<rocshmem::MemcpyKind::Put>(dst, const_cast<void*>(src), bytes);
+  auto* d = static_cast<uint8_t*>(dst);
+  auto* s = static_cast<const uint8_t*>(src);
+  size_t i = 0;
+  for (; i + 8 <= bytes; i += 8) {
+    unsigned long long v;
+    __builtin_memcpy(&v, s + i, 8);
+    __hip_atomic_store(reinterpret_cast<unsigned long long*>(d + i), v, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  if (i < bytes) ipcPutScalar(d + i, s + i, bytes - i);
 }
 
 NCCL_DEVICE_INLINE void ipcSignal(uint64_t* sigPtr, uint64_t value) {
