@@ -47,7 +47,6 @@ struct ginAnvilGinCtx {
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
-  void** signal_ipc_peer_ptrs;
 };
 
 struct ginAnvilMemHandle {
@@ -61,18 +60,6 @@ struct ginAnvilListenCtx {
 
 static int ginAnvilBootstrapAllgather(void* ctx, void* buf, size_t perRankSize) {
   return (bootstrapAllGather(ctx, buf, (int)perRankSize) == ncclSuccess) ? 0 : -1;
-}
-
-static void ginAnvilCloseSignalIpc(ginAnvilGinCtx* ctx) {
-  if (!ctx || !ctx->signal_ipc_peer_ptrs) return;
-  for (int p = 0; p < ctx->nRanks; ++p) {
-    if (p != ctx->rank && ctx->signal_ipc_peer_ptrs[p]) {
-      (void)hipIpcCloseMemHandle(ctx->signal_ipc_peer_ptrs[p]);
-      ctx->signal_ipc_peer_ptrs[p] = nullptr;
-    }
-  }
-  free(ctx->signal_ipc_peer_ptrs);
-  ctx->signal_ipc_peer_ptrs = nullptr;
 }
 
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
@@ -264,7 +251,6 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
-  ctx->signal_ipc_peer_ptrs = nullptr;
 
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
