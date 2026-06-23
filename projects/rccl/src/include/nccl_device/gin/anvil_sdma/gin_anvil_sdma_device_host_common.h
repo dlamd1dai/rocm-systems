@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 107
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 108
 
 /** Default SDMA threshold (bytes). Transfers below this use IPC load/store. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 256u

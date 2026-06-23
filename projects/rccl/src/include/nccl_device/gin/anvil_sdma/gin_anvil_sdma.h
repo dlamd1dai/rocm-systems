@@ -81,7 +81,6 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     constexpr int eff_ch = 0;
-    auto* handle = queueHandle(rsCtx, peer, eff_ch);
 
     if ((required == cuda::thread_scope_system) && (given > required)) {
       __threadfence_system();
@@ -89,7 +88,12 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     // Small data uses IPC even for signaled puts; remote completion stays on rocSHMEM atomics.
-    bool useIpc = hasWins && (bytes < threshold || handle == nullptr);
+    bool useIpc = hasWins && bytes < threshold;
+    rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
+    if (hasWins && !useIpc) {
+      handle = queueHandle(rsCtx, peer, eff_ch);
+      if (handle == nullptr) useIpc = true;
+    }
     bool sdmaDataPath = hasWins && !useIpc && handle != nullptr;
 
     if (hasWins) {
@@ -141,7 +145,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     constexpr int eff_ch = 0;
-    auto* handle = queueHandle(rsCtx, peer, eff_ch);
     ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
     uintptr_t dstAddr = loadConst(loadConst(&dstMh->remote_vas) + peer) + dstOff;
     T tmp = srcVal;
@@ -152,7 +155,12 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useIpc = bytes < threshold || handle == nullptr;
+    bool useIpc = bytes < threshold;
+    rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
+    if (!useIpc) {
+      handle = queueHandle(rsCtx, peer, eff_ch);
+      if (handle == nullptr) useIpc = true;
+    }
     bool sdmaDataPath = !useIpc && handle != nullptr;
 
     if (useIpc) {
