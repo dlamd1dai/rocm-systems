@@ -60,6 +60,32 @@ NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
 }  // namespace gin
 }  // namespace nccl
 
+namespace nccl {
+namespace gin {
+namespace anvil {
+namespace detail {
+
+using nccl::utility::loadConst;
+
+NCCL_DEVICE_INLINE void markSdmaDirty(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int numCh,
+                                      int effCh) {
+  uint64_t bit = 1ULL << (peer * numCh + effCh);
+  __hip_atomic_fetch_or(rsCtx->sdmaDirty, bit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+NCCL_DEVICE_INLINE rocshmem::anvil::SdmaQueueSingleProducerDeviceHandle* queueHandle(
+    ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int effCh) {
+  int numCh = loadConst(&rsCtx->numChannels);
+  auto** handles =
+      (rocshmem::anvil::SdmaQueueSingleProducerDeviceHandle**)loadConst(&rsCtx->queueHandles);
+  return loadConst(handles + peer * numCh + effCh);
+}
+
+}  // namespace detail
+}  // namespace anvil
+}  // namespace gin
+}  // namespace nccl
+
 template <>
 struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   template <typename Coop>
