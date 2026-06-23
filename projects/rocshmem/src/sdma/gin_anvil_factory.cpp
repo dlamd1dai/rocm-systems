@@ -77,7 +77,9 @@ extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_i
     const int remote = devs[static_cast<size_t>(p)];
     for (int c = 0; c < numChannels; ++c) {
       rocshmem::anvil::SdmaQueue* q = rocshmem::anvil::anvil.getSdmaQueue(myDev, remote, c);
-      host_handles[static_cast<size_t>(p * numChannels + c)] = q ? q->deviceHandle() : nullptr;
+      host_handles[static_cast<size_t>(p * numChannels + c)] =
+          q ? reinterpret_cast<rocshmem::anvil::SdmaQueueDeviceHandle*>(q->singleProducerDeviceHandle())
+            : nullptr;
     }
   }
 

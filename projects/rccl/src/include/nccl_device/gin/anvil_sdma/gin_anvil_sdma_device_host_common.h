@@ -9,7 +9,10 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 101
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 102
+
+/** Default SDMA threshold (bytes). Transfers below this use IPC load/store. */
+#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 256u
 
 struct ncclGinAnvilSdmaGPUContext {
   void** queueHandles;
@@ -19,6 +22,7 @@ struct ncclGinAnvilSdmaGPUContext {
   uint64_t* counters;
   uint32_t nSignals;
   uint32_t nCounters;
+  uint32_t sdmaThreshold;
   int nRanks;
   int rank;
   int numChannels;

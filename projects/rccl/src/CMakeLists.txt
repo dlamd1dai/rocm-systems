@@ -215,6 +215,7 @@ set(SRC_FILES
   include/nccl_device/gin/rocshmem_gda/gin_rocshmem_device_host_common_gda.h
   include/nccl_device/gin/rocshmem_gda/queue_pair_device.h
   include/nccl_device/gin/anvil_sdma/gin_anvil_sdma.h
+  include/nccl_device/gin/anvil_sdma/gin_anvil_ipc_copy.h
   include/nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h
   include/nccl_device/ll_a2a.h
   include/nccl_device/lsa_barrier.h

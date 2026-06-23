@@ -446,8 +446,8 @@ static_assert(sizeof(SdmaQueueSingleProducerDeviceHandle) == sizeof(SdmaQueueDev
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
 // Internal template: reserves space for enabled operations, places packets, submits.
-template <bool PUT_EN, bool SIGNAL_EN, bool COUNTER_EN>
-__device__ __forceinline__ void put_signal_counter_impl(SdmaQueueDeviceHandle& handle, void* dst,
+template <bool PUT_EN, bool SIGNAL_EN, bool COUNTER_EN, typename QueueHandle>
+__device__ __forceinline__ void put_signal_counter_impl(QueueHandle& handle, void* dst,
                                                         void* src, size_t size, uint64_t* signal,
                                                         uint64_t* counter,
                                                         uint64_t* put_index = nullptr) {
@@ -522,8 +522,18 @@ __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, vo
   put_signal_counter_impl<true, false, false>(handle, dst, src, size, nullptr, nullptr);
 }
 
+__device__ __forceinline__ void put(SdmaQueueSingleProducerDeviceHandle& handle, void* dst,
+                                    void* src, size_t size) {
+  put_signal_counter_impl<true, false, false>(handle, dst, src, size, nullptr, nullptr);
+}
+
 __device__ __forceinline__ void putSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                           size_t size, uint64_t* signal) {
+  put_signal_counter_impl<true, true, false>(handle, dst, src, size, signal, nullptr);
+}
+
+__device__ __forceinline__ void putSignal(SdmaQueueSingleProducerDeviceHandle& handle, void* dst,
+                                          void* src, size_t size, uint64_t* signal) {
   put_signal_counter_impl<true, true, false>(handle, dst, src, size, signal, nullptr);
 }
 
@@ -533,8 +543,19 @@ __device__ __forceinline__ void putSignalCounter(SdmaQueueDeviceHandle& handle, 
   put_signal_counter_impl<true, true, true>(handle, dst, src, size, signal, counter);
 }
 
+__device__ __forceinline__ void putSignalCounter(SdmaQueueSingleProducerDeviceHandle& handle,
+                                                  void* dst, void* src, size_t size,
+                                                  uint64_t* signal, uint64_t* counter) {
+  put_signal_counter_impl<true, true, true>(handle, dst, src, size, signal, counter);
+}
+
 __device__ __forceinline__ void putCounter(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                            size_t size, uint64_t* counter) {
+  put_signal_counter_impl<true, false, true>(handle, dst, src, size, nullptr, counter);
+}
+
+__device__ __forceinline__ void putCounter(SdmaQueueSingleProducerDeviceHandle& handle, void* dst,
+                                           void* src, size_t size, uint64_t* counter) {
   put_signal_counter_impl<true, false, true>(handle, dst, src, size, nullptr, counter);
 }
 
@@ -547,6 +568,10 @@ __device__ __forceinline__ void putWithSignal(SdmaQueueDeviceHandle& handle, voi
 // --- Free functions (signaling) ---
 
 __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, uint64_t* sig) {
+  put_signal_counter_impl<false, true, false>(handle, nullptr, nullptr, 0, sig, nullptr);
+}
+
+__device__ __forceinline__ void signal(SdmaQueueSingleProducerDeviceHandle& handle, uint64_t* sig) {
   put_signal_counter_impl<false, true, false>(handle, nullptr, nullptr, 0, sig, nullptr);
 }
 
@@ -580,6 +605,10 @@ __device__ __forceinline__ void flush(SdmaQueueDeviceHandle& handle, uint64_t up
 
 // Spin-poll rptr until all submitted packets have been consumed
 __device__ __forceinline__ void quiet(SdmaQueueDeviceHandle& handle) {
+  handle.quietAll();
+}
+
+__device__ __forceinline__ void quiet(SdmaQueueSingleProducerDeviceHandle& handle) {
   handle.quietAll();
 }
 
