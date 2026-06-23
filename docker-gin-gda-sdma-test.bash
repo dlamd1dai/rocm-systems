@@ -13,7 +13,6 @@
 #   RCCL_GIN_GDA_TEST4_MODE=auto|run|skip → GIN GDA (Test#4): auto-skip if no bnxt_en or fw < min
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA  → BNXT firmware floor for auto (default 233.2.104.0)
 #   RCCL_GIN_SDMA_TEST5_NUM_CHANNELS → NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS for Test#5 (default 1)
-#   RCCL_GIN_GDA_TEST5_MODE=skip      → skip Test#5 (GIN Anvil SDMA; NCCL_GIN_TYPE=6)
 #   RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR → absolute host dir with libmlx5*.so* / libmlx5dv*.so* from one newer
 #       rdma-core tree (objdump must show mlx5dv_reg_dmabuf_mr + mlx5dv_get_data_direct_sysfs_path). Test#5 only:
 #       adds bind-mounts after DOCKER_TEST2_VOLUMES so RCCL loads MLX5_1.25-capable libs (ddai-gin-perf.log).
@@ -393,9 +392,6 @@ _rccl_gin_gda_test5_image_mlx5_dmabuf_ok() {
   if [[ -n "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR:-}" ]]; then
     return 0
   fi
-  if [[ "${RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT:-1}" == 0 ]]; then
-    return 0
-  fi
   ${DOCKER_CMD} run --rm --init ${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
     'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
      rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
@@ -495,9 +491,6 @@ set +x
 fi
 
 if [ 0 -eq 1 ]; then
-if [[ "${RCCL_GIN_GDA_RUN_TEST4}" == 0 ]]; then
-  echo "=== Test#4: A2A, ${NP} gpus, GIN GDA (skipped) ===" >&2
-else
   set -x
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
@@ -524,14 +517,8 @@ else
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
 fi
-fi
 
 if [ 1 -eq 1 ]; then
-  if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" == "skip" ]]; then
-    echo "=== Test#5: skipped (RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
-  elif ! _rccl_gin_gda_test5_image_mlx5_dmabuf_ok; then
-    echo "=== RCCL_GIN_GDA: Test#5 skipped: image libmlx5 lacks mlx5dv_reg_dmabuf_mr (preflight with Test#2/#5 bind mounts). Fix: RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR, host rdma-core/MOFED libs, RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1, or RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT=0 to force run. ===" >&2
-  else
 set -x
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=6) ==="
   ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
@@ -546,7 +533,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=TRACE \
+    -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=6 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_SDMA_TEST5_NUM_CHANNELS:-1}" \
@@ -559,6 +546,5 @@ set -x
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
-  fi
 fi
 # done
