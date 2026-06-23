@@ -422,6 +422,13 @@ struct SdmaQueueSingleProducerDeviceHandle : SdmaQueueDeviceHandle {
     return cur_index;
   }
 
+  // API-compatible overload for shared put_signal_counter_impl (ring wrap uses PadRingToEnd).
+  __device__ __forceinline__ uint64_t ReserveQueueSpace(const size_t size_in_bytes,
+                                                        uint64_t& offset) {
+    offset = 0;
+    return ReserveQueueSpace(size_in_bytes);
+  }
+
   // Single-producer submitPacket: no committedWptr serialization
   __device__ __forceinline__ void submitPacket([[maybe_unused]] uint64_t base,
                                                uint64_t pendingWptr) {
