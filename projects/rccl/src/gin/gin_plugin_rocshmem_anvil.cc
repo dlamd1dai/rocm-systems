@@ -330,13 +330,7 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
-<<<<<<< HEAD
   if (ctx->gpuCtxHost.signals) rocshmem::rocshmem_free(ctx->gpuCtxHost.signals);
-=======
-  ginAnvilCloseSignalIpc(ctx);
-  if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
-  if (ctx->gpuCtxHost.signal_peer_addrs) (void)hipFree(ctx->gpuCtxHost.signal_peer_addrs);
->>>>>>> 1c38337451 (Fix a bug related to init GPU VAs.)
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
   if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
   free(ctx->devHandle);
