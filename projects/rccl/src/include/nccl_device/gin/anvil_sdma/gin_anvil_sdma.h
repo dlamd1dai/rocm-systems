@@ -11,6 +11,9 @@
 #include "gin_anvil_ipc_copy.h"
 #include "gin_anvil_sdma_device_host_common.h"
 #include "sdma/anvil_device.hpp"
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include <rocshmem/rocshmem.hpp>
+#endif
 
 namespace nccl {
 namespace gin {
@@ -25,12 +28,31 @@ NCCL_DEVICE_INLINE void markSdmaDirty(ncclGinAnvilSdmaGPUContext* rsCtx, int pee
   __hip_atomic_fetch_or(rsCtx->sdmaDirty, bit, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 }
 
-NCCL_DEVICE_INLINE rocshmem::anvil::SdmaQueueSingleProducerDeviceHandle* queueHandle(
+NCCL_DEVICE_INLINE rocshmem::anvil::SdmaQueueDeviceHandle* queueHandle(
     ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int effCh) {
   int numCh = loadConst(&rsCtx->numChannels);
-  auto** handles =
-      (rocshmem::anvil::SdmaQueueSingleProducerDeviceHandle**)loadConst(&rsCtx->queueHandles);
+  auto** handles = (rocshmem::anvil::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
   return loadConst(handles + peer * numCh + effCh);
+}
+
+// Remote signal completion via symmetric rocSHMEM atomics (matches GIN rocSHMEM API path).
+NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
+                                        ncclGinSignal_t signalId, uint64_t value) {
+  rocshmem::rocshmem_uint64_atomic_add(loadConst(&rsCtx->signals) + signalId, value, peer);
+}
+
+NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
+                                              rocshmem::anvil::SdmaQueueDeviceHandle* handle,
+                                              bool hasCounter) {
+  if (hasCounter) {
+    if (sdmaDataPath && handle != nullptr) {
+      rocshmem::anvil::quiet(*handle);
+    } else {
+      rocshmem::rocshmem_fence();
+    }
+  } else {
+    rocshmem::rocshmem_fence();
+  }
 }
 
 }  // namespace detail
@@ -48,8 +70,10 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       ncclGinCounter_t counterId, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, cuda::thread_scope required,
                                       cuda::thread_scope given, uint32_t optFlags = ncclGinOptFlagsDefault) {
+    using nccl::gin::anvil::detail::fenceBeforeShmemSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
+    using nccl::gin::anvil::detail::shmemSignalPeer;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
@@ -63,16 +87,9 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       __threadfence_system();
     }
 
-    uint64_t* sigPtr = nullptr;
-    if (hasSignal) {
-      uintptr_t sigBase = loadConst(loadConst(&rsCtx->signal_peer_addrs) + peer);
-      sigPtr = (uint64_t*)(sigBase + sizeof(uint64_t) * (size_t)signal.indexedSignal.signalId);
-    }
-
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    // IPC fast path is data-only. Signaled puts always use SDMA putSignal / signal.
     bool useIpc = hasWins && !hasSignal && (bytes < threshold || handle == nullptr);
-    bool fusedSignal = false;
+    bool sdmaDataPath = hasWins && !useIpc && handle != nullptr;
 
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
@@ -84,36 +101,20 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
         nccl::gin::anvil::ipcPut((void*)dstAddr, (void*)srcAddr, bytes);
       } else if (handle != nullptr) {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-        if (hasSignal && !hasCounter) {
-          rocshmem::anvil::putSignal(*handle, (void*)dstAddr, (void*)srcAddr, bytes, sigPtr);
-          fusedSignal = true;
-        } else {
-          rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)srcAddr, bytes);
-        }
+        rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)srcAddr, bytes);
         markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
       }
     }
 
     if (hasSignal || hasCounter) {
-      if (hasCounter && !useIpc && handle != nullptr) {
-        rocshmem::anvil::quiet(*handle);
-      } else if (!useIpc && !fusedSignal) {
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-      }
+      fenceBeforeShmemSignal(sdmaDataPath, handle, hasCounter);
 
-      if (useIpc) {
-        if (hasCounter) {
-          atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
-        }
-      } else {
-        if (hasSignal && !fusedSignal && handle != nullptr) {
-          if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-          rocshmem::anvil::signal(*handle, sigPtr);
-          markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
-        }
-        if (hasCounter) {
-          atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
-        }
+      if (hasSignal) {
+        if (signalOp == ncclGinSignalInc) signalOpArg = 1;
+        shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
+      }
+      if (hasCounter) {
+        atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
       }
     }
   }
@@ -128,8 +129,10 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       ncclGinDescriptorSmem* descriptor, cuda::thread_scope required,
                                       cuda::thread_scope given, uint32_t optFlags = ncclGinOptFlagsDefault) {
     using nccl::gin::anvil::ipcPutScalar;
+    using nccl::gin::anvil::detail::fenceBeforeShmemSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
+    using nccl::gin::anvil::detail::shmemSignalPeer;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
@@ -149,20 +152,20 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
     bool useIpc = !hasSignal && (bytes < threshold || handle == nullptr);
+    bool sdmaDataPath = !useIpc && handle != nullptr;
 
     if (useIpc) {
       ipcPutScalar((void*)dstAddr, &tmp, bytes);
     } else if (handle != nullptr) {
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-      if (hasSignal) {
-        uintptr_t sigBase = loadConst(loadConst(&rsCtx->signal_peer_addrs) + peer);
-        uint64_t* sigPtr =
-            (uint64_t*)(sigBase + sizeof(uint64_t) * (size_t)signal.indexedSignal.signalId);
-        rocshmem::anvil::putSignal(*handle, (void*)dstAddr, (void*)&tmp, bytes, sigPtr);
-      } else {
-        rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)&tmp, bytes);
-      }
+      rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)&tmp, bytes);
       markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
+    }
+
+    if (hasSignal) {
+      fenceBeforeShmemSignal(sdmaDataPath, handle, /*hasCounter=*/false);
+      if (signalOp == ncclGinSignalInc) signalOpArg = 1;
+      shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }
   }
 };
@@ -207,8 +210,7 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       uint32_t* abortFlag) {
     using nccl::utility::loadConst;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    auto** handles =
-        (rocshmem::anvil::SdmaQueueSingleProducerDeviceHandle**)loadConst(&rsCtx->queueHandles);
+    auto** handles = (rocshmem::anvil::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
     int nr = ctx.nRanks;
     int numCh = loadConst(&rsCtx->numChannels);
 #pragma unroll 1

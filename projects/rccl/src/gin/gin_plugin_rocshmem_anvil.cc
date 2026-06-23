@@ -20,6 +20,7 @@
 #include "bootstrap.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include <rocshmem/gin_anvil_factory.h>
+#include <rocshmem/rocshmem.hpp>
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
@@ -46,7 +47,6 @@ struct ginAnvilGinCtx {
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
-  void** signal_ipc_peer_ptrs;
 };
 
 struct ginAnvilMemHandle {
@@ -60,18 +60,6 @@ struct ginAnvilListenCtx {
 
 static int ginAnvilBootstrapAllgather(void* ctx, void* buf, size_t perRankSize) {
   return (bootstrapAllGather(ctx, buf, (int)perRankSize) == ncclSuccess) ? 0 : -1;
-}
-
-static void ginAnvilCloseSignalIpc(ginAnvilGinCtx* ctx) {
-  if (!ctx || !ctx->signal_ipc_peer_ptrs) return;
-  for (int p = 0; p < ctx->nRanks; ++p) {
-    if (p != ctx->rank && ctx->signal_ipc_peer_ptrs[p]) {
-      (void)hipIpcCloseMemHandle(ctx->signal_ipc_peer_ptrs[p]);
-      ctx->signal_ipc_peer_ptrs[p] = nullptr;
-    }
-  }
-  free(ctx->signal_ipc_peer_ptrs);
-  ctx->signal_ipc_peer_ptrs = nullptr;
 }
 
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
@@ -263,7 +251,6 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
-  ctx->signal_ipc_peer_ptrs = nullptr;
 
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
@@ -286,76 +273,13 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
 
   if (config->nSignals > 0) {
-    if (hipExtMallocWithFlags((void**)&ctx->gpuCtxHost.signals, sizeof(uint64_t) * config->nSignals,
-                              hipDeviceMallocFinegrained) != hipSuccess) {
+    ctx->gpuCtxHost.signals =
+        (uint64_t*)rocshmem::rocshmem_malloc(sizeof(uint64_t) * config->nSignals);
+    if (!ctx->gpuCtxHost.signals) {
       ret = ncclSystemError;
       goto fail;
     }
     (void)hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals);
-
-    uintptr_t* addrs = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)ctx->nRanks);
-    hipIpcMemHandle_t* ipc_handles = nullptr;
-    if (!addrs) {
-      ret = ncclSystemError;
-      goto fail;
-    }
-
-    ipc_handles = (hipIpcMemHandle_t*)malloc(sizeof(hipIpcMemHandle_t) * (size_t)ctx->nRanks);
-    if (!ipc_handles) {
-      free(addrs);
-      ret = ncclSystemError;
-      goto fail;
-    }
-
-    const bool signal_ipc_ok =
-        hipIpcGetMemHandle(&ipc_handles[ctx->rank], ctx->gpuCtxHost.signals) == hipSuccess;
-    if (signal_ipc_ok) {
-      NCCLCHECKGOTO(bootstrapAllGather(cctx->comm->bootstrap, ipc_handles, sizeof(hipIpcMemHandle_t)),
-                    ret, signal_fail);
-      NCCLCHECKGOTO(ncclCalloc(&ctx->signal_ipc_peer_ptrs, ctx->nRanks), ret, signal_fail);
-      addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
-      for (int p = 0; p < ctx->nRanks; ++p) {
-        if (p == ctx->rank) continue;
-        void* peer_ptr = nullptr;
-        hipError_t hip_ret =
-            hipIpcOpenMemHandle(&peer_ptr, ipc_handles[p], hipIpcMemLazyEnablePeerAccess);
-        if (hip_ret != hipSuccess) {
-          WARN("GIN anvil-sdma: hipIpcOpenMemHandle(rank %d) failed: %s", p,
-               hipGetErrorString(hip_ret));
-          ret = ncclSystemError;
-          goto signal_fail;
-        }
-        ctx->signal_ipc_peer_ptrs[p] = peer_ptr;
-        addrs[p] = (uintptr_t)peer_ptr;
-      }
-    } else {
-      WARN("GIN anvil-sdma: hipIpcGetMemHandle failed for signals; using allgathered pointers");
-      addrs[ctx->rank] = (uintptr_t)ctx->gpuCtxHost.signals;
-      NCCLCHECKGOTO(bootstrapAllGather(cctx->comm->bootstrap, addrs, (int)sizeof(uintptr_t)), ret,
-                    signal_fail);
-    }
-    free(ipc_handles);
-    ipc_handles = nullptr;
-
-    if (hipMalloc(&ctx->gpuCtxHost.signal_peer_addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks) !=
-        hipSuccess) {
-      free(addrs);
-      ginAnvilCloseSignalIpc(ctx);
-      ret = ncclSystemError;
-      goto fail;
-    }
-    (void)hipMemcpy(ctx->gpuCtxHost.signal_peer_addrs, addrs, sizeof(uintptr_t) * (size_t)ctx->nRanks,
-                    hipMemcpyHostToDevice);
-    free(addrs);
-    goto signal_done;
-
-  signal_fail:
-    if (ipc_handles) free(ipc_handles);
-    free(addrs);
-    ginAnvilCloseSignalIpc(ctx);
-    goto fail;
-
-  signal_done:;
   }
 
   if (config->nCounters > 0) {
@@ -380,9 +304,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
 fail:
   if (ctx) {
-    ginAnvilCloseSignalIpc(ctx);
-    if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
-    if (ctx->gpuCtxHost.signal_peer_addrs) (void)hipFree(ctx->gpuCtxHost.signal_peer_addrs);
+    if (ctx->gpuCtxHost.signals) rocshmem::rocshmem_free(ctx->gpuCtxHost.signals);
     if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
     if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
     free(ctx->devHandle);
@@ -394,9 +316,7 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
-  ginAnvilCloseSignalIpc(ctx);
-  if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
-  if (ctx->gpuCtxHost.signal_peer_addrs) (void)hipFree(ctx->gpuCtxHost.signal_peer_addrs);
+  if (ctx->gpuCtxHost.signals) rocshmem::rocshmem_free(ctx->gpuCtxHost.signals);
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
   if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
   free(ctx->devHandle);

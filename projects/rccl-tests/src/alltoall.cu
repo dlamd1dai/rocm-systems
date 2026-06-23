@@ -22,9 +22,11 @@
 // called from gin_host_rocshmem_gda.cc after QP creation.
 static void rocshmemPreInit(int rank, int nranks) {
   const char *gin_type = getenv("NCCL_GIN_TYPE");
-  if (!gin_type || atoi(gin_type) != 4) return;
-
-  // GIN_TYPE=4 (rocshmem API) needs full rocshmem_init.
+  if (!gin_type) return;
+  const int type = atoi(gin_type);
+  // GIN_TYPE=4 (rocSHMEM API) and GIN_TYPE=6 (Anvil SDMA) need rocshmem_init for
+  // symmetric signal memory and device-side rocshmem_uint64_atomic_add.
+  if (type != 4 && type != 6) return;
   int nGpus = 0;
   hipGetDeviceCount(&nGpus);
   if (nGpus > 0) hipSetDevice(rank % nGpus);
