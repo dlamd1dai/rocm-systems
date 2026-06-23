@@ -72,10 +72,6 @@ NCCL_DEVICE_INLINE void ipcPut(void* dst, const void* src, size_t bytes) {
   if (i < bytes) ipcPutScalar(d + i, s + i, bytes - i);
 }
 
-NCCL_DEVICE_INLINE void ipcSignal(uint64_t* sigPtr, uint64_t value) {
-  __hip_atomic_fetch_add(sigPtr, value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-
 }  // namespace anvil
 }  // namespace gin
 }  // namespace nccl

@@ -70,7 +70,10 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    bool useIpc = hasWins && (bytes < threshold || handle == nullptr);
+    // IPC load/store is only for data. Remote signals must use SDMA atomics — flat P2P
+    // fetch_add on signal_peer_addrs does not reliably reach the peer's waitSignal poll.
+    bool useIpcData = hasWins && (bytes < threshold || handle == nullptr);
+    bool useIpc = useIpcData && !hasSignal;
     bool fusedSignal = false;
 
     if (hasWins) {
@@ -81,6 +84,12 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
       if (useIpc) {
         nccl::gin::anvil::ipcPut((void*)dstAddr, (void*)srcAddr, bytes);
+      } else if (useIpcData && hasSignal && !hasCounter && handle != nullptr) {
+        nccl::gin::anvil::ipcPut((void*)dstAddr, (void*)srcAddr, bytes);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+        rocshmem::anvil::signal(*handle, sigPtr);
+        fusedSignal = true;
+        markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
       } else {
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         if (hasSignal && !hasCounter) {
@@ -101,10 +110,6 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       }
 
       if (useIpc) {
-        if (hasSignal) {
-          if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-          nccl::gin::anvil::ipcSignal(sigPtr, signalOpArg);
-        }
         if (hasCounter) {
           atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
         }
@@ -151,10 +156,19 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useIpc = bytes < threshold || handle == nullptr;
+    bool useIpcData = bytes < threshold || handle == nullptr;
+    bool useIpc = useIpcData && !hasSignal;
 
     if (useIpc) {
       ipcPutScalar((void*)dstAddr, &tmp, bytes);
+    } else if (useIpcData && hasSignal && handle != nullptr) {
+      ipcPutScalar((void*)dstAddr, &tmp, bytes);
+      uintptr_t sigBase = loadConst(loadConst(&rsCtx->signal_peer_addrs) + peer);
+      uint64_t* sigPtr =
+          (uint64_t*)(sigBase + sizeof(uint64_t) * (size_t)signal.indexedSignal.signalId);
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+      rocshmem::anvil::signal(*handle, sigPtr);
+      markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
     } else if (handle != nullptr) {
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       if (hasSignal) {
@@ -166,14 +180,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
         rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)&tmp, bytes);
       }
       markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
-    }
-
-    if (hasSignal && useIpc) {
-      if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-      uintptr_t sigBase = loadConst(loadConst(&rsCtx->signal_peer_addrs) + peer);
-      uint64_t* sigPtr =
-          (uint64_t*)(sigBase + sizeof(uint64_t) * (size_t)signal.indexedSignal.signalId);
-      nccl::gin::anvil::ipcSignal(sigPtr, signalOpArg);
     }
   }
 };
