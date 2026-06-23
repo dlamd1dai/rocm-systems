@@ -211,17 +211,32 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       uint32_t* abortFlag) {
     using nccl::utility::loadConst;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    auto** handles = (rocshmem::anvil::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
-    int nr = ctx.nRanks;
-    int numCh = loadConst(&rsCtx->numChannels);
+    uint64_t dirty = __hip_atomic_load(loadConst(&rsCtx->sdmaDirty), __ATOMIC_RELAXED,
+                                       __HIP_MEMORY_SCOPE_AGENT);
+    if (dirty != 0) {
+      auto** handles = (rocshmem::anvil::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
+      int nr = ctx.nRanks;
+      int numCh = loadConst(&rsCtx->numChannels);
 #pragma unroll 1
-    for (int peer = coop.thread_rank(); peer < nr; peer += coop.size()) {
-      for (int ch = 0; ch < numCh; ++ch) {
-        auto* h = loadConst(handles + peer * numCh + ch);
-        if (h != nullptr) rocshmem::anvil::quiet(*h);
+      for (int peer = coop.thread_rank(); peer < nr; peer += coop.size()) {
+        uint64_t peerMask = ((1ULL << numCh) - 1) << (peer * numCh);
+        if ((dirty & peerMask) == 0) continue;
+        for (int ch = 0; ch < numCh; ++ch) {
+          uint64_t bit = 1ULL << (peer * numCh + ch);
+          if ((dirty & bit) == 0) continue;
+          auto* h = loadConst(handles + peer * numCh + ch);
+          if (h != nullptr) rocshmem::anvil::quiet(*h);
+        }
       }
+      coop.sync();
+      if (coop.thread_rank() == 0) {
+        __hip_atomic_store(loadConst(&rsCtx->sdmaDirty), 0, __ATOMIC_RELAXED,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      }
+      coop.sync();
     }
-    coop.sync();
+    // IPC-only iterations skip SDMA quiet (matches IpcSdmaImpl::ipcQuiet).
+    rocshmem::rocshmem_fence();
   }
 };
 
