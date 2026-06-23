@@ -191,14 +191,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     if (useIpc) {
       ipcPutScalar((void*)dstAddr, &tmp, bytes);
-    } else if (useIpcData && hasSignal && handle != nullptr) {
-      ipcPutScalar((void*)dstAddr, &tmp, bytes);
-      uintptr_t sigBase = loadConst(loadConst(&rsCtx->signal_peer_addrs) + peer);
-      uint64_t* sigPtr =
-          (uint64_t*)(sigBase + sizeof(uint64_t) * (size_t)signal.indexedSignal.signalId);
-      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-      rocshmem::anvil::signal(*handle, sigPtr);
-      markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
     } else if (handle != nullptr) {
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       rocshmem::anvil::put(*handle, (void*)dstAddr, (void*)&tmp, bytes);
