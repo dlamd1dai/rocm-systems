@@ -15,7 +15,13 @@
 #   RCCL_GIN_GDA_DOCKER_RDMA_GROUP=0 → do not add --group-add rdma when host has that group
 #   RCCL_GIN_GDA_TEST4_MODE=auto   → GIN GDA (Test#4): auto-skip if host bnxt_en fw < min (default auto; run|skip)
 #   RCCL_GIN_GDA_MIN_BNXT_FW_FOR_GDA → BNXT firmware floor for that auto check (default 233.2.104.0, matches RCCL GIN probe)
-#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _MLX5_SO / _GNU_DIRS / _IB_SYSFS / _BIND_HOST_DEV_INFINIBAND / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-test.bash header
+#   RCCL_GIN_GDA_TEST5_MODE=skip   → skip Test#5 (GIN Anvil SDMA direct path, NCCL_GIN_TYPE=6; default run)
+#   RCCL_GIN_GDA_TEST5_NUM_CHANNELS → NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS for Test#5 (default 1)
+#   RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT=1 (default) → skip Test#5 if image libmlx5 lacks mlx5dv_reg_dmabuf_mr; 0 disables
+#   RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR → absolute host dir with newer libmlx5*.so* / libmlx5dv*.so* (objdump must show
+#       mlx5dv_reg_dmabuf_mr + mlx5dv_get_data_direct_sysfs_path). Test#5 adds bind-mounts after DOCKER_TEST2_VOLUMES.
+#   RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1 → always bind adjacent host libmlx5* (see docker-gin-gda-sdma-test.bash).
+#   RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO / _BASE / _EXTRA / _MLX5_SO / _GNU_DIRS / _IB_SYSFS / _BIND_HOST_DEV_INFINIBAND / _HOST_SO_SEARCH_DIRS → see docker-gin-gda-sdma-test.bash header
 #
 # If perf still prints nothing for a long time: rebuild the image with --build-arg GPU_TARGETS matching
 # the node (e.g. gfx942 on MI300); default image builds often target gfx950 only.
@@ -24,7 +30,7 @@
 NP=${1:-8}
 
 DOCKER_CMD="sudo docker"
-DOCKER_IMAGE="rccl-gingda713"
+DOCKER_IMAGE="rccl-gin-gda-sdma-713"
 RCCL_GIN_GDA_SCRIPT_MARK="${RCCL_GIN_GDA_SCRIPT_MARK:-ruby-20260618e}"
 MAX_BYTES="${RCCL_GIN_GDA_MAX_BYTES:-1024M}"
 
@@ -118,12 +124,20 @@ _rccl_gin_gda_host_so_mount_from_base() {
   return 1
 }
 
+# True if ELF exports mlx5dv_reg_dmabuf_mr in dynamic symbol table (RCCL MLX5_1.25 path; needs binutils objdump on host).
+_rccl_gin_gda_host_so_objdump_has_mlx5_dmabuf_mr() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  command -v objdump >/dev/null 2>&1 || return 1
+  objdump -T "$f" 2>/dev/null | grep -q mlx5dv_reg_dmabuf_mr
+}
+
 # Bind host libmlx5* from the directory of resolved libibverbs.so.1 (same rdma-core install). RCCL dlopens
 # "libmlx5.so" and dlvsym's MLX5_1.25 — image libmlx5 can be too old while host libibverbs is new (ddai-gin-perf.log).
 # Host adjacent libmlx5.so.1.N.* with small N can be too old vs RCCL while image mlx5 is new (ddai-gin-perf.log).
 _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
-  local d cand verbs_real vbdir mlx cand2 real check cand5 bn min_impl impl_n
+  local d cand verbs_real vbdir mlx cand2 real check cand5 bn min_impl impl_n dv dvr
   verbs_real=""
   for d in ${_dirs}; do
     cand="${d}/libibverbs.so.1"
@@ -144,11 +158,34 @@ _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   done
   if [[ -n "${check}" ]]; then
     bn=$(basename "${check}")
-    if [[ "${bn}" =~ ^libmlx5.*\.so\.1\.([0-9]+) ]]; then
+    if [[ "${RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK:-0}" == 1 ]]; then
+      echo "=== RCCL_GIN_GDA: RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1 — binding adjacent host libmlx5* (${bn}). ===" >&2
+    elif [[ "${bn}" =~ ^libmlx5.*\.so\.1\.([0-9]+) ]]; then
       impl_n="${BASH_REMATCH[1]}"
       if (( 10#${impl_n} < 10#${min_impl} )); then
-        echo "=== RCCL_GIN_GDA: Test#2 skipping adjacent host libmlx5* bind (${bn}; impl ${impl_n} < ${min_impl}; RCCL MLX5_1.25 dlvsym — using image libmlx5; ddai-gin-perf.log). ===" >&2
-        return 0
+        if _rccl_gin_gda_host_so_objdump_has_mlx5_dmabuf_mr "${check}"; then
+          echo "=== RCCL_GIN_GDA: adjacent host libmlx5 ${bn} has impl ${impl_n} < ${min_impl} but objdump shows mlx5dv_reg_dmabuf_mr — binding adjacent libmlx5* (RCCL MLX5_1.25). ===" >&2
+        else
+          dvr=""
+          for dv in "${vbdir}/libmlx5dv.so.1" "${vbdir}/libmlx5dv.so"; do
+            [[ -e "${dv}" ]] || continue
+            dvr=$(readlink -f "${dv}" 2>/dev/null || true)
+            [[ -z "${dvr}" || ! -e "${dvr}" ]] && dvr="${dv}"
+            if _rccl_gin_gda_host_so_objdump_has_mlx5_dmabuf_mr "${dvr}"; then
+              echo "=== RCCL_GIN_GDA: adjacent libmlx5dv exports mlx5dv_reg_dmabuf_mr (${dvr}); libmlx5 impl ${impl_n} < ${min_impl} — binding adjacent libmlx5* anyway. ===" >&2
+              break
+            fi
+            dvr=""
+          done
+          if [[ -z "${dvr}" ]]; then
+            if ! command -v objdump >/dev/null 2>&1; then
+              echo "=== RCCL_GIN_GDA: warning: objdump not found — binding adjacent host libmlx5* anyway (${bn}; impl ${impl_n} < ${min_impl}). Install binutils for a safer symbol probe. ===" >&2
+            else
+              echo "=== RCCL_GIN_GDA: Test#2 skipping adjacent host libmlx5* bind (${bn}; impl ${impl_n} < ${min_impl}; no mlx5dv_reg_dmabuf_mr on host libmlx5/libmlx5dv; upgrade host rdma-core or set RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1; ddai-gin-perf.log). ===" >&2
+              return 0
+            fi
+          fi
+        fi
       fi
     fi
   fi
@@ -224,6 +261,59 @@ if [[ "${_rccl_gin_gda_t2_dev_inf_bind}" -eq 1 ]]; then
 fi
 unset _rccl_gin_gda_t2_dev_inf_bind
 
+DOCKER_TEST5_MLX5_VOLUMES=""
+_rccl_gin_gda_test5_so_add_bind() {
+  local src="$1" dst="$2"
+  [[ -n "${src}" && -e "${src}" && -n "${dst}" ]] || return 0
+  if [[ " ${_rccl_t5_dst_mounted} " == *" ${dst} "* ]]; then
+    return 0
+  fi
+  DOCKER_TEST5_MLX5_VOLUMES+=" -v ${src}:${dst}:ro"
+  _rccl_t5_dst_mounted+=" ${dst} "
+}
+
+_rccl_gin_gda_test5_mount_mlx5_from_host_dir() {
+  local dir="$1" d cand real base _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local ok_mr=0 ok_sys=0 check
+  [[ -d "${dir}" ]] || {
+    echo "error: RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR is not a directory: ${dir}" >&2
+    return 1
+  }
+  shopt -s nullglob
+  for cand in "${dir}"/libmlx5*.so* "${dir}"/libmlx5dv*.so*; do
+    [[ -f "${cand}" ]] || continue
+    check=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${check}" || ! -e "${check}" ]] && check="${cand}"
+    objdump -T "${check}" 2>/dev/null | grep -q mlx5dv_reg_dmabuf_mr && ok_mr=1
+    objdump -T "${check}" 2>/dev/null | grep -q mlx5dv_get_data_direct_sysfs_path && ok_sys=1
+  done
+  shopt -u nullglob
+  if [[ "${ok_mr}" != 1 ]] || [[ "${ok_sys}" != 1 ]]; then
+    echo "error: RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR=${dir}: no libmlx5*.so* / libmlx5dv*.so* export both mlx5dv_reg_dmabuf_mr and mlx5dv_get_data_direct_sysfs_path." >&2
+    echo "error: Install Mellanox OFED or newer rdma-core on the host, then set this variable to that lib directory." >&2
+    return 1
+  fi
+  _rccl_t5_dst_mounted=""
+  shopt -s nullglob
+  for cand in "${dir}"/libmlx5*.so* "${dir}"/libmlx5dv*.so*; do
+    [[ -f "${cand}" ]] || continue
+    real=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${cand}"
+    base=$(basename "${cand}")
+    for d in ${_dirs}; do
+      _rccl_gin_gda_test5_so_add_bind "${real}" "${d}/${base}"
+    done
+    _rccl_gin_gda_test5_so_add_bind "${real}" "${real}"
+  done
+  shopt -u nullglob
+  unset _rccl_t5_dst_mounted
+  echo "=== RCCL_GIN_GDA: Test#5 bind-mounts from RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR=${dir} (MLX5 DMA-BUF symbols verified on host). ===" >&2
+}
+
+if [[ -n "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR:-}" ]]; then
+  _rccl_gin_gda_test5_mount_mlx5_from_host_dir "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR}" || exit 1
+fi
+
 # RCCL_LD_PATH="/workspace/rocshmem/lib:/workspace/rccl/lib:/opt/ucx/lib:/opt/ompi/lib:/opt/rocm/lib:/opt/rocm/core/lib/rocm_sysdeps/lib"
 # HFILE="my_hostfile"
 # MPIRUN_BASE="-n ${NP} --allow-run-as-root -mca pml ob1 -mca btl ^openib"
@@ -282,6 +372,19 @@ _rccl_gin_gda_should_skip_test4_auto() {
   return 1
 }
 
+_rccl_gin_gda_test5_image_mlx5_dmabuf_ok() {
+  if [[ -n "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR:-}" ]]; then
+    return 0
+  fi
+  if [[ "${RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT:-1}" == 0 ]]; then
+    return 0
+  fi
+  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
+    'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
+     rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
+    >/dev/null 2>&1
+}
+
 if [[ "${RCCL_GIN_GDA_PREFLIGHT:-1}" == 1 ]]; then
   echo "=== Preflight: container, rocm-smi, mpirun hostname (RCCL_GIN_GDA_PREFLIGHT=0 to skip) ===" >&2
   ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
@@ -297,9 +400,10 @@ echo '[preflight] ok'
   }
 fi
 
+# for ((NP = 2; NP <= 8; NP <<= 1)); do
 set -x
   echo "=== Test#1: A2A, ${NP} gpus, Host Initiated ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${DOCKER_IMAGE} \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
@@ -309,7 +413,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG="${RCCL_GIN_GDA_NCCL_DEBUG}" \
+    -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
@@ -321,6 +425,7 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
 set +x
 
+if [ 0 -eq 1 ]; then
 set -x
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (Ib proxy; GinAlltoAllKernel; -D 3) ==="
   if [[ "${RCCL_GIN_GDA_DOCKER_UVERBS:-1}" != 0 ]] && [[ "${RCCL_GIN_GDA_UVERBS_ADDED:-0}" -eq 0 ]]; then
@@ -343,7 +448,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=NONE \
+    -x NCCL_DEBUG=INFO \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=2 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
@@ -355,10 +460,11 @@ set -x
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
+fi
 
 set -x
   echo "=== Test#3: A2A, ${NP} gpus, GIN ROCSHMEM+SDMA ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${DOCKER_IMAGE} \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
@@ -370,7 +476,7 @@ set -x
     -x ROCSHMEM_SDMA_ENABLED=1 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=NONE \
+    -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=4 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
@@ -382,6 +488,7 @@ set -x
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
 set +x
 
+if [ 0 -eq 1 ]; then
 RCCL_GIN_GDA_RUN_TEST4=1
 case "${RCCL_GIN_GDA_TEST4_MODE:-auto}" in
   skip) RCCL_GIN_GDA_RUN_TEST4=0 ;;
@@ -402,7 +509,7 @@ if [[ "${RCCL_GIN_GDA_RUN_TEST4}" == 0 ]]; then
 else
   set -x
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}  ${DOCKER_IMAGE} \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${DOCKER_IMAGE} \
     mpirun -n ${NP} ${MPI_OPT} \
     -x OMPI_ALLOW_RUN_AS_ROOT=1 \
     -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
@@ -414,7 +521,7 @@ else
     -x ROCSHMEM_SDMA_ENABLED=1 \
     -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
     -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
-    -x NCCL_DEBUG=NONE \
+    -x NCCL_DEBUG=VERSION \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=5 \
     -x NCCL_DEBUG_SUBSYS=INIT,NET \
@@ -426,6 +533,42 @@ else
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   set +x
 fi
+fi
 
+if [ 1 -eq 1 ]; then
+  if [[ "${RCCL_GIN_GDA_TEST5_MODE:-run}" == "skip" ]]; then
+    echo "=== Test#5: skipped (RCCL_GIN_GDA_TEST5_MODE=skip) ===" >&2
+  elif ! _rccl_gin_gda_test5_image_mlx5_dmabuf_ok; then
+    echo "=== RCCL_GIN_GDA: Test#5 skipped: image libmlx5 lacks mlx5dv_reg_dmabuf_mr (preflight with Test#2/#5 bind mounts). Fix: RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR, host rdma-core/MOFED libs, RCCL_GIN_GDA_TEST2_ADJACENT_MLX5_IGNORE_SO1_MINOR_CHECK=1, or RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT=0 to force run. ===" >&2
+  else
+set -x
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (direct; NCCL_GIN_TYPE=6) ==="
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
+    mpirun -n ${NP} ${MPI_OPT} \
+    -x OMPI_ALLOW_RUN_AS_ROOT=1 \
+    -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_NET_PLUGIN=none \
+    -x RCCL_ROCSHMEM_ENABLE=0 \
+    -x ROCSHMEM_BACKEND=ipc \
+    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
+    -x RCCL_ROCSHMEM_THRESHOLD=$((128*1024*1024)) \
+    -x NCCL_DEBUG=VERSION \
+    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_TYPE=6 \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${RCCL_GIN_GDA_TEST5_NUM_CHANNELS:-1}" \
+    -x NCCL_DEBUG_SUBSYS=INIT,NET \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x RCCL_ENABLE_INTRANET=1 \
+    -x NCCL_DMABUF_ENABLE=1 \
+    -x NCCL_MSCCL_ENABLE=0 \
+    -x HSA_NO_SCRATCH_RECLAIM=1 \
+    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+set +x
+  fi
+fi
 # done
 

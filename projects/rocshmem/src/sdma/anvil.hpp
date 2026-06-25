@@ -50,6 +50,7 @@ class SdmaQueue {
   ~SdmaQueue();
 
   SdmaQueueDeviceHandle* deviceHandle() const;
+  SdmaQueueSingleProducerDeviceHandle* singleProducerDeviceHandle() const;
   void dump(std::ofstream& logFile);
 
  private:
@@ -59,6 +60,7 @@ class SdmaQueue {
   void* queueBuffer_;
   HsaQueueResource queue_;
   SdmaQueueDeviceHandle* deviceHandle_;
+  SdmaQueueSingleProducerDeviceHandle* singleProducerDeviceHandle_{nullptr};
 };
 
 class AnvilLib {
