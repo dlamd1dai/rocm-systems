@@ -1,0 +1,58 @@
+/******************************************************************************
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * SPDX-License-Identifier: MIT
+ *****************************************************************************/
+
+#ifndef ROCSHMEM_GIN_ANVIL_FACTORY_H_
+#define ROCSHMEM_GIN_ANVIL_FACTORY_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define ROCSHMEM_GIN_ANVIL_API __attribute__((visibility("default")))
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Opaque handle: SDMA queue table (per rank × channels) + sdmaDirty bitmask.
+ * Built without rocshmem_init(); uses the same AnvilLib SDMA paths as IPC SDMA.
+ */
+typedef struct rocshmem_gin_anvil_opaque* rocshmem_gin_anvil_handle_t;
+
+/** @return 1 if SDMA Anvil path is compiled in and HIP reports at least one device, else 0 */
+ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_probe(void);
+
+/**
+ * Bootstrap allgather: int allgather(void* ctx, void* buf, size_t bytes_per_rank)
+ * Each rank fills buf[myRank * elem_size ..] before the collective; result is full table.
+ *
+ * On entry, `buf` must point to `nRanks * sizeof(int)` bytes. The caller sets
+ * `buf[myRank] = my_device_id` before invoking `allgather`; after the collective,
+ * `buf[r]` is the HIP device ordinal for rank `r`.
+ *
+ * @param my_device_id  HIP ordinal for this rank (typically hipGetDevice).
+ * @param num_channels  SDMA channels per peer pair (clamped to [1,8]).
+ * @param out_gpu_handles Device pointer to array of nRanks*num_channels pointers to
+ *                        SdmaQueueDeviceHandle (layout: peer * num_channels + ch).
+ * @param out_sdma_dirty  Device pointer to a single uint64_t dirty bitmask (device memory).
+ */
+ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_create(
+    int nRanks, int myRank, int my_device_id,
+    int (*allgather)(void* ctx, void* buf, size_t bytes_per_rank), void* allgather_ctx,
+    int num_channels, rocshmem_gin_anvil_handle_t* out_handle, void** out_gpu_handles,
+    uint64_t** out_sdma_dirty);
+
+ROCSHMEM_GIN_ANVIL_API void rocshmem_gin_anvil_destroy(rocshmem_gin_anvil_handle_t handle);
+
+/** Fields stored in the opaque handle for RCCL plugin / device code */
+ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_get_n_ranks(rocshmem_gin_anvil_handle_t handle);
+ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_get_num_channels(rocshmem_gin_anvil_handle_t handle);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // ROCSHMEM_GIN_ANVIL_FACTORY_H_
