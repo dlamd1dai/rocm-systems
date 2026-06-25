@@ -149,6 +149,13 @@ SdmaQueue::SdmaQueue([[maybe_unused]] int localDeviceId, int remoteDeviceId, hsa
 
   ANVIL_CHECK_HIP_ERROR(
       hipMemcpy(deviceHandle_, &handle, sizeof(SdmaQueueDeviceHandle), hipMemcpyHostToDevice));
+
+  ANVIL_CHECK_HIP_ERROR(hipMalloc(&singleProducerDeviceHandle_,
+                                  sizeof(SdmaQueueSingleProducerDeviceHandle)));
+  ANVIL_CHECK_HIP_ERROR(hipMemcpy(singleProducerDeviceHandle_, &handle,
+                                  sizeof(SdmaQueueSingleProducerDeviceHandle),
+                                  hipMemcpyHostToDevice));
+
   ANVIL_CHECK_HIP_ERROR(hipMemcpy(cachedWptr_, &cachedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
   ANVIL_CHECK_HIP_ERROR(
       hipMemcpy(committedWptr_, &committedWptr, sizeof(uint64_t), hipMemcpyHostToDevice));
@@ -157,6 +164,7 @@ SdmaQueue::SdmaQueue([[maybe_unused]] int localDeviceId, int remoteDeviceId, hsa
 SdmaQueue::~SdmaQueue() {
   CHECK_HSAKMT_SUCCESS(hsaKmtDestroyQueue(queue_.QueueId), "Failed to destroy queue.");
   ANVIL_CHECK_HIP_ERROR(hipFree(deviceHandle_));
+  if (singleProducerDeviceHandle_) ANVIL_CHECK_HIP_ERROR(hipFree(singleProducerDeviceHandle_));
   ANVIL_CHECK_HIP_ERROR(hipFree(cachedWptr_));
   ANVIL_CHECK_HIP_ERROR(hipFree(committedWptr_));
   CHECK_HSAKMT_SUCCESS(hsaKmtUnmapMemoryToGPU(queueBuffer_), "Failed");
@@ -164,6 +172,10 @@ SdmaQueue::~SdmaQueue() {
 }
 
 SdmaQueueDeviceHandle* SdmaQueue::deviceHandle() const { return deviceHandle_; }
+
+SdmaQueueSingleProducerDeviceHandle* SdmaQueue::singleProducerDeviceHandle() const {
+  return singleProducerDeviceHandle_;
+}
 
 void SdmaQueue::dump(std::ofstream& logFile) {
   logFile << "Queue -> device " << remoteDeviceId_ << ": "
