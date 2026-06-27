@@ -8,7 +8,7 @@ FROM ubuntu:24.04
 #docker build -f Dockerfile-rccl-gin-gda-sdma -t rccl-gin-gda-sdma-713 --build-arg GPU_TARGETS=gfx950  .
 #--build-arg ROCSHMEM_CACHE_BUST=N: increase N to force pull rocSHMEM and rebuilding
 #--build-arg RCCL_CACHE_BUST=N: increase N to force pull RCCL and RCCL-test and rebuilding
-#--build-arg ROCSHMEM_BRANCH=users/abouteiller/gin-stage2 (RCCL_BRANCH): pull and build that specific branch from github
+#--build-arg ROCSHMEM_BRANCH=users/dondai/gin-stage2-gda-sdma-merge (RCCL_BRANCH): pull and build that specific branch from github
 # Example build: from local sources, CWD in the rocm-systems pull
 #docker build -f Dockerfile-rccl-gin-gda-sdma -t rccl-gin-gda-sdma-713 --build-arg GPU_TARGETS=gfx950 --build-arg ROCSHMEM_CACHE_BUST=5 --build-arg USE_LOCAL_SRC=1  .
 
@@ -138,14 +138,14 @@ ARG USE_LOCAL_SRC=0
 ARG DEBUG_BUILD=0
 
 # ROCSHMEM_USE_SDMA=1 (default): rocSHMEM cmake USE_SDMA=ON. Required for GIN Anvil-SDMA
-# (NCCL_GIN_TYPE=6) exercised by docker-gin-gda-sdma-test.bash / docker-gin-gda-sdma-ruby-test.bash Test#5.
+# (NCCL_GIN_TYPE=6) exercised by docker-gin-gda-sdma-test.bash Test#5.
 # The Dockerfile upgrades rdma-core/libmlx5 from ${VERSION_CODENAME}-updates (when available).
 # Optional: --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 fails the build unless those MLX5 symbols exist.
 # Set --build-arg ROCSHMEM_USE_SDMA=0 if you do not need Test#5 and want a slightly leaner build.
 ARG ROCSHMEM_USE_SDMA=1
 
 ## building rocSHMEM
-ARG ROCSHMEM_BRANCH=users/abouteiller/gin-stage2
+ARG ROCSHMEM_BRANCH=users/dondai/gin-stage2-gda-sdma-merge
 ARG ROCSHMEM_CACHE_BUST=1
 COPY projects/rocshmem/ /tmp/local/projects/rocshmem/
 ENV ROCSHMEM_INSTALL_DIR=${WORKDIR}/rocshmem
@@ -175,8 +175,7 @@ RUN cd rocshmem/src/projects/rocshmem \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug")
 
 ## building RCCL
-#ARG RCCL_BRANCH=users/prasanna-amd/nccl-sync-v2-28-9-gin-rebased-0501
-ARG RCCL_BRANCH=users/abouteiller/gin-stage2
+ARG RCCL_BRANCH=users/dondai/gin-stage2-gda-sdma-merge
 ARG RCCL_CACHE_BUST=1
 COPY projects/rccl/      /tmp/local/projects/rccl/
 COPY projects/rccl-tests/ /tmp/local/projects/rccl-tests/
