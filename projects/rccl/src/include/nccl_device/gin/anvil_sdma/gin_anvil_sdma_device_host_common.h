@@ -9,7 +9,10 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 110
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 111
+
+/** Must match host plugin and device kernel build; checked on device. */
+#define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
 
 /** Default SDMA threshold (bytes). Transfers of at most this size use rocshmem_putmem;
  *  larger transfers use direct Anvil SDMA. Tuned for MI355: putmem wins below ~1 KiB
@@ -17,10 +20,11 @@
 // #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 1024u
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default: fused copy+signal SDMA packets on MI355 (OSS7). Set env to 0 to disable. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
+/** Default off: fused OSS7 copy+signal needs remote GPU signal VA; opt-in via env on MI355. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
 
 struct ncclGinAnvilSdmaGPUContext {
+  uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
   void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
   uint64_t* sdmaDirty;   // GIN-owned dirty bitmask (separate from rocSHMEM IPC SDMA)
   uint64_t* signals;

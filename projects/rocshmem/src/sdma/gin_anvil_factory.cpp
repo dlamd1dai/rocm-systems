@@ -28,13 +28,15 @@ struct rocshmem_gin_anvil_opaque {
 extern "C" int rocshmem_gin_anvil_probe(void) {
   int ndev = 0;
   if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) return 0;
-  return 1;
+  return rocshmem::anvil::initEndpoint() ? 1 : 0;
 }
 
-static void checkHip(hipError_t e, const char* what) {
+static int checkHip(hipError_t e, const char* what) {
   if (e != hipSuccess) {
     LOG_ERROR("rocshmem_gin_anvil: %s: %s", what, hipGetErrorString(e));
+    return -1;
   }
+  return 0;
 }
 
 // Mirrors ROCSHMEM_SDMA_SPREAD_CHANNELS / default-context assignSdmaChannel:
@@ -73,40 +75,68 @@ extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_i
 
   const int myDev = devs[static_cast<size_t>(myRank)];
 
-  rocshmem::anvil::anvil.init();
+  if (!rocshmem::anvil::initEndpoint()) {
+    LOG_ERROR("rocshmem_gin_anvil: Anvil SDMA init failed");
+    return -1;
+  }
 
   // Standalone Anvil stack (independent of rocSHMEM IPC SDMA). Connection
   // pattern matches SdmaImpl::sdmaHostInit: one queue set per local peer index.
-  for (int local_pe = 0; local_pe < nRanks; ++local_pe) {
-    const int remoteDev = devs[static_cast<size_t>(local_pe)];
-    if (rocshmem::anvil::anvil.getSdmaQueue(myDev, remoteDev, 0) != nullptr) continue;
-    if (myDev != remoteDev) rocshmem::anvil::EnablePeerAccess(myDev, remoteDev);
-    rocshmem::anvil::anvil.connect(myDev, remoteDev, numChannels);
+  try {
+    for (int local_pe = 0; local_pe < nRanks; ++local_pe) {
+      const int remoteDev = devs[static_cast<size_t>(local_pe)];
+      if (rocshmem::anvil::anvil.getSdmaQueue(myDev, remoteDev, 0) != nullptr) continue;
+      if (myDev != remoteDev) rocshmem::anvil::EnablePeerAccess(myDev, remoteDev);
+      if (!rocshmem::anvil::anvil.connect(myDev, remoteDev, numChannels)) {
+        LOG_ERROR("rocshmem_gin_anvil: connect(%d -> %d) failed", myDev, remoteDev);
+        return -1;
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG_ERROR("rocshmem_gin_anvil: SDMA connect failed: %s", e.what());
+    return -1;
   }
 
   const int total = nRanks * numChannels;
   std::vector<rocshmem::anvil::SdmaQueueDeviceHandle*> host_handles(static_cast<size_t>(total),
                                                                     nullptr);
+  int validHandles = 0;
   for (int local_pe = 0; local_pe < nRanks; ++local_pe) {
     const int remoteDev = devs[static_cast<size_t>(local_pe)];
     for (int c = 0; c < numChannels; ++c) {
       rocshmem::anvil::SdmaQueue* q = rocshmem::anvil::anvil.getSdmaQueue(myDev, remoteDev, c);
-      host_handles[static_cast<size_t>(local_pe * numChannels + c)] =
-          q ? reinterpret_cast<rocshmem::anvil::SdmaQueueDeviceHandle*>(q->deviceHandle())
-            : nullptr;
+      auto* h = q ? reinterpret_cast<rocshmem::anvil::SdmaQueueDeviceHandle*>(q->deviceHandle())
+                  : nullptr;
+      host_handles[static_cast<size_t>(local_pe * numChannels + c)] = h;
+      if (h != nullptr) validHandles++;
     }
+  }
+  if (validHandles == 0) {
+    LOG_ERROR("rocshmem_gin_anvil: no SDMA queue handles for device %d", myDev);
+    return -1;
   }
 
   rocshmem::anvil::SdmaQueueDeviceHandle** dev_row = nullptr;
-  checkHip(hipMalloc(&dev_row, static_cast<size_t>(total) * sizeof(void*)), "hipMalloc handles");
-  checkHip(hipMemcpy(dev_row, host_handles.data(), static_cast<size_t>(total) * sizeof(void*),
-                     hipMemcpyHostToDevice),
-           "hipMemcpy handles");
+  if (checkHip(hipMalloc(&dev_row, static_cast<size_t>(total) * sizeof(void*)), "hipMalloc handles") != 0)
+    return -1;
+  if (checkHip(hipMemcpy(dev_row, host_handles.data(), static_cast<size_t>(total) * sizeof(void*),
+                         hipMemcpyHostToDevice),
+               "hipMemcpy handles") != 0) {
+    hipFree(dev_row);
+    return -1;
+  }
 
   uint64_t* dirty = nullptr;
-  checkHip(hipExtMallocWithFlags((void**)&dirty, sizeof(uint64_t), hipDeviceMallocFinegrained),
-           "hipExtMallocWithFlags sdmaDirty");
-  checkHip(hipMemset(dirty, 0, sizeof(uint64_t)), "hipMemset sdmaDirty");
+  if (checkHip(hipExtMallocWithFlags((void**)&dirty, sizeof(uint64_t), hipDeviceMallocFinegrained),
+               "hipExtMallocWithFlags sdmaDirty") != 0) {
+    hipFree(dev_row);
+    return -1;
+  }
+  if (checkHip(hipMemset(dirty, 0, sizeof(uint64_t)), "hipMemset sdmaDirty") != 0) {
+    hipFree(dev_row);
+    hipFree(dirty);
+    return -1;
+  }
 
   auto* impl = new rocshmem_gin_anvil_opaque{};
   impl->nRanks = nRanks;

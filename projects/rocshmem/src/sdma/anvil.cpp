@@ -369,23 +369,27 @@ int AnvilLib::getOamId(int deviceId) {
   std::string busId = getBusId(deviceId);
   std::string file_str = "/sys/bus/pci/devices/" + busId + "/xgmi_physical_id";
   std::ifstream file(file_str);
-  int xgmi_physical_id;
+  int xgmi_physical_id = -1;
   if (file.is_open()) {
-    if (!(file >> xgmi_physical_id)) {
-      throw std::runtime_error("Failed to read xGMI physical id from file: " + file_str);
-    }
+    if (file >> xgmi_physical_id) return xgmi_physical_id;
+    LOG_WARN("anvil: failed to read xGMI physical id from %s", file_str.c_str());
   } else {
-    throw std::runtime_error("Failed to open file: " + file_str);
+    LOG_WARN("anvil: xGMI physical id sysfs not found at %s", file_str.c_str());
   }
-  return xgmi_physical_id;
+  // Fallback for containers / parts without sysfs: pin to HIP device index.
+  const int fallback = deviceId % 8;
+  LOG_WARN("anvil: using deviceId%%8=%d as OAM id for device %d", fallback, deviceId);
+  return fallback;
 }
 
 int AnvilLib::getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
-  int srcOamId = getOamId(srcDeviceId);
-  int dstOamId = getOamId(dstDeviceId);
+  int srcOamId = getOamId(srcDeviceId) % 8;
+  int dstOamId = getOamId(dstDeviceId) % 8;
+  if (srcOamId < 0) srcOamId = 0;
+  if (dstOamId < 0) dstOamId = 0;
 
   // Use even engines only
-  return mi300xOamMap[srcOamId][dstOamId] * 2;
+  return mi300xOamMap[static_cast<size_t>(srcOamId)][static_cast<size_t>(dstOamId)] * 2;
 }
 
 AnvilLib& anvil = anvil.getInstance();
