@@ -49,15 +49,17 @@ NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int p
 
 NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
                                               rocshmem::anvil::SdmaQueueDeviceHandle* handle,
-                                              bool hasCounter, bool sdmaAlreadyQuiet) {
+                                              bool hasCounter) {
   if (hasCounter) {
-    if (sdmaDataPath && handle != nullptr && !sdmaAlreadyQuiet) {
+    if (sdmaDataPath && handle != nullptr) {
       rocshmem::anvil::quiet(*handle);
-    } else if (!sdmaDataPath) {
+    } else {
+      // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC).
       rocshmem::rocshmem_quiet();
     }
+  } else {
+    rocshmem::rocshmem_fence();
   }
-  rocshmem::rocshmem_fence();
 }
 
 }  // namespace detail
@@ -101,9 +103,6 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       if (handle == nullptr) useRocshmemPutmem = true;
     }
     bool sdmaDataPath = hasWins && !useRocshmemPutmem && handle != nullptr;
-    bool sdmaAlreadyQuiet = false;
-    const bool needsSdmaCompletion = hasSignal || hasCounter;
-    const uint32_t blockingMax = loadConst(&rsCtx->sdmaBlockingMax);
 
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
@@ -117,18 +116,12 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
         void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         rocshmem::anvil::put(*handle, dstAddr, srcAddr, bytes);
-        // Small signaled puts: blocking quiet before signal (matches rocSHMEM PutBlocking).
-        if (needsSdmaCompletion && bytes <= blockingMax) {
-          rocshmem::anvil::quiet(*handle);
-          sdmaAlreadyQuiet = true;
-        } else {
-          markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
-        }
+        markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
       }
     }
 
     if (hasSignal || hasCounter) {
-      fenceBeforeShmemSignal(sdmaDataPath, handle, hasCounter, sdmaAlreadyQuiet);
+      fenceBeforeShmemSignal(sdmaDataPath, handle, hasCounter);
 
       if (hasSignal) {
         if (signalOp == ncclGinSignalInc) signalOpArg = 1;
@@ -178,8 +171,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       if (handle == nullptr) useRocshmemPutmem = true;
     }
     bool sdmaDataPath = !useRocshmemPutmem && handle != nullptr;
-    bool sdmaAlreadyQuiet = false;
-    const uint32_t blockingMax = loadConst(&rsCtx->sdmaBlockingMax);
 
     if (useRocshmemPutmem) {
       static_assert(sizeof(T) <= 8, "PutValue requires sizeof(T) <= 8");
@@ -195,16 +186,11 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       rocshmem::anvil::put(*handle, dstAddr, (void*)&tmp, bytes);
-      if (hasSignal && bytes <= blockingMax) {
-        rocshmem::anvil::quiet(*handle);
-        sdmaAlreadyQuiet = true;
-      } else {
-        markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
-      }
+      markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
     }
 
     if (hasSignal) {
-      fenceBeforeShmemSignal(sdmaDataPath, handle, /*hasCounter=*/false, sdmaAlreadyQuiet);
+      fenceBeforeShmemSignal(sdmaDataPath, handle, /*hasCounter=*/false);
       if (signalOp == ncclGinSignalInc) signalOpArg = 1;
       shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }
