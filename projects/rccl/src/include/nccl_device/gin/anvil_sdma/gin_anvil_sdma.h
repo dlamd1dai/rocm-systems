@@ -10,6 +10,7 @@
 #include "../gin_device_common.h"
 #include "gin_anvil_sdma_device_host_common.h"
 #include "sdma/anvil_device.hpp"
+#include "sdma/sdma_opcodes.h"
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #include <rocshmem/rocshmem.hpp>
 #endif
@@ -20,6 +21,23 @@ namespace anvil {
 namespace detail {
 
 using nccl::utility::loadConst;
+
+NCCL_DEVICE_INLINE bool anvilCtxValid(ncclGinAnvilSdmaGPUContext* rsCtx) {
+  return rsCtx != nullptr &&
+         loadConst(&rsCtx->layoutMagic) == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC;
+}
+
+// Fallback when host/device context is corrupt or signals were not allocated.
+// Avoids null deref in generic readSignal/waitSignal (GinAlltoAllKernel line 1).
+__device__ uint64_t anvilGinDummySignal;
+
+NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* rsCtx,
+                                                   ncclGinSignal_t signalId) {
+  if (!anvilCtxValid(rsCtx)) return &anvilGinDummySignal;
+  uint64_t* signals = loadConst(&rsCtx->signals);
+  if (signals == nullptr) return &anvilGinDummySignal;
+  return signals + signalId;
+}
 
 // Resolve symmetric baseAddr+offset to the peer's VA via rocSHMEM's constant-memory
 // user-buffer table (populated by rocshmem_buffer_register_vmm on the host).
@@ -41,9 +59,18 @@ NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx,
 NCCL_DEVICE_INLINE bool useSdmaFusedSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                            bool hasSignal, bool hasCounter,
                                            ncclGinSignalOp_t signalOp) {
-  return sdmaDataPath && hasSignal && !hasCounter && signalOp == ncclGinSignalInc &&
-         loadConst(&rsCtx->signals) != nullptr &&
+#if SDMA_IS_OSS7
+  return anvilCtxValid(rsCtx) && sdmaDataPath && hasSignal && !hasCounter &&
+         signalOp == ncclGinSignalInc && loadConst(&rsCtx->signals) != nullptr &&
          loadConst(&rsCtx->fusedSdmaSignal) != 0;
+#else
+  (void)rsCtx;
+  (void)sdmaDataPath;
+  (void)hasSignal;
+  (void)hasCounter;
+  (void)signalOp;
+  return false;
+#endif
 }
 
 NCCL_DEVICE_INLINE void markSdmaDirty(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int numCh,
@@ -112,6 +139,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       ncclGinCounter_t counterId, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, cuda::thread_scope required,
                                       cuda::thread_scope given, uint32_t optFlags = ncclGinOptFlagsDefault) {
+    using nccl::gin::anvil::detail::anvilCtxValid;
     using nccl::gin::anvil::detail::effectiveChannel;
     using nccl::gin::anvil::detail::remoteSignalAddr;
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
@@ -126,6 +154,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     if (coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
+    if (!anvilCtxValid(rsCtx)) return;
     const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
 
     if ((required == cuda::thread_scope_system) && (given > required)) {
@@ -196,6 +225,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       ncclGinSignalOp_t signalOp, uint64_t signalOpArg, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, cuda::thread_scope required,
                                       cuda::thread_scope given, uint32_t optFlags = ncclGinOptFlagsDefault) {
+    using nccl::gin::anvil::detail::anvilCtxValid;
     using nccl::gin::anvil::detail::effectiveChannel;
     using nccl::gin::anvil::detail::remoteSignalAddr;
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
@@ -210,6 +240,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     if (coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
+    if (!anvilCtxValid(rsCtx)) return;
     const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
     ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
     void* dstSym = (void*)(loadConst(&dstMh->baseAddr) + dstOff);
@@ -281,6 +312,7 @@ template <>
 struct ncclGinApi_GetCounterPtr<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   NCCL_DEVICE_INLINE static uint64_t* call(ncclGinCtx ctx, ncclGinCounter_t counterId) {
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
+    if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) return nullptr;
     return nccl::utility::loadConst(&rsCtx->counters) + counterId;
   }
 };
@@ -289,7 +321,9 @@ template <>
 struct ncclGinApi_ResetCounter<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, ncclGinCounter_t counterId) {
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    nccl::utility::loadConst(&rsCtx->counters)[counterId] = 0;
+    if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) return;
+    uint64_t* counters = nccl::utility::loadConst(&rsCtx->counters);
+    if (counters != nullptr) counters[counterId] = 0;
   }
 };
 
@@ -297,7 +331,7 @@ template <>
 struct ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   NCCL_DEVICE_INLINE static uint64_t* call(ncclGinCtx ctx, ncclGinSignal_t signalId) {
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    return nccl::utility::loadConst(&rsCtx->signals) + signalId;
+    return nccl::gin::anvil::detail::anvilSignalPtrOrDummy(rsCtx, signalId);
   }
 };
 
@@ -305,8 +339,11 @@ template <>
 struct ncclGinApi_ResetSignal<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, ncclGinSignalDescriptor signal) {
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    if (signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED)
-      nccl::utility::loadConst(&rsCtx->signals)[signal.indexedSignal.signalId] = 0;
+    if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) return;
+    if (signal.type == NCCL_GIN_SIGNAL_TYPE_INDEXED) {
+      uint64_t* signals = nccl::utility::loadConst(&rsCtx->signals);
+      if (signals != nullptr) signals[signal.indexedSignal.signalId] = 0;
+    }
   }
 };
 
@@ -317,6 +354,10 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       uint32_t* abortFlag) {
     using nccl::utility::loadConst;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
+    if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) {
+      rocshmem::rocshmem_quiet();
+      return;
+    }
     uint64_t* sdmaDirty = loadConst(&rsCtx->sdmaDirty);
     uint64_t dirty = 0;
     if (sdmaDirty != nullptr) {
