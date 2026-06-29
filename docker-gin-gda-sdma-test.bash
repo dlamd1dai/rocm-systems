@@ -383,6 +383,17 @@ case "${RCCL_GIN_GDA_TEST4_MODE:-auto}" in
     ;;
 esac
 
+# Optional: skip Test#5 when image libmlx5 is too old (avoids opaque alltoall_perf GIN errors).
+_rccl_gin_gda_test5_image_mlx5_dmabuf_ok() {
+  if [[ -n "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR:-}" ]]; then
+    return 0
+  fi
+  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
+    'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
+     rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
+    >/dev/null 2>&1
+}
+
 # for ((NP = 2; NP <= 8; NP <<= 1)); do
 if [ 1 -eq 1 ]; then
 set -x

@@ -368,6 +368,19 @@ _rccl_gin_gda_should_skip_test4_auto() {
   return 1
 }
 
+_rccl_gin_gda_test5_image_mlx5_dmabuf_ok() {
+  if [[ -n "${RCCL_GIN_GDA_TEST5_HOST_MLX5_LIB_DIR:-}" ]]; then
+    return 0
+  fi
+  if [[ "${RCCL_GIN_GDA_TEST5_MLX5_PREFLIGHT:-1}" == 0 ]]; then
+    return 0
+  fi
+  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
+    'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
+     rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
+    >/dev/null 2>&1
+}
+
 if [[ "${RCCL_GIN_GDA_PREFLIGHT:-1}" == 1 ]]; then
   echo "=== Preflight: container, rocm-smi, mpirun hostname (RCCL_GIN_GDA_PREFLIGHT=0 to skip) ===" >&2
   ${DOCKER_CMD} run ${DOCKER_GPU} --entrypoint /bin/bash "${DOCKER_IMAGE}" -c "
