@@ -285,6 +285,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   }
 
   memset(&ctx->gpuCtxHost, 0, sizeof(ncclGinAnvilSdmaGPUContext));
+  ctx->gpuCtxHost.layoutMagic = NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC;
   ctx->gpuCtxHost.nRanks = ctx->nRanks;
   ctx->gpuCtxHost.rank = ctx->rank;
   ctx->gpuCtxHost.nSignals = config->nSignals;
@@ -301,10 +302,14 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
     ctx->gpuCtxHost.signals =
         (uint64_t*)rocshmem::rocshmem_malloc(sizeof(uint64_t) * config->nSignals);
     if (!ctx->gpuCtxHost.signals) {
+      WARN("GIN anvil-sdma: rocshmem_malloc failed for %d signals", config->nSignals);
       ret = ncclSystemError;
       goto fail;
     }
-    (void)hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals);
+    if (hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals) != hipSuccess) {
+      ret = ncclSystemError;
+      goto fail;
+    }
   }
 
   if (config->nCounters > 0) {
@@ -313,19 +318,29 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
       ret = ncclSystemError;
       goto fail;
     }
-    (void)hipMemset(ctx->gpuCtxHost.counters, 0, sizeof(uint64_t) * config->nCounters);
+    if (hipMemset(ctx->gpuCtxHost.counters, 0, sizeof(uint64_t) * config->nCounters) != hipSuccess) {
+      ret = ncclSystemError;
+      goto fail;
+    }
   }
 
-  (void)hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext), hipMemcpyHostToDevice);
+  if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    WARN("GIN anvil-sdma: hipMemcpy gpu context failed");
+    ret = ncclSystemError;
+    goto fail;
+  }
 
   ctx->devHandle->handle = ctx->gpuCtxDev;
   ctx->devHandle->size = sizeof(ncclGinAnvilSdmaGPUContext);
 
   *outGinCtx = ctx;
   *outDevHandle = ctx->devHandle;
-  INFO(NCCL_INIT, "GIN anvil-sdma: context created (%d signals, %d counters, sdmaThreshold=%u, spread=%d, fusedSignal=%u)",
-       config->nSignals, config->nCounters, ctx->gpuCtxHost.sdmaThreshold,
-       ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
+  INFO(NCCL_INIT,
+       "GIN anvil-sdma: context created (v%d, %d signals, %d counters, sdmaThreshold=%u, spread=%d, "
+       "fusedSignal=%u)",
+       NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters,
+       ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
   return ncclSuccess;
 
 fail:
