@@ -17,8 +17,9 @@ extern "C" {
 #endif
 
 /**
- * Opaque handle: SDMA queue table (per rank × channels) + sdmaDirty bitmask.
- * Built without rocshmem_init(); uses the same AnvilLib SDMA paths as IPC SDMA.
+ * Opaque handle: standalone SDMA queue table (per local peer × channels) +
+ * sdmaDirty bitmask. Independent of rocSHMEM IPC SDMA / rocshmem_init(); uses
+ * the same AnvilLib device paths as the rocSHMEM transport.
  */
 typedef struct rocshmem_gin_anvil_opaque* rocshmem_gin_anvil_handle_t;
 
@@ -36,7 +37,7 @@ ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_probe(void);
  * @param my_device_id  HIP ordinal for this rank (typically hipGetDevice).
  * @param num_channels  SDMA channels per peer pair (clamped to [1,8]).
  * @param out_gpu_handles Device pointer to array of nRanks*num_channels pointers to
- *                        SdmaQueueDeviceHandle (layout: peer * num_channels + ch).
+ *                        SdmaQueueDeviceHandle (layout: local_pe * num_channels + ch).
  * @param out_sdma_dirty  Device pointer to a single uint64_t dirty bitmask (device memory).
  */
 ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_create(
@@ -50,6 +51,8 @@ ROCSHMEM_GIN_ANVIL_API void rocshmem_gin_anvil_destroy(rocshmem_gin_anvil_handle
 /** Fields stored in the opaque handle for RCCL plugin / device code */
 ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_get_n_ranks(rocshmem_gin_anvil_handle_t handle);
 ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_get_num_channels(rocshmem_gin_anvil_handle_t handle);
+/** 1 = spread wavefronts across channels (NCCL_GIN_ANVIL_SDMA_SPREAD_CHANNELS, default on) */
+ROCSHMEM_GIN_ANVIL_API int rocshmem_gin_anvil_get_channel_stride(rocshmem_gin_anvil_handle_t handle);
 
 #ifdef __cplusplus
 }

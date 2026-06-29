@@ -18,8 +18,8 @@
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
 struct ncclGinAnvilSdmaGPUContext {
-  void** queueHandles;
-  uint64_t* sdmaDirty;
+  void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
+  uint64_t* sdmaDirty;   // GIN-owned dirty bitmask (separate from rocSHMEM IPC SDMA)
   uint64_t* signals;
   uint64_t* counters;
   uint32_t nSignals;
@@ -28,6 +28,8 @@ struct ncclGinAnvilSdmaGPUContext {
   int nRanks;
   int rank;
   int numChannels;
+  int sdmaChannel;
+  int sdmaChannelStride;
 };
 
 struct ncclGinAnvilSdmaMemHandle {
