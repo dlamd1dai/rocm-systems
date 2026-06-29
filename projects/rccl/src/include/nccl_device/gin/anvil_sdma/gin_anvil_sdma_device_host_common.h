@@ -17,10 +17,6 @@
 // #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 1024u
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Signaled/counter SDMA puts of at most this size drain inline (anvil::quiet) before
- *  the rocSHMEM fence/signal; larger SDMA ops defer quiet to gin.flush(). */
-#define NCCL_GIN_ANVIL_SDMA_BLOCKING_MAX_DEFAULT 4096u
-
 struct ncclGinAnvilSdmaGPUContext {
   void** queueHandles;
   uint64_t* sdmaDirty;
@@ -29,7 +25,6 @@ struct ncclGinAnvilSdmaGPUContext {
   uint32_t nSignals;
   uint32_t nCounters;
   uint32_t sdmaThreshold;
-  uint32_t sdmaBlockingMax;
   int nRanks;
   int rank;
   int numChannels;
