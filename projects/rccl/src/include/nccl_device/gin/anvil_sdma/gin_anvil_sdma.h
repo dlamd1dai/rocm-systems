@@ -8,7 +8,6 @@
 #define _NCCL_DEVICE_GIN_ANVIL_SDMA_H_
 
 #include "../gin_device_common.h"
-#include "gin_anvil_ipc_copy.h"
 #include "gin_anvil_sdma_device_host_common.h"
 #include "sdma/anvil_device.hpp"
 #if defined(__HIPCC__) || defined(__CUDACC__)
@@ -55,7 +54,8 @@ NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
     if (sdmaDataPath && handle != nullptr) {
       rocshmem::anvil::quiet(*handle);
     } else {
-      rocshmem::rocshmem_fence();
+      // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC).
+      rocshmem::rocshmem_quiet();
     }
   } else {
     rocshmem::rocshmem_fence();
@@ -95,24 +95,25 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    // Small data uses IPC even for signaled puts; remote completion stays on rocSHMEM atomics.
-    bool useIpc = hasWins && bytes < threshold;
+    // Below threshold: rocshmem_putmem (memcpy_lane / rocSHMEM IPC). At/above: direct Anvil SDMA.
+    bool useRocshmemPutmem = hasWins && bytes < threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
-    if (hasWins && !useIpc) {
+    if (hasWins && !useRocshmemPutmem) {
       handle = queueHandle(rsCtx, peer, eff_ch);
-      if (handle == nullptr) useIpc = true;
+      if (handle == nullptr) useRocshmemPutmem = true;
     }
-    bool sdmaDataPath = hasWins && !useIpc && handle != nullptr;
+    bool sdmaDataPath = hasWins && !useRocshmemPutmem && handle != nullptr;
 
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
       ncclGinAnvilSdmaMemHandle* srcMh = (ncclGinAnvilSdmaMemHandle*)srcWin;
-      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      void* dstSym = (void*)(loadConst(&dstMh->baseAddr) + dstOff);
       void* srcAddr = (void*)(loadConst(&srcMh->baseAddr) + srcOff);
 
-      if (useIpc) {
-        nccl::gin::anvil::ipcPut(dstAddr, srcAddr, bytes);
+      if (useRocshmemPutmem) {
+        rocshmem::rocshmem_putmem(dstSym, srcAddr, bytes, peer);
       } else if (handle != nullptr) {
+        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         rocshmem::anvil::put(*handle, dstAddr, srcAddr, bytes);
         markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
@@ -141,7 +142,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
                                       ncclGinSignalOp_t signalOp, uint64_t signalOpArg, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, cuda::thread_scope required,
                                       cuda::thread_scope given, uint32_t optFlags = ncclGinOptFlagsDefault) {
-    using nccl::gin::anvil::ipcPutScalar;
     using nccl::gin::anvil::detail::fenceBeforeShmemSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
@@ -155,7 +155,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     constexpr int eff_ch = 0;
     ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
-    void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+    void* dstSym = (void*)(loadConst(&dstMh->baseAddr) + dstOff);
     T tmp = srcVal;
 
     if ((required == cuda::thread_scope_system) && (given > required)) {
@@ -164,17 +164,26 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useIpc = bytes < threshold;
+    bool useRocshmemPutmem = bytes < threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
-    if (!useIpc) {
+    if (!useRocshmemPutmem) {
       handle = queueHandle(rsCtx, peer, eff_ch);
-      if (handle == nullptr) useIpc = true;
+      if (handle == nullptr) useRocshmemPutmem = true;
     }
-    bool sdmaDataPath = !useIpc && handle != nullptr;
+    bool sdmaDataPath = !useRocshmemPutmem && handle != nullptr;
 
-    if (useIpc) {
-      ipcPutScalar(dstAddr, &tmp, bytes);
+    if (useRocshmemPutmem) {
+      static_assert(sizeof(T) <= 8, "PutValue requires sizeof(T) <= 8");
+      if constexpr (sizeof(T) == 8)
+        rocshmem::rocshmem_longlong_p((long long*)dstSym, (long long)srcVal, peer);
+      else if constexpr (sizeof(T) == 4)
+        rocshmem::rocshmem_int_p((int*)dstSym, (int)srcVal, peer);
+      else if constexpr (sizeof(T) == 2)
+        rocshmem::rocshmem_short_p((short*)dstSym, (short)srcVal, peer);
+      else if constexpr (sizeof(T) == 1)
+        rocshmem::rocshmem_char_p((char*)dstSym, (char)srcVal, peer);
     } else if (handle != nullptr) {
+      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
       __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
       rocshmem::anvil::put(*handle, dstAddr, (void*)&tmp, bytes);
       markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), eff_ch);
@@ -252,8 +261,8 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       }
       coop.sync();
     }
-    // IPC-only iterations skip SDMA quiet (matches IpcSdmaImpl::ipcQuiet).
-    rocshmem::rocshmem_fence();
+    // Drain rocSHMEM putmem / IPC completions, then any Anvil SDMA work above.
+    rocshmem::rocshmem_quiet();
   }
 };
 
