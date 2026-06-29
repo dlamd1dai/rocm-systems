@@ -9,6 +9,7 @@
 # Optional: export RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 for strict MLX5 DMA-BUF symbol check at docker build.
 # ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA:-1}"
 
+NO_CACHE=${1:-0}
 DOCKER_CMD=docker
 DOCKERFILE="Dockerfile-rccl-gin-gda-sdma"
 DOCKER_IMAGE="rccl-gin-gda-sdma-713"
@@ -20,8 +21,16 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
 mkdir -p extra-rdma-debs
 
+if [ ${NO_CACHE} -eq 1 ]; then
+    NO_CACHE_OPT="--no-cache"
+    N=1
+else
+    NO_CACHE_OPT=""
+    N=${ROCSHMEM_CACHE_BUST:-1}
+fi
+set -x
 ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
-    --no-cache \
+    ${NO_CACHE_OPT} \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
     --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
@@ -29,4 +38,5 @@ ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --build-arg ROCSHMEM_CACHE_BUST=$((N++)) \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
+set +x
 
