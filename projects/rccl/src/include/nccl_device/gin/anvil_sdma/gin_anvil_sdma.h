@@ -95,8 +95,8 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    // Below threshold: rocshmem_putmem (memcpy_lane / rocSHMEM IPC). At/above: direct Anvil SDMA.
-    bool useRocshmemPutmem = hasWins && bytes < threshold;
+    // At or below threshold: rocshmem_putmem (memcpy_lane). Above: direct Anvil SDMA.
+    bool useRocshmemPutmem = hasWins && bytes <= threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
     if (hasWins && !useRocshmemPutmem) {
       handle = queueHandle(rsCtx, peer, eff_ch);
@@ -164,7 +164,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useRocshmemPutmem = bytes < threshold;
+    bool useRocshmemPutmem = bytes <= threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
     if (!useRocshmemPutmem) {
       handle = queueHandle(rsCtx, peer, eff_ch);

@@ -11,8 +11,10 @@
 
 #define NCCL_GIN_ANVIL_SDMA_NET_VERSION 109
 
-/** Default SDMA threshold (bytes). Transfers below this use IPC load/store. */
-#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 256u
+/** Default SDMA threshold (bytes). Transfers of at most this size use rocshmem_putmem;
+ *  larger transfers use direct Anvil SDMA. Tuned for MI355: putmem wins below ~1 KiB
+ *  per message; Anvil SDMA plateaus ~24.5 us for 2 KiB–64 KiB. */
+#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 1024u
 
 struct ncclGinAnvilSdmaGPUContext {
   void** queueHandles;
