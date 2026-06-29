@@ -34,8 +34,9 @@
 #   RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS → dirs to resolve RDMA .so basenames (default includes lib64 paths).
 #
 
-NP=${1:-2}
+NP=${1:-8}
 MAX_BYTES="${2:-128M}"
+# MAX_BYTES="${2:-1024M}"
 
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
