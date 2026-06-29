@@ -8,8 +8,8 @@
 
 /**
  * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
- * Host flow mirrors GIN-GDA (connect builds transport resources, regMrSym exchanges
- * addressing metadata, createContext wires device context). Data movement uses
+ * Host flow mirrors GIN rocSHMEM API (regMrSym registers buffers with
+ * rocshmem_buffer_register_vmm for constant-memory remote lookup). Data movement uses
  * rocSHMEM's Anvil SDMA helpers (anvil::put / quiet / signal) directly — not rocshmem_putmem.
  */
 
@@ -24,6 +24,11 @@
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+
+// Refcount for buffer registration: ncclGinRegister calls regMrSym once per
+// connection for the same buffer.
+static std::map<void*, int> bufferRegRefcount;
 
 struct ginAnvilCollCtx {
   int nranks;
@@ -51,7 +56,8 @@ struct ginAnvilGinCtx {
 
 struct ginAnvilMemHandle {
   ncclGinAnvilSdmaMemHandle* devHandle;
-  uintptr_t* remote_vas_dev;
+  void* addr;
+  size_t size;
 };
 
 struct ginAnvilListenCtx {
@@ -167,56 +173,45 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
                                      void** mhandle, void** ginHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
   struct ncclDevrState* devr = &cctx->comm->devrState;
-  void* lsaSelfAddr = nullptr;
-  NCCLCHECK(ncclDevrGetLsaSelfAddr(devr, data, &lsaSelfAddr));
 
   ginAnvilMemHandle* mh = nullptr;
   NCCLCHECK(ncclCalloc(&mh, 1));
+
+  auto& refcount = bufferRegRefcount[data];
+
+  void* lsaSelfAddr = nullptr;
+  NCCLCHECK(ncclDevrGetLsaSelfAddr(devr, data, &lsaSelfAddr));
+  if (lsaSelfAddr == nullptr) {
+    WARN("GIN anvil-sdma: could not resolve LSA flat addr for %p", data);
+    bufferRegRefcount.erase(data);
+    free(mh);
+    return ncclSystemError;
+  }
+
+  if (refcount == 0) {
+    int rc = rocshmem::rocshmem_buffer_register_vmm(lsaSelfAddr, size, devr->lsaSelf, devr->lsaSize,
+                                                    (ptrdiff_t)devr->bigSize);
+    if (rc != 0) {
+      WARN("GIN anvil-sdma: buffer register failed for %p (lsaSelf=%p) size %zu", data, lsaSelfAddr,
+           size);
+      bufferRegRefcount.erase(data);
+      free(mh);
+      return ncclSystemError;
+    }
+    INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaSelf=%p +%zu", data, lsaSelfAddr, size);
+  }
+  refcount++;
+
+  mh->addr = data;
+  mh->size = size;
 
   if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
     free(mh);
     return ncclSystemError;
   }
 
-  uintptr_t* vas_buf = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
-  if (!vas_buf) {
-    (void)hipFree(mh->devHandle);
-    free(mh);
-    return ncclSystemError;
-  }
-
-  const bool use_symmetric_flat =
-      lsaSelfAddr != nullptr && devr->bigSize > 1 && devr->lsaFlatBase != nullptr;
-  if (use_symmetric_flat) {
-    const int myLsaRank = devr->lsaSelf;
-    for (int p = 0; p < cctx->nranks; ++p) {
-      int peerLsaRank = 0;
-      NCCLCHECK(ncclDevrWorldToLsaRank(cctx->comm, p, &peerLsaRank));
-      vas_buf[p] = (uintptr_t)lsaSelfAddr +
-                   (ptrdiff_t)(peerLsaRank - myLsaRank) * (ptrdiff_t)devr->bigSize;
-    }
-    INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaSelf=%p size %zu", data, lsaSelfAddr,
-         size);
-  } else {
-    vas_buf[cctx->rank] = (uintptr_t)data;
-    NCCLCHECK(bootstrapAllGather(cctx->comm->bootstrap, vas_buf, (int)sizeof(uintptr_t)));
-    if (lsaSelfAddr == nullptr) {
-      WARN("GIN anvil-sdma: buffer %p not in symmetric VA; using allgathered local pointers", data);
-    }
-  }
-
-  if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess) {
-    free(vas_buf);
-    (void)hipFree(mh->devHandle);
-    free(mh);
-    return ncclSystemError;
-  }
-  (void)hipMemcpy(mh->remote_vas_dev, vas_buf, sizeof(uintptr_t) * (size_t)cctx->nranks, hipMemcpyHostToDevice);
-  free(vas_buf);
-
   ncclGinAnvilSdmaMemHandle hostMh;
-  hostMh.local_va = (uintptr_t)(lsaSelfAddr != nullptr ? lsaSelfAddr : data);
-  hostMh.remote_vas = mh->remote_vas_dev;
+  hostMh.baseAddr = (uintptr_t)lsaSelfAddr;
   (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
 
   *mhandle = mh;
@@ -232,7 +227,14 @@ static ncclResult_t ginAnvilRegMrSymDmaBuf(void* collComm, void* data, size_t si
 static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   ginAnvilMemHandle* mh = (ginAnvilMemHandle*)mhandle;
   if (!mh) return ncclSuccess;
-  if (mh->remote_vas_dev) (void)hipFree(mh->remote_vas_dev);
+
+  if (mh->addr) {
+    auto& refcount = bufferRegRefcount[mh->addr];
+    refcount--;
+    if (refcount <= 0) {
+      bufferRegRefcount.erase(mh->addr);
+    }
+  }
   if (mh->devHandle) (void)hipFree(mh->devHandle);
   free(mh);
   return ncclSuccess;
