@@ -10,6 +10,7 @@
 # BuildKit: hosts without docker0 fail with "network bridge not found" — default
 # DOCKER_BUILD_NETWORK=host. Override: DOCKER_BUILD_NETWORK=default
 
+NO_CACHE=${1:-0}
 DOCKER_CMD="sudo docker"
 DOCKERFILE="Dockerfile-rccl-gin-gda-sdma-ruby"
 DOCKER_IMAGE="rccl-gin-gda-sdma-713"
@@ -18,14 +19,21 @@ USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
 
-N=1
 DOCKER_BUILD_NETWORK="${DOCKER_BUILD_NETWORK:-host}"
 
 # Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
 mkdir -p extra-rdma-debs
 
+if [ ${NO_CACHE} -eq 1 ]; then
+    NO_CACHE_OPT="--no-cache"
+    N=1
+else
+    NO_CACHE_OPT=""
+    N=${ROCSHMEM_CACHE_BUST:-1}
+fi
+set -x
 ${DOCKER_CMD} build --network="${DOCKER_BUILD_NETWORK}" -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
-    --no-cache \
+    ${NO_CACHE_OPT} \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
     --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
@@ -33,4 +41,5 @@ ${DOCKER_CMD} build --network="${DOCKER_BUILD_NETWORK}" -f ${DOCKERFILE} -t ${DO
     --build-arg ROCSHMEM_CACHE_BUST=$((N++)) \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
+set +x
 
