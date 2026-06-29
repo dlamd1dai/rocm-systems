@@ -10,7 +10,8 @@
  * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
  * Host flow mirrors GIN rocSHMEM API (regMrSym registers buffers with
  * rocshmem_buffer_register_vmm for constant-memory remote lookup). Data movement uses
- * rocSHMEM's Anvil SDMA helpers (anvil::put / quiet / signal) directly — not rocshmem_putmem.
+ * a standalone Anvil SDMA stack (rocshmem_gin_anvil_create) — independent of the
+ * rocSHMEM IPC SDMA transport, so GIN type 6 can outlive removal of GIN type 4.
  */
 
 #include "gin/gin_host_rocshmem_api.h"
@@ -38,6 +39,7 @@ struct ginAnvilCollCtx {
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
+  int sdmaChannelStride;
 };
 
 struct ginAnvilGinCtx {
@@ -52,6 +54,7 @@ struct ginAnvilGinCtx {
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
+  int sdmaChannelStride;
 };
 
 struct ginAnvilMemHandle {
@@ -144,8 +147,10 @@ static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int 
   cctx->gpu_queue_handles = (void**)gpu_handles;
   cctx->sdma_dirty_d = dirty;
   cctx->numChannels = rocshmem_gin_anvil_get_num_channels(h);
+  cctx->sdmaChannelStride = rocshmem_gin_anvil_get_channel_stride(h);
 
-  INFO(NCCL_INIT, "GIN anvil-sdma: SDMA queues ready (%d ranks, %d ch)", nranks, cctx->numChannels);
+  INFO(NCCL_INIT, "GIN anvil-sdma: standalone SDMA queues (%d ranks, %d ch, spread=%d)", nranks,
+       cctx->numChannels, cctx->sdmaChannelStride);
   *collComm = cctx;
   return ncclSuccess;
 }
@@ -253,6 +258,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
+  ctx->sdmaChannelStride = cctx->sdmaChannelStride;
 
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
@@ -270,6 +276,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.nSignals = config->nSignals;
   ctx->gpuCtxHost.nCounters = config->nCounters;
   ctx->gpuCtxHost.numChannels = ctx->numChannels;
+  ctx->gpuCtxHost.sdmaChannel = 0;
+  ctx->gpuCtxHost.sdmaChannelStride = ctx->sdmaChannelStride;
   ctx->gpuCtxHost.queueHandles = ctx->gpu_queue_handles;
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
@@ -300,8 +308,9 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
   *outGinCtx = ctx;
   *outDevHandle = ctx->devHandle;
-  INFO(NCCL_INIT, "GIN anvil-sdma: context created (%d signals, %d counters, sdmaThreshold=%u)",
-       config->nSignals, config->nCounters, ctx->gpuCtxHost.sdmaThreshold);
+  INFO(NCCL_INIT, "GIN anvil-sdma: context created (%d signals, %d counters, sdmaThreshold=%u, spread=%d)",
+       config->nSignals, config->nCounters, ctx->gpuCtxHost.sdmaThreshold,
+       ctx->gpuCtxHost.sdmaChannelStride);
   return ncclSuccess;
 
 fail:
