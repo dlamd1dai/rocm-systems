@@ -28,8 +28,7 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  uintptr_t local_va;
-  uintptr_t* remote_vas;
+  uintptr_t baseAddr;  // Symmetric LSA flat VA; remote resolved via rocshmem_ptr
 };
 
 #endif
