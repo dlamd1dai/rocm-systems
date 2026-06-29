@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 109
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 110
 
 /** Default SDMA threshold (bytes). Transfers of at most this size use rocshmem_putmem;
  *  larger transfers use direct Anvil SDMA. Tuned for MI355: putmem wins below ~1 KiB

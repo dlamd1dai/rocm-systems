@@ -252,6 +252,13 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
 
+  if (!cctx->gpu_queue_handles || !cctx->sdma_dirty_d) {
+    WARN("GIN anvil-sdma: missing SDMA infrastructure (handles=%p dirty=%p)",
+         cctx->gpu_queue_handles, (void*)cctx->sdma_dirty_d);
+    ret = ncclSystemError;
+    goto fail;
+  }
+
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
   ctx->devHandle->netDeviceVersion = NCCL_GIN_ANVIL_SDMA_NET_VERSION;
