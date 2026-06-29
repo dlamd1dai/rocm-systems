@@ -113,6 +113,13 @@ static int ginAnvilSdmaThresholdFromEnv() {
   return v > 0 ? v : (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
 }
 
+static uint32_t ginAnvilFusedSignalFromEnv() {
+  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL");
+  if (!e || !e[0]) return NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT;
+  if (e[0] == '0' && e[1] == '\0') return 0;
+  return atoi(e) != 0 ? 1u : 0u;
+}
+
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,
                                     void** collComm) {
   struct ginRocshmemInitCtx* ictx = (struct ginRocshmemInitCtx*)ctx;
@@ -281,6 +288,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.queueHandles = ctx->gpu_queue_handles;
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
+  ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
 
   if (config->nSignals > 0) {
     ctx->gpuCtxHost.signals =
@@ -308,9 +316,9 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
   *outGinCtx = ctx;
   *outDevHandle = ctx->devHandle;
-  INFO(NCCL_INIT, "GIN anvil-sdma: context created (%d signals, %d counters, sdmaThreshold=%u, spread=%d)",
+  INFO(NCCL_INIT, "GIN anvil-sdma: context created (%d signals, %d counters, sdmaThreshold=%u, spread=%d, fusedSignal=%u)",
        config->nSignals, config->nCounters, ctx->gpuCtxHost.sdmaThreshold,
-       ctx->gpuCtxHost.sdmaChannelStride);
+       ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
   return ncclSuccess;
 
 fail:

@@ -17,6 +17,9 @@
 // #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 1024u
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
+/** Default: fused copy+signal SDMA packets on MI355 (OSS7). Set env to 0 to disable. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
+
 struct ncclGinAnvilSdmaGPUContext {
   void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
   uint64_t* sdmaDirty;   // GIN-owned dirty bitmask (separate from rocSHMEM IPC SDMA)
@@ -25,6 +28,7 @@ struct ncclGinAnvilSdmaGPUContext {
   uint32_t nSignals;
   uint32_t nCounters;
   uint32_t sdmaThreshold;
+  uint32_t fusedSdmaSignal;  // use COPY_LINEAR_WAIT_SIGNAL_MI4 for SignalInc SDMA puts
   int nRanks;
   int rank;
   int numChannels;
