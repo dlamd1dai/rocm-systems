@@ -47,6 +47,9 @@ NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int p
   rocshmem::rocshmem_uint64_atomic_add(loadConst(&rsCtx->signals) + signalId, value, peer);
 }
 
+// Order data movement before remote signal/counter updates.
+// putmem/memcpy_lane uses system-scope flat stores — a lightweight system fence
+// suffices and avoids nocall rocshmem_fence()/ipcFence SDMA-dirty checks.
 NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
                                               rocshmem::anvil::SdmaQueueDeviceHandle* handle,
                                               bool hasCounter) {
@@ -57,8 +60,10 @@ NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
       // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC).
       rocshmem::rocshmem_quiet();
     }
-  } else {
+  } else if (sdmaDataPath) {
     rocshmem::rocshmem_fence();
+  } else {
+    __threadfence_system();
   }
 }
 
