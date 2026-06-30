@@ -12,6 +12,8 @@
  * rocshmem_buffer_register_vmm for constant-memory remote lookup). Data movement uses
  * a standalone Anvil SDMA stack (rocshmem_gin_anvil_create) — independent of the
  * rocSHMEM IPC SDMA transport, so GIN type 6 can outlive removal of GIN type 4.
+ * Sub-threshold puts use rocshmem_putmem (IpcSdmaImpl when ROCSHMEM_SDMA_ENABLED=1);
+ * NCCL_GIN_ANVIL_SDMA_* env vars fall back to ROCSHMEM_SDMA_* when unset.
  */
 
 #include "gin/gin_host_rocshmem_api.h"
@@ -106,11 +108,35 @@ static ncclResult_t ginAnvilListen(void* ctx, int dev, void* handle, void** list
   return ncclSuccess;
 }
 
+static int ginAnvilEnvInt(const char* primary, const char* fallback, int defaultVal) {
+  const char* e = getenv(primary);
+  if (e && e[0]) {
+    int v = atoi(e);
+    return v > 0 ? v : defaultVal;
+  }
+  e = getenv(fallback);
+  if (e && e[0]) {
+    int v = atoi(e);
+    return v > 0 ? v : defaultVal;
+  }
+  return defaultVal;
+}
+
 static int ginAnvilSdmaThresholdFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
-  if (!e || !e[0]) return (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
-  int v = atoi(e);
-  return v > 0 ? v : (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  return ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "ROCSHMEM_SDMA_THRESHOLD",
+                        (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
+}
+
+static int ginAnvilSdmaNumChannelsFromEnv() {
+  int v = ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS", "ROCSHMEM_SDMA_NUM_CHANNELS", 1);
+  return v >= 1 && v <= 8 ? v : 1;
+}
+
+static uint32_t ginAnvilRocshmemSdmaEnabledFromEnv() {
+  const char* e = getenv("ROCSHMEM_SDMA_ENABLED");
+  if (!e || !e[0]) return 0u;
+  if (e[0] == '0' && e[1] == '\0') return 0u;
+  return atoi(e) != 0 ? 1u : 0u;
 }
 
 static uint32_t ginAnvilFusedSignalFromEnv() {
@@ -134,11 +160,7 @@ static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int 
     return ncclSystemError;
   }
 
-  int numCh = 1;
-  if (const char* e = getenv("NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS")) {
-    int v = atoi(e);
-    if (v >= 1 && v <= 8) numCh = v;
-  }
+  int numCh = ginAnvilSdmaNumChannelsFromEnv();
 
   rocshmem_gin_anvil_handle_t h = nullptr;
   void* gpu_handles = nullptr;
@@ -297,6 +319,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
+  ctx->gpuCtxHost.rocshmemSdmaEnabled = ginAnvilRocshmemSdmaEnabledFromEnv();
 
   if (config->nSignals > 0) {
     ctx->gpuCtxHost.signals =
@@ -338,9 +361,10 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   *outDevHandle = ctx->devHandle;
   INFO(NCCL_INIT,
        "GIN anvil-sdma: context created (v%d, %d signals, %d counters, sdmaThreshold=%u, spread=%d, "
-       "fusedSignal=%u)",
+       "fusedSignal=%u, rocshmemSdma=%u)",
        NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters,
-       ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
+       ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal,
+       ctx->gpuCtxHost.rocshmemSdmaEnabled);
   return ncclSuccess;
 
 fail:

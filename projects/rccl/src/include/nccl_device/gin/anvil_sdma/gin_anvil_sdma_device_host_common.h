@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 111
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 112
 
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
@@ -33,6 +33,7 @@ struct ncclGinAnvilSdmaGPUContext {
   uint32_t nCounters;
   uint32_t sdmaThreshold;
   uint32_t fusedSdmaSignal;  // use COPY_LINEAR_WAIT_SIGNAL_MI4 for SignalInc SDMA puts
+  uint32_t rocshmemSdmaEnabled;  // ROCSHMEM_SDMA_ENABLED: putmem may use IpcSdmaImpl
   int nRanks;
   int rank;
   int numChannels;
