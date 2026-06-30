@@ -41,11 +41,19 @@ static int checkHip(hipError_t e, const char* what) {
 
 // Mirrors ROCSHMEM_SDMA_SPREAD_CHANNELS / default-context assignSdmaChannel:
 // stride=1 spreads wavefronts across channels; stride=0 pins to sdmaChannel.
+// Falls back to ROCSHMEM_SDMA_SPREAD_CHANNELS when NCCL_GIN_ANVIL_SDMA_SPREAD_CHANNELS unset.
 static int ginAnvilSpreadChannelsFromEnv() {
   const char* e = getenv("NCCL_GIN_ANVIL_SDMA_SPREAD_CHANNELS");
-  if (!e || !e[0]) return 1;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1 : 0;
+  if (e && e[0]) {
+    if (e[0] == '0' && e[1] == '\0') return 0;
+    return atoi(e) != 0 ? 1 : 0;
+  }
+  e = getenv("ROCSHMEM_SDMA_SPREAD_CHANNELS");
+  if (e && e[0]) {
+    if (e[0] == '0' && e[1] == '\0') return 0;
+    return atoi(e) != 0 ? 1 : 0;
+  }
+  return 1;
 }
 
 extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_id,
