@@ -192,6 +192,43 @@ _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   done
 }
 
+# Bind host libibverbs *-rdmav*.so provider plugins (e.g. libmlx5-rdmav34.so) from the same
+# rdma-core tree as libibverbs.so.1. Without these, injected host /etc/libibverbs.d makes
+# libibverbs warn "couldn't load driver 'libmlx5-rdmav34.so'" inside Docker (ddai-gin-ruby-perf.log).
+_rccl_gin_gda_host_so_mount_ibverbs_rdmav_plugins() {
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d cand verbs_real vbdir plugdir plug real base
+  verbs_real=""
+  for d in ${_dirs}; do
+    cand="${d}/libibverbs.so.1"
+    [[ -e "${cand}" ]] || continue
+    verbs_real=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${verbs_real}" || ! -e "${verbs_real}" ]] && verbs_real="${cand}"
+    break
+  done
+  [[ -n "${verbs_real}" ]] || return 0
+  vbdir=$(dirname "${verbs_real}")
+
+  shopt -s nullglob
+  for plugdir in "${vbdir}/libibverbs" "${vbdir}"; do
+    [[ -d "${plugdir}" ]] || continue
+    for plug in "${plugdir}"/*-rdmav*.so*; do
+      [[ -f "${plug}" ]] || continue
+      real=$(readlink -f "${plug}" 2>/dev/null || true)
+      [[ -z "${real}" || ! -e "${real}" ]] && real="${plug}"
+      base=$(basename "${plug}")
+      _rccl_gin_gda_host_so_add_bind "${real}" "${plugdir}/${base}"
+      if [[ "${real}" != "${plugdir}/${base}" ]]; then
+        _rccl_gin_gda_host_so_add_bind "${real}" "${real}"
+      fi
+      for d in ${_dirs}; do
+        _rccl_gin_gda_host_so_add_bind "${real}" "${d}/libibverbs/${base}"
+      done
+    done
+  done
+  shopt -u nullglob
+}
+
 DOCKER_TEST2_VOLUMES=""
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   echo "warning: RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 bind-mounts full GNU lib dirs; can break librccl if host glibc is older than the image." >&2
@@ -221,6 +258,7 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 0 ]] && [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 1 ]]; then
     _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs
   fi
+  _rccl_gin_gda_host_so_mount_ibverbs_rdmav_plugins
   unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted _rccl_t2_mlx5_part
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
