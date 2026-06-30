@@ -105,19 +105,21 @@ NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int p
 }
 
 // Order data movement before remote signal/counter updates.
-// putmem/memcpy_lane uses system-scope flat stores — a lightweight system fence
-// suffices and avoids nocall rocshmem_fence()/ipcFence SDMA-dirty checks.
-NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(bool sdmaDataPath,
+// putmem/memcpy_lane: threadfence when IPC-only; rocshmem_fence when ROCSHMEM_SDMA_ENABLED
+// (putmem may route through IpcSdmaImpl). Direct Anvil SDMA always uses rocshmem_fence.
+NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                               rocshmem::anvil::SdmaQueueDeviceHandle* handle,
                                               bool hasCounter) {
   if (hasCounter) {
     if (sdmaDataPath && handle != nullptr) {
       rocshmem::anvil::quiet(*handle);
     } else {
-      // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC).
+      // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC / IpcSdma).
       rocshmem::rocshmem_quiet();
     }
   } else if (sdmaDataPath) {
+    rocshmem::rocshmem_fence();
+  } else if (anvilCtxValid(rsCtx) && loadConst(&rsCtx->rocshmemSdmaEnabled)) {
     rocshmem::rocshmem_fence();
   } else {
     __threadfence_system();
@@ -204,7 +206,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if ((hasSignal || hasCounter) && !sdmaFusedSignal) {
-      fenceBeforeShmemSignal(sdmaDataPath, handle, hasCounter);
+      fenceBeforeShmemSignal(rsCtx, sdmaDataPath, handle, hasCounter);
 
       if (hasSignal) {
         if (signalOp == ncclGinSignalInc) signalOpArg = 1;
@@ -301,7 +303,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if (hasSignal && !sdmaFusedSignal) {
-      fenceBeforeShmemSignal(sdmaDataPath, handle, /*hasCounter=*/false);
+      fenceBeforeShmemSignal(rsCtx, sdmaDataPath, handle, /*hasCounter=*/false);
       if (signalOp == ncclGinSignalInc) signalOpArg = 1;
       shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }
