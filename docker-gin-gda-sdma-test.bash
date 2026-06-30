@@ -226,11 +226,86 @@ _rccl_gin_gda_host_so_resolve_ibverbs_real() {
   return 1
 }
 
+_rccl_gin_gda_host_so_resolve_soname_real() {
+  local base="$1"
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d cand real
+  for d in ${_dirs}; do
+    cand="${d}/${base}"
+    [[ -e "${cand}" ]] || continue
+    real=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${cand}"
+    echo "${real}"
+    return 0
+  done
+  return 1
+}
+
+# RHEL path-style (driver /usr/lib64/libibverbs/libmlx5), two-line, and library-only .driver files.
+_rccl_gin_gda_host_so_normalize_driver_library() {
+  local -n _out_drv="$1"
+  local -n _out_lib="$2"
+  local drv="${_out_drv}" lib="${_out_lib}"
+  drv="${drv%%[[:space:]]*}"
+  lib="${lib%%[[:space:]]*}"
+
+  if [[ -n "${lib}" ]]; then
+    [[ "${lib}" == */* ]] && lib=$(basename "${lib}")
+    if [[ "${drv}" == */lib* ]]; then
+      local base
+      base=$(basename "${drv}")
+      drv="${base#lib}"
+      drv="${drv%%-*}"
+      drv="${drv%%.so*}"
+    fi
+    _out_drv="${drv}"
+    _out_lib="${lib}"
+    [[ -n "${_out_drv}" && -n "${_out_lib}" ]]
+    return
+  fi
+
+  if [[ -z "${drv}" ]]; then
+    return 1
+  fi
+
+  if [[ "${drv}" == lib*-rdmav*.so* ]]; then
+    lib="${drv}"
+    drv="${lib#lib}"
+    drv="${drv%%-rdmav*}"
+    _out_drv="${drv}"
+    _out_lib="${lib}"
+    return 0
+  fi
+
+  if [[ "${drv}" == */* ]]; then
+    local base
+    base=$(basename "${drv}")
+    if [[ "${base}" == lib*-rdmav*.so* ]]; then
+      lib="${base}"
+      drv="${lib#lib}"
+      drv="${drv%%-rdmav*}"
+    else
+      drv="${base#lib}"
+      drv="${drv%%-*}"
+      drv="${drv%%.so*}"
+      lib=""
+    fi
+    _out_drv="${drv}"
+    _out_lib="${lib}"
+    [[ -n "${_out_drv}" ]]
+    return
+  fi
+
+  _out_drv="${drv}"
+  _out_lib=""
+  return 0
+}
+
 _rccl_gin_gda_host_so_find_ibverbs_plugin_real() {
   local vbdir="$1" driver="$2" library="$3"
   local plugdir="${vbdir}/libibverbs" plug real
-  [[ -n "${driver}" && -n "${library}" ]] || return 1
-  if [[ -e "${plugdir}/${library}" ]]; then
+  [[ -n "${driver}" ]] || return 1
+  if [[ -n "${library}" && -e "${plugdir}/${library}" ]]; then
     real=$(readlink -f "${plugdir}/${library}" 2>/dev/null || true)
     [[ -z "${real}" || ! -e "${real}" ]] && real="${plugdir}/${library}"
     echo "${real}"
@@ -257,12 +332,26 @@ _rccl_gin_gda_host_so_find_ibverbs_plugin_real() {
   return 1
 }
 
-# Force host libibverbs onto Ubuntu container lib paths and bind ibverbs providers at the
-# exact library names from host /etc/libibverbs.d (e.g. libmlx5-rdmav34.so while the host
-# file is libmlx5-rdmav59.so). Fixes Test#5 libibverbs warnings (ddai-gin-ruby-perf.log).
+_rccl_gin_gda_host_so_mount_host_libnl_for_container() {
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d nl3 nlrt
+  nl3=$(_rccl_gin_gda_host_so_resolve_soname_real libnl-3.so.200) || return 0
+  nlrt=$(_rccl_gin_gda_host_so_resolve_soname_real libnl-route-3.so.200) || return 0
+  for d in ${_dirs}; do
+    _rccl_gin_gda_host_so_add_bind "${nl3}" "${d}/libnl-3.so.200"
+    _rccl_gin_gda_host_so_add_bind "${nlrt}" "${d}/libnl-route-3.so.200"
+  done
+  _rccl_gin_gda_host_so_add_bind "${nl3}" "${nl3}"
+  _rccl_gin_gda_host_so_add_bind "${nlrt}" "${nlrt}"
+}
+
+# Force host libibverbs + libnl onto Ubuntu container lib paths; bind the host ibverbs
+# provider directory and per-driver aliases from /etc/libibverbs.d. Fixes Test#5 warnings
+# (ddai-gin-ruby-perf.log: empty /lib/x86_64-linux-gnu/libibverbs/, libnl mismatch).
 _rccl_gin_gda_host_so_mount_host_ibverbs_for_container() {
   local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
-  local d drvfile line driver library plugin_real plugin_base vbdir plugdir_host
+  local d drvfile line key val driver library plugin_real plugin_base vbdir plugdir_host
+  local rdmav_cand
   _rccl_gin_gda_host_so_resolve_ibverbs_real || return 0
   vbdir=$(dirname "${_RCCL_GIN_GDA_IBVERBS_REAL}")
   plugdir_host="${vbdir}/libibverbs"
@@ -273,6 +362,14 @@ _rccl_gin_gda_host_so_mount_host_ibverbs_for_container() {
   done
   _rccl_gin_gda_host_so_add_bind "${_RCCL_GIN_GDA_IBVERBS_REAL}" "${_RCCL_GIN_GDA_IBVERBS_REAL}"
 
+  _rccl_gin_gda_host_so_mount_host_libnl_for_container
+
+  if [[ -d "${plugdir_host}" ]]; then
+    for d in ${_dirs}; do
+      _rccl_gin_gda_host_so_add_bind "${plugdir_host}" "${d}/libibverbs"
+    done
+  fi
+
   [[ -d /etc/libibverbs.d ]] || return 0
   shopt -s nullglob
   for drvfile in /etc/libibverbs.d/*.driver; do
@@ -281,28 +378,54 @@ _rccl_gin_gda_host_so_mount_host_ibverbs_for_container() {
     while IFS= read -r line || [[ -n "${line}" ]]; do
       line="${line%%#*}"
       line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -n "${line}" ]] || continue
+      if [[ "${line}" == *"="* ]]; then
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        case "${key}" in
+          driver|driver_name) driver="${val}" ;;
+          library|library_name) library="${val}" ;;
+        esac
+        continue
+      fi
       case "${line}" in
         driver\ *) driver="${line#driver }" ;;
+        driver_name\ *) driver="${line#driver_name }" ;;
         library\ *) library="${line#library }" ;;
+        library_name\ *) library="${line#library_name }" ;;
       esac
     done < "${drvfile}"
-    driver="${driver%% *}"
-    library="${library%% *}"
-    [[ -n "${driver}" && -n "${library}" ]] || continue
+    _rccl_gin_gda_host_so_normalize_driver_library driver library || continue
+    if [[ -z "${library}" ]]; then
+      rdmav_cand=""
+      for rdmav_cand in "${plugdir_host}/lib${driver}-rdmav"*.so; do
+        [[ -f "${rdmav_cand}" ]] || continue
+        library=$(basename "${rdmav_cand}")
+        break
+      done
+      if [[ -z "${library}" ]]; then
+        library=$(grep -oE 'lib[^[:space:]]*-rdmav[0-9]+\.so' "${drvfile}" 2>/dev/null | head -1)
+      fi
+    fi
     plugin_real=$(_rccl_gin_gda_host_so_find_ibverbs_plugin_real "${vbdir}" "${driver}" "${library}") || continue
     plugin_base=$(basename "${plugin_real}")
+    if [[ -z "${library}" ]]; then
+      case "${plugin_base}" in
+        lib${driver}-rdmav*.so*) library="${plugin_base}" ;;
+      esac
+    fi
+    [[ -n "${library}" ]] || continue
     for d in ${_dirs}; do
       _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${d}/libibverbs/${library}"
       if [[ "${plugin_base}" != "${library}" ]]; then
         _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${d}/libibverbs/${plugin_base}"
       fi
     done
-    if [[ -d "${plugdir_host}" ]]; then
-      _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${plugdir_host}/${library}"
-      if [[ "${plugin_base}" != "${library}" ]]; then
-        _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${plugdir_host}/${plugin_base}"
-      fi
-    fi
   done
   shopt -u nullglob
 }
