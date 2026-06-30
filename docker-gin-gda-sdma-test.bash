@@ -211,6 +211,102 @@ _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs() {
   done
 }
 
+_RCCL_GIN_GDA_IBVERBS_REAL=""
+_rccl_gin_gda_host_so_resolve_ibverbs_real() {
+  _RCCL_GIN_GDA_IBVERBS_REAL=""
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d cand
+  for d in ${_dirs}; do
+    cand="${d}/libibverbs.so.1"
+    [[ -e "${cand}" ]] || continue
+    _RCCL_GIN_GDA_IBVERBS_REAL=$(readlink -f "${cand}" 2>/dev/null || true)
+    [[ -z "${_RCCL_GIN_GDA_IBVERBS_REAL}" || ! -e "${_RCCL_GIN_GDA_IBVERBS_REAL}" ]] && _RCCL_GIN_GDA_IBVERBS_REAL="${cand}"
+    return 0
+  done
+  return 1
+}
+
+_rccl_gin_gda_host_so_find_ibverbs_plugin_real() {
+  local vbdir="$1" driver="$2" library="$3"
+  local plugdir="${vbdir}/libibverbs" plug real
+  [[ -n "${driver}" && -n "${library}" ]] || return 1
+  if [[ -e "${plugdir}/${library}" ]]; then
+    real=$(readlink -f "${plugdir}/${library}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${plugdir}/${library}"
+    echo "${real}"
+    return 0
+  fi
+  shopt -s nullglob
+  for plug in "${plugdir}/lib${driver}-rdmav"*.so*; do
+    [[ -f "${plug}" ]] || continue
+    real=$(readlink -f "${plug}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${plug}"
+    echo "${real}"
+    shopt -u nullglob
+    return 0
+  done
+  for plug in "${vbdir}/lib${driver}.so.1" "${vbdir}/lib${driver}.so"; do
+    [[ -e "${plug}" ]] || continue
+    real=$(readlink -f "${plug}" 2>/dev/null || true)
+    [[ -z "${real}" || ! -e "${real}" ]] && real="${plug}"
+    echo "${real}"
+    shopt -u nullglob
+    return 0
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# Force host libibverbs onto Ubuntu container lib paths and bind ibverbs providers at the
+# exact library names from host /etc/libibverbs.d (e.g. libmlx5-rdmav34.so while the host
+# file is libmlx5-rdmav59.so). Fixes Test#5 libibverbs warnings (ddai-gin-ruby-perf.log).
+_rccl_gin_gda_host_so_mount_host_ibverbs_for_container() {
+  local _dirs="${RCCL_GIN_GDA_TEST2_HOST_SO_SEARCH_DIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+  local d drvfile line driver library plugin_real plugin_base vbdir plugdir_host
+  _rccl_gin_gda_host_so_resolve_ibverbs_real || return 0
+  vbdir=$(dirname "${_RCCL_GIN_GDA_IBVERBS_REAL}")
+  plugdir_host="${vbdir}/libibverbs"
+
+  for d in ${_dirs}; do
+    _rccl_gin_gda_host_so_add_bind "${_RCCL_GIN_GDA_IBVERBS_REAL}" "${d}/libibverbs.so"
+    _rccl_gin_gda_host_so_add_bind "${_RCCL_GIN_GDA_IBVERBS_REAL}" "${d}/libibverbs.so.1"
+  done
+  _rccl_gin_gda_host_so_add_bind "${_RCCL_GIN_GDA_IBVERBS_REAL}" "${_RCCL_GIN_GDA_IBVERBS_REAL}"
+
+  [[ -d /etc/libibverbs.d ]] || return 0
+  shopt -s nullglob
+  for drvfile in /etc/libibverbs.d/*.driver; do
+    driver=""
+    library=""
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%%#*}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      case "${line}" in
+        driver\ *) driver="${line#driver }" ;;
+        library\ *) library="${line#library }" ;;
+      esac
+    done < "${drvfile}"
+    driver="${driver%% *}"
+    library="${library%% *}"
+    [[ -n "${driver}" && -n "${library}" ]] || continue
+    plugin_real=$(_rccl_gin_gda_host_so_find_ibverbs_plugin_real "${vbdir}" "${driver}" "${library}") || continue
+    plugin_base=$(basename "${plugin_real}")
+    for d in ${_dirs}; do
+      _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${d}/libibverbs/${library}"
+      if [[ "${plugin_base}" != "${library}" ]]; then
+        _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${d}/libibverbs/${plugin_base}"
+      fi
+    done
+    if [[ -d "${plugdir_host}" ]]; then
+      _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${plugdir_host}/${library}"
+      if [[ "${plugin_base}" != "${library}" ]]; then
+        _rccl_gin_gda_host_so_add_bind "${plugin_real}" "${plugdir_host}/${plugin_base}"
+      fi
+    fi
+  done
+  shopt -u nullglob
+}
+
 DOCKER_TEST2_VOLUMES=""
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS:-0}" != 0 ]]; then
   echo "warning: RCCL_GIN_GDA_TEST2_BIND_HOST_GNU_DIRS=1 bind-mounts full GNU lib dirs; host libc older than the image breaks librccl (ddai-gin-perf.log)." >&2
@@ -242,6 +338,7 @@ if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_RDMA_SO:-1}" != 0 ]]; then
   if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 0 ]] && [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_MLX5_SO:-}" != 1 ]]; then
     _rccl_gin_gda_host_so_mount_mlx5_adjacent_to_ibverbs
   fi
+  _rccl_gin_gda_host_so_mount_host_ibverbs_for_container
   unset _rccl_t2_base _rccl_t2_bases _rccl_t2_dst_mounted _rccl_t2_mlx5_part
 fi
 if [[ "${RCCL_GIN_GDA_TEST2_BIND_HOST_IB_SYSFS:-1}" != 0 ]]; then
