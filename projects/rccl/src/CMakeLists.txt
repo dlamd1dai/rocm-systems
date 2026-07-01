@@ -141,7 +141,7 @@ set(SRC_FILES
   include/gin.h
   include/gin/gin_host.h
   include/gin/gin_host_proxy.h
-  include/gin/gin_host_rocshmem_api.h
+  include/gin/gin_host_rocshmem_common.h
   include/gin/gin_host_rocshmem_gda.h
   include/gin/gin_host_rocshmem_anvil.h
   include/gin/gin_rocshmem_gda_factory.h
@@ -209,8 +209,6 @@ set(SRC_FILES
   include/nccl_device/gin/gin_device_host_common.h
   include/nccl_device/gin/proxy/gin_proxy.h
   include/nccl_device/gin/proxy/gin_proxy_device_host_common.h
-  include/nccl_device/gin/rocshmem_api/gin_rocshmem_api.h
-  include/nccl_device/gin/rocshmem_api/gin_rocshmem_api_device_host_common.h
   include/nccl_device/gin/rocshmem_gda/gin_rocshmem_gda.h
   include/nccl_device/gin/rocshmem_gda/gin_rocshmem_device_host_common_gda.h
   include/nccl_device/gin/rocshmem_gda/queue_pair_device.h
@@ -438,7 +436,7 @@ set(SRC_FILES
   transport/shm.cc
   gin/gin_host.cc
   gin/gin_host_proxy.cc
-  gin/gin_plugin_rocshmem_api.cc
+  gin/gin_host_rocshmem_common.cc
   gin/gin_plugin_rocshmem_gda.cc
   gin/gin_plugin_rocshmem_anvil.cc
   gin/gin_rocshmem_gda_factory.cc

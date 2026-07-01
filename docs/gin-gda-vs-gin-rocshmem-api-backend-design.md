@@ -1,5 +1,7 @@
 # Conversation: GIN-GDA vs GIN-ROCSHMEM-API backend design
 
+> **Note (2026):** The **GIN–rocSHMEM–API** backend (`NCCL_GIN_TYPE=4`) has been **removed** from RCCL. Use **GIN Anvil SDMA** (`NCCL_GIN_TYPE=6`) for intra-node xGMI device puts, or **GIN–rocSHMEM–GDA** (`NCCL_GIN_TYPE=5`) for IB GDA QPs. This document is retained for historical comparison only.
+
 *Saved from chat, 2026-06-20.*
 
 ---

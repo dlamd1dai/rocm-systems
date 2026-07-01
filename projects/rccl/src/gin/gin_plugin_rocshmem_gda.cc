@@ -15,7 +15,7 @@
  * - createContext(collComm) sets up signals, counters, GPU context
  */
 
-#include "gin/gin_host_rocshmem_api.h"  // ginRocshmemInitCtx, SetInitContext
+#include "gin/gin_host_rocshmem_common.h"  // ginRocshmemInitCtx, SetInitContext
 #include "gin/gin_host_rocshmem_gda.h"
 #include "comm.h"
 #include "bootstrap.h"

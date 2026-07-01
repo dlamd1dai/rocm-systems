@@ -7,7 +7,7 @@ NP=${1:-8}
 MAX_BYTES="${2:-128M}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
-RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,3,5}}"
+RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
 GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${TEST2_HOST_SO_SEARCH_DIRS:-/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}"
 ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
 
@@ -354,21 +354,6 @@ if _run_test 2; then
   _trace_off
 fi
 
-if _run_test 3; then
-  _trace_on
-  echo "=== Test#3: A2A, ${NP} gpus, GIN ROCSHMEM+SDMA ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
-    mpirun -n "${NP}" ${MPI_OPT} \
-    "${MPI_BASE[@]}" \
-    "${GIN_PLUGIN_X[@]}" \
-    -x NCCL_NET_PLUGIN=none \
-    -x ROCSHMEM_SDMA_ENABLED=1 \
-    -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=4 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
-  _trace_off
-fi
-
 if _should_run_test4; then
   _trace_on
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
@@ -395,7 +380,7 @@ if _should_run_test5; then
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=6 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}}}" \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   _trace_off

@@ -6,9 +6,7 @@ set(GIN_SOURCES
 
 if(ENABLE_ROCSHMEM OR ENABLE_ROCSHMEM_GIN)
     list(APPEND GIN_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/gin_host_rocshmem_api.cc
-        ${CMAKE_CURRENT_SOURCE_DIR}/gin_plugin_rocshmem_api.cc
-        ${CMAKE_CURRENT_SOURCE_DIR}/gin_host_rocshmem_gda.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/gin_host_rocshmem_common.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/gin_plugin_rocshmem_gda.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/gin_plugin_rocshmem_anvil.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/gin_rocshmem_gda_factory.cc)

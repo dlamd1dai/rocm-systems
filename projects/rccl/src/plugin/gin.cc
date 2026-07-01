@@ -11,7 +11,7 @@
 #include "plugin.h"
 #include "nccl_gin.h"
 #ifdef ENABLE_ROCSHMEM_GIN
-#include "gin/gin_host_rocshmem_api.h"
+#include "gin/gin_host_rocshmem_common.h"
 #include "gin/gin_host_rocshmem_gda.h"
 #include "gin/gin_host_rocshmem_anvil.h"
 #endif
@@ -37,7 +37,7 @@ getNcclGin_t* getNcclRma[NCCL_GIN_VERSION_COUNT] = {getNcclRma_v13, getNcclGin_v
 extern ncclGin_t* getNcclGin_v12_internal(ncclGin_v12_t* ncclGin_v12);
 
 #ifdef ENABLE_ROCSHMEM_GIN
-#define NCCL_GIN_NUM_INTERNAL_PLUGINS 4
+#define NCCL_GIN_NUM_INTERNAL_PLUGINS 3
 #else
 #define NCCL_GIN_NUM_INTERNAL_PLUGINS 1
 #endif
@@ -127,8 +127,7 @@ static ncclResult_t ncclGinPluginInit(struct ncclComm* comm, ginPluginLib_t* plu
     }
 #ifdef ENABLE_ROCSHMEM_GIN
     else if (comm->ginContext &&
-             (pluginLib->ncclGin == &ncclGinRocshmemApiPlugin ||
-              pluginLib->ncclGin == &ncclGinRocshmemGdaPlugin ||
+             (pluginLib->ncclGin == &ncclGinRocshmemGdaPlugin ||
               pluginLib->ncclGin == &ncclGinRocshmemAnvilPlugin)) {
       ncclGinRocshmemSetInitContext(comm->ginContext, comm);
     }
@@ -269,13 +268,6 @@ static void initPluginLibsOnceFunc() {
   pluginCounter++;
 
 #ifdef ENABLE_ROCSHMEM_GIN
-  // Add internal rocshmem API plugin (device-initiated, GIN_TYPE=4)
-  {
-    extern ncclGin_t ncclGinRocshmemApiPlugin;
-    ginPluginLibs[pluginCounter].ncclGin = &ncclGinRocshmemApiPlugin;
-    ginPluginLibs[pluginCounter].ncclGinPluginState = ncclGinPluginStateInitReady;
-    pluginCounter++;
-  }
   // Add internal rocshmem GDA plugin (device-initiated, GIN_TYPE=5)
   {
     extern ncclGin_t ncclGinRocshmemGdaPlugin;

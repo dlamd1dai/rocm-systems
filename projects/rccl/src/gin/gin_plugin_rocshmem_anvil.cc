@@ -13,7 +13,7 @@
  * device-side IPC flat stores for small messages — no rocSHMEM runtime API.
  */
 
-#include "gin/gin_host_rocshmem_api.h"
+#include "gin/gin_host_rocshmem_common.h"
 #include "gin/gin_host_rocshmem_anvil.h"
 #include "comm.h"
 #include "dev_runtime.h"
