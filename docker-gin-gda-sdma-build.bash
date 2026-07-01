@@ -1,4 +1,5 @@
 #! /usr/bin/env bash
+set -euo pipefail
 
 # Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=6) needs rocSHMEM built with USE_SDMA=ON. Default
 # ROCSHMEM_USE_SDMA=1 passes --build-arg to the Dockerfile; set ROCSHMEM_USE_SDMA=0 to opt out.
@@ -17,26 +18,33 @@ TARGET_GPU_ARCH=gfx950
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
+ROCSHMEM_CACHE_BUST="${ROCSHMEM_CACHE_BUST:-1}"
+RCCL_CACHE_BUST="${RCCL_CACHE_BUST:-1}"
+BUILD_LOG="${BUILD_LOG:-ddai-gin-build.log}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
+# shellcheck source=docker-gin-gda-sdma-preflight.bash
+source "${SCRIPT_DIR}/docker-gin-gda-sdma-preflight.bash"
 
 # Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
 mkdir -p extra-rdma-debs
 
-if [ ${NO_CACHE} -eq 1 ]; then
+if [ "${NO_CACHE}" -eq 1 ]; then
     NO_CACHE_OPT="--no-cache"
-    N=1
 else
     NO_CACHE_OPT=""
-    N=${ROCSHMEM_CACHE_BUST:-1}
 fi
+
 set -x
-${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
+${DOCKER_CMD} build -f "${DOCKERFILE}" -t "${DOCKER_IMAGE}" \
     ${NO_CACHE_OPT} \
-    --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
-    --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
-    --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
-    --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS} \
-    --build-arg ROCSHMEM_CACHE_BUST=$((N++)) \
-    .
+    --build-arg GPU_TARGETS="${TARGET_GPU_ARCH}" \
+    --build-arg USE_LOCAL_SRC="${USE_LOCAL_SRC}" \
+    --build-arg ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA}" \
+    --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS}" \
+    --build-arg ROCSHMEM_CACHE_BUST="${ROCSHMEM_CACHE_BUST}" \
+    --build-arg RCCL_CACHE_BUST="${RCCL_CACHE_BUST}" \
+    . 2>&1 | tee "${BUILD_LOG}"
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
 set +x
-

@@ -179,6 +179,10 @@ ARG RCCL_BRANCH=users/dondai/gin-stage2-gda-sdma-merge
 ARG RCCL_CACHE_BUST=1
 COPY projects/rccl/      /tmp/local/projects/rccl/
 COPY projects/rccl-tests/ /tmp/local/projects/rccl-tests/
+RUN echo "RCCL_CACHE_BUST=${RCCL_CACHE_BUST}" \
+ && test -f /tmp/local/projects/rccl/src/include/gin/gin_host_rocshmem_common.h \
+ && test -f /tmp/local/projects/rccl/src/gin/gin_host_rocshmem_common.cc \
+ || { echo "ERROR: gin_host_rocshmem_common.h/.cc missing from RCCL build context"; exit 1; }
 ENV RCCL_INSTALL_PREFIX=${WORKDIR}/rccl
 ENV ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda"
 RUN if [ "${USE_LOCAL_SRC}" = "1" ]; then \
