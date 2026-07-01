@@ -73,6 +73,51 @@ RUN apt-get install -y --no-install-recommends \
     openmpi-bin openmpi-common libopenmpi-dev \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# Newest rdma-core / libmlx5 from distro updates (base pocket can lag). RCCL GIN Anvil SDMA
+# (NCCL_GIN_TYPE=6) dlopens MLX5_1.25 symbols (mlx5dv_reg_dmabuf_mr, mlx5dv_get_data_direct_sysfs_path).
+RUN . /etc/os-release \
+ && apt-get update \
+ && ( apt-get install -y --no-install-recommends \
+        -t "${VERSION_CODENAME}-updates" \
+        rdma-core libibverbs1 libmlx5-1 librdmacm1t64 libibumad3 ibverbs-providers \
+        libibverbs-dev librdmacm-dev libibumad-dev \
+      || apt-get install -y --no-install-recommends \
+        rdma-core libibverbs1 libmlx5-1 librdmacm1t64 libibumad3 ibverbs-providers \
+        libibverbs-dev librdmacm-dev libibumad-dev ) \
+ && rm -rf /var/lib/apt/lists/*
+
+# Optional: install newer rdma-core / libmlx5 .deb files from build context (extra-rdma-debs/*.deb).
+# See extra-rdma-debs/README.md — required for Test#5 on hosts where stock noble libmlx5 lacks MLX5_1.25 symbols.
+COPY extra-rdma-debs/ /tmp/extra-rdma-debs/
+RUN set -eu; \
+  if ! ls /tmp/extra-rdma-debs/*.deb >/dev/null 2>&1; then \
+    echo "extra-rdma-debs/: no .deb files (optional; skipping)"; \
+    exit 0; \
+  fi; \
+  apt-get update; \
+  dpkg -i /tmp/extra-rdma-debs/*.deb || apt-get -fy install; \
+  rm -rf /var/lib/apt/lists/*
+
+# Stock Ubuntu 24.04 libmlx5 often lacks MLX5_1.25 exports (mlx5dv_reg_dmabuf_mr); strict verify fails (ddai-gin-build.log).
+# Default: skip. Set --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 with MOFED/newer rdma-core to enforce.
+ARG RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=0
+RUN set -eu; \
+  if [ "${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS}" != "1" ]; then \
+    echo "Skipping libmlx5 DMA-BUF symbol verify (RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS is not 1)."; \
+    exit 0; \
+  fi; \
+  ok_mr=0; ok_sys=0; \
+  for f in /lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so.1 \
+           /lib/x86_64-linux-gnu/libmlx5dv.so.1 /usr/lib/x86_64-linux-gnu/libmlx5dv.so.1; do \
+    [ -e "$f" ] || continue; \
+    rf=$(readlink -f "$f"); \
+    [ -f "$rf" ] || continue; \
+    objdump -T "$rf" 2>/dev/null | grep -q mlx5dv_reg_dmabuf_mr && ok_mr=1; \
+    objdump -T "$rf" 2>/dev/null | grep -q mlx5dv_get_data_direct_sysfs_path && ok_sys=1; \
+  done; \
+  [ "$ok_mr" -eq 1 ] && [ "$ok_sys" -eq 1 ]; \
+  echo "OK: MLX5 DMA-BUF/sysfs symbols found (RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1)."
+
 
 ## Not needed on Ubuntu 24, probably needed on Ubuntu22
 #RUN wget https://github.com/Kitware/CMake/releases/download/v3.28.0/cmake-3.28.0-linux-x86_64.sh \
@@ -82,7 +127,8 @@ RUN apt-get install -y --no-install-recommends \
 
 ## Set ROCm path
 ENV ROCM_PATH=/opt/rocm
-# System OpenMPI from apt. rocSHMEM MPI_ROOT and rccl-tests CMAKE_PREFIX_PATH use these.
+# System OpenMPI from apt. 
+# rocSHMEM MPI_ROOT, rccl-tests CMAKE_PREFIX_PATH use these.
 ENV MPI_INSTALL_PREFIX=/usr
 ENV MPI_INSTALL_DIR=/usr
 
