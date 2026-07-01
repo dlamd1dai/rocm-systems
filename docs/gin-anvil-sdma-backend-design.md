@@ -7,7 +7,8 @@ This document describes the **GIN Anvil SDMA** backend added to RCCL (`NCCL_NET_
 Provide a GIN path that **replaces** “GIN + rocSHMEM API + SDMA policy” (where device work goes through `rocshmem_putmem` / fence / quiet and SDMA is selected inside rocSHMEM) with a backend that:
 
 1. Issues **SDMA through Anvil** (`rocshmem::anvil::put`, `quiet`, `signal`) **directly** from the GIN device templates.
-2. Mirrors the **host-side lifecycle** of **GIN–GDA** as closely as practical: `connect()` establishes transport resources, `regMrSym()` exchanges per-rank addressing metadata, `createContext()` builds the device-visible context (signals, counters, handles).
+2. Uses **IPC flat stores** (`gin_anvil_ipc_copy.h`) for small messages — same datapath as rocSHMEM’s `memcpy_lane` Put policy, without calling the rocSHMEM runtime API.
+3. Mirrors the **host-side lifecycle** of **GIN–GDA** as closely as practical: `connect()` establishes transport resources, `regMrSym()` exchanges per-rank addressing metadata, `createContext()` builds the device-visible context (signals, counters, handles).
 
 ## Selection and versioning
 
@@ -35,27 +36,45 @@ rocSHMEM’s IPC SDMA path indexes queues by **local PE / device index** on a sy
 
 **Reasoning:** This preserves the same **“one column of queues per peer index”** mental model as the IPC policy, but swaps PE indices for **NCCL ranks**, which is what GIN kernels already use.
 
-## Memory registration (no IB MR)
+## Memory registration (no IB MR, no rocSHMEM constant-memory table)
 
 GDA registers GPU memory with the **GDA PD** and exchanges **rkeys + VAs**. Anvil SDMA over XGMI uses **GPU VAs** visible to peer SDMA engines once **P2P is enabled**; there is no lkey/rkey surface in this path.
 
-**Choice:** `regMrSym()` only **allgathers base VAs** per rank and packs them into a small device-side `ncclGinAnvilSdmaMemHandle` (local VA + device array of remote VAs), analogous to the VA half of the GDA mem handle without keys.
+**Choice:** `regMrSym()` **allgathers each rank’s LSA flat base VA** and stores the result in a device-side `remoteVas[nRanks]` array inside `ncclGinAnvilSdmaMemHandle`. The device resolves `remoteVas[peer] + offset` directly — the same exchange step as GDA, without IB keys and without `rocshmem_buffer_register_vmm` / `rocshmem_ptr`.
 
-**Reasoning:** Same **exchange step** as GDA for addressing; drops IB-specific fields that do not exist on the SDMA path.
+**Reasoning:** Constant-memory user-buffer lookup (rocSHMEM IPC) adds indirection and ties the backend to `rocshmem_init` semantics. Per-window GPU arrays match GDA’s `remote_vas` pattern and keep remote resolution to one HBM load per put.
 
 ## Signals and counters
 
-- **Signals:** Fine-grained GPU memory, **`bootstrapAllGather`** of each rank’s signal base pointer, device array **`signal_peer_addrs[peer]`** so a sender can compute the remote signal cell address (mirrors GDA’s `signal_raddrs`, without rkeys).
+- **Signals:** Fine-grained GPU memory via **`hipExtMallocWithFlags(..., hipDeviceMallocFinegrained)`** (not `rocshmem_malloc`). **`bootstrapAllGather`** of each rank’s signal base pointer into device array **`signalPeerAddrs[peer]`**; remote updates use **`__hip_atomic_fetch_add` with system scope** on the peer VA (same observable behaviour as `rocshmem_uint64_atomic_add`, without symmetric-heap lookup).
 - **Counters:** Local-only `uint64_t` array on device (same idea as API/GDA plugins).
-- **Ordering:** After `anvil::put`, use **`quiet`** when a **counter** is involved (must observe completion of the copy before bumping the local counter), else a **release fence** before `anvil::signal` when only a signal is used—aligned with the rocSHMEM API GIN template’s quiet/fence split.
+- **Ordering:** After `anvil::put`, use **`anvil::quiet`** when a **counter** is involved; else **`__builtin_amdgcn_fence(release, agent)`** before SDMA-fused signal, or **`__threadfence_system()`** after IPC flat stores before a separate signal atomic.
 
-**Reasoning:** Matches observable ordering from the API backend while using Anvil primitives instead of `rocshmem_fence` / `rocshmem_quiet`.
+**Reasoning:** Matches observable ordering from the API backend while using Anvil primitives and self-contained IPC helpers instead of `rocshmem_fence` / `rocshmem_quiet`.
 
 ## `anvil::signal` and `SignalAdd`
 
 The current Anvil helper **`signal()`** submits a fixed **64-bit atomic add of 1** (see `CreateAtomicIncPacket` in `anvil_device.hpp`). Arbitrary **`SignalAdd`** values are not implemented in this first revision.
 
 **Reasoning:** Documented limitation to avoid inventing new SDMA packet shapes without hardware review; **SignalInc** / default increment path matches the hardware packet already used by Anvil.
+
+## Small-message path (IPC flat stores)
+
+Transfers of at most **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** bytes (default 128 B, tunable via env) use **`ipcPut` / `ipcPutScalar`** from `gin_anvil_ipc_copy.h`: cached local loads plus **system-scope flat stores** to the peer GPU VA. This is the same mechanism rocSHMEM’s IPC `memcpy_lane` Put policy uses internally, inlined without `#include <rocshmem/rocshmem.hpp>` on the device.
+
+**Reasoning:** Benchmarks on MI355 show IPC flat stores win below ~128 B–1 KiB per message; Anvil SDMA has ~24.5 µs setup overhead and wins above the threshold. Keeping both paths avoids paying SDMA doorbell cost on tiny AlltoAll slices.
+
+## rocSHMEM API removal summary
+
+| Former rocSHMEM API | Replacement | Performance note |
+|---------------------|-------------|------------------|
+| `rocshmem_buffer_register_vmm` + `rocshmem_ptr` | `bootstrapAllGather` → `remoteVas[peer]` on mem handle | One HBM load vs constant-memory table scan |
+| `rocshmem_putmem` / `*_p` | `ipcPut` / `ipcPutScalar` to resolved peer VA | Identical flat-store instructions |
+| `rocshmem_uint64_atomic_add` | `ipcFlatAtomicAddSys64` on `signalPeerAddrs[peer]` | Same system-scope flat atomic |
+| `rocshmem_quiet` / `rocshmem_fence` | `anvil::quiet` (SDMA dirty queues) + `__threadfence_system` (IPC) | Avoids nocall into uninitialised rocSHMEM context |
+| `rocshmem_malloc` / `rocshmem_free` (signals) | `hipExtMallocWithFlags` fine-grained + `hipFree` | Required for xGMI peer atomics on signals |
+
+**Still in rocSHMEM (by design):** `rocshmem_gin_anvil_*` C factory and `rocshmem::anvil::*` SDMA device helpers live in `librocshmem` to avoid duplicating `AnvilLib` / KFD state inside `librccl.so`.
 
 ## Dirty bitmask and channel selection
 

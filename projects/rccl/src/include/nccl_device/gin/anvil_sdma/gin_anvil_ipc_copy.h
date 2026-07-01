@@ -112,6 +112,12 @@ NCCL_DEVICE_INLINE void ipcPutRemainder(uint8_t* dst, uint8_t* src, int remainde
   }
 }
 
+NCCL_DEVICE_INLINE void ipcFlatAtomicAddSys64(uint64_t* dst, uint64_t val) {
+  __hip_atomic_fetch_add(reinterpret_cast<unsigned long long*>(dst),
+                         static_cast<unsigned long long>(val), __ATOMIC_RELAXED,
+                         __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 }  // namespace detail
 
 NCCL_DEVICE_INLINE void ipcPutScalar(void* dst, const void* src, size_t bytes) {
