@@ -13,7 +13,7 @@
  * rocSHMEM's Anvil SDMA helpers (anvil::put / quiet / signal) directly — not rocshmem_putmem.
  */
 
-#include "gin/gin_host_rocshmem_api.h"
+#include "gin/gin_host_rocshmem_common.h"
 #include "gin/gin_host_rocshmem_anvil.h"
 #include "comm.h"
 #include "dev_runtime.h"
