@@ -14,9 +14,9 @@
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
 
-/** Default SDMA threshold (bytes). Transfers of at most this size use rocshmem_putmem;
- *  larger transfers use direct Anvil SDMA. Tuned for MI355: putmem wins below ~1 KiB
- *  per message; Anvil SDMA plateaus ~24.5 us for 2 KiB–64 KiB. */
+/** Default SDMA threshold (bytes). Transfers of at most this size use IPC flat stores
+ *  (gin_anvil_ipc_copy.h); larger transfers use direct Anvil SDMA. Tuned for MI355:
+ *  IPC put wins below ~128 B per message; Anvil SDMA plateaus ~24.5 us for 2 KiB–64 KiB. */
 // #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 1024u
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
@@ -28,6 +28,7 @@ struct ncclGinAnvilSdmaGPUContext {
   void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
   uint64_t* sdmaDirty;   // GIN-owned dirty bitmask (separate from rocSHMEM IPC SDMA)
   uint64_t* signals;
+  uintptr_t* signalPeerAddrs;  // per-rank remote signal buffer base (allgather at createContext)
   uint64_t* counters;
   uint32_t nSignals;
   uint32_t nCounters;
@@ -41,7 +42,8 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  uintptr_t baseAddr;  // Symmetric LSA flat VA; remote resolved via rocshmem_ptr
+  uintptr_t baseAddr;   // Local LSA flat VA (this rank)
+  uintptr_t* remoteVas; // Device array [peer] -> peer's base VA for this window
 };
 
 #endif
