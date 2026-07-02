@@ -9,7 +9,9 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 114
+#include "gin_anvil_ipc_table.h"
+
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 115
 
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
@@ -36,6 +38,8 @@ struct ncclGinAnvilSdmaGPUContext {
   int numChannels;
   int sdmaChannel;
   int sdmaChannelStride;
+  const ncclGinAnvilIpcBufEntry* ipcTable;  // device pointer; peer VA lookup for IPC puts
+  int ipcTableCount;
 };
 
 struct ncclGinAnvilSdmaMemHandle {

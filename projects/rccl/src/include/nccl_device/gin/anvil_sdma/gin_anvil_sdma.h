@@ -36,16 +36,21 @@ NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* r
   return signals + signalId;
 }
 
-NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaMemHandle* mh, int peer, size_t off) {
+NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaGPUContext* rsCtx, ncclGinAnvilSdmaMemHandle* mh,
+                                             int peer, size_t off) {
   void* sym = reinterpret_cast<void*>(loadConst(&mh->baseAddr) + off);
-  return ginAnvilResolvePeerVa(sym, peer);
+  const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+  int count = loadConst(&rsCtx->ipcTableCount);
+  return ginAnvilResolvePeerVa(sym, peer, table, count);
 }
 
 NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                               ncclGinSignal_t signalId) {
   uint64_t* signals = loadConst(&rsCtx->signals);
   if (signals == nullptr) return nullptr;
-  return reinterpret_cast<uint64_t*>(ginAnvilResolvePeerVa(signals + signalId, peer));
+  const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+  int count = loadConst(&rsCtx->ipcTableCount);
+  return reinterpret_cast<uint64_t*>(ginAnvilResolvePeerVa(signals + signalId, peer, table, count));
 }
 
 NCCL_DEVICE_INLINE bool useSdmaFusedSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
@@ -166,14 +171,16 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcOff);
 
       if (useIpcPut) {
-        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+        void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
         if (dstAddr != nullptr && srcAddr != nullptr) {
           ipcPut(dstAddr, srcAddr, bytes);
         }
       } else if (handle != nullptr) {
-        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+        void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
         if (dstAddr == nullptr) {
-          void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer);
+          const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+          int ipcCount = loadConst(&rsCtx->ipcTableCount);
+          void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
           if (fallbackDst != nullptr && srcAddr != nullptr) {
             ipcPut(fallbackDst, srcAddr, bytes);
           }
@@ -255,15 +262,17 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     bool sdmaFusedSignal = false;
 
     if (useIpcPut) {
-      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
       if (dstAddr != nullptr) {
         ipcPutScalar(dstAddr, &srcVal, bytes);
       }
     } else if (handle != nullptr) {
-      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
       if (dstAddr == nullptr) {
         void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
-        void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer);
+        const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+        int ipcCount = loadConst(&rsCtx->ipcTableCount);
+        void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
         if (fallbackDst != nullptr) {
           ipcPutScalar(fallbackDst, &srcVal, bytes);
         }

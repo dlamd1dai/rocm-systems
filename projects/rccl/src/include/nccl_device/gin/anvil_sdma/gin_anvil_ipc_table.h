@@ -23,25 +23,25 @@ struct ncclGinAnvilIpcBufEntry {
 #if defined(__HIPCC__) || defined(__CUDACC__)
 
 #include "../../hip_compat.h"
-
-extern __constant__ ncclGinAnvilIpcBufEntry nccl_gin_anvil_ipc_table[NCCL_GIN_ANVIL_IPC_MAX_BUFS];
-extern __constant__ int nccl_gin_anvil_ipc_table_count;
+#include "../../utility.h"
 
 namespace nccl {
 namespace gin {
 namespace anvil {
 namespace detail {
 
-NCCL_DEVICE_INLINE void* ginAnvilResolvePeerVa(void* localAddr, int peer) {
+NCCL_DEVICE_INLINE void* ginAnvilResolvePeerVa(void* localAddr, int peer,
+                                               const ncclGinAnvilIpcBufEntry* table, int count) {
+  if (table == nullptr || count <= 0) return nullptr;
   uintptr_t addr = reinterpret_cast<uintptr_t>(localAddr);
-  int count = nccl_gin_anvil_ipc_table_count;
   for (int b = 0; b < count; b++) {
-    uintptr_t base = nccl_gin_anvil_ipc_table[b].local_base;
-    size_t len = nccl_gin_anvil_ipc_table[b].length;
+    uintptr_t base = nccl::utility::loadConst(&table[b].local_base);
+    size_t len = nccl::utility::loadConst(&table[b].length);
     if (addr >= base && addr < base + len) {
       uintptr_t off = addr - base;
       if (peer < 0 || peer >= NCCL_GIN_ANVIL_IPC_MAX_RANKS) return nullptr;
-      return reinterpret_cast<void*>(nccl_gin_anvil_ipc_table[b].remote_bases[peer] + off);
+      uintptr_t remote = nccl::utility::loadConst(&table[b].remote_bases[peer]);
+      return reinterpret_cast<void*>(remote + off);
     }
   }
   return nullptr;
@@ -63,6 +63,7 @@ int ncclGinAnvilIpcTableRegisterVmm(void* localBase, size_t length, int myRank, 
 int ncclGinAnvilIpcTableRegisterExplicit(void* localBase, const uintptr_t* remoteBases, int nRanks,
                                          size_t length);
 int ncclGinAnvilIpcTableUnregister(void* localBase);
+void ncclGinAnvilIpcTableGetDevice(const ncclGinAnvilIpcBufEntry** outTable, int* outCount);
 
 #ifdef __cplusplus
 }

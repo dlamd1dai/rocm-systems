@@ -454,9 +454,11 @@ list(TRANSFORM SRC_FILES PREPEND "src/")
 #==================================================================================================
 if(ENABLE_ROCSHMEM_GIN)
   list(APPEND SRC_FILES
+    src/gin/gin_host_rocshmem_common.cc
     src/gin/gin_plugin_rocshmem_gda.cc
     src/gin/gin_rocshmem_gda_factory.cc
     src/gin/gin_plugin_rocshmem_anvil.cc
+    src/gin/gin_anvil_ipc_table_host.cc
   )
 endif()
 
