@@ -21,8 +21,12 @@
 #include "gin/gin_host_win_stub.h"
 #else
 #include "gin/gin_host.h"
+#ifdef ENABLE_ROCSHMEM_GIN
+#include "gin/gin_host_rocshmem_anvil.h"
+#endif
 #endif
 #include "argcheck.h"
+#include "bitops.h"
 #include <mutex>
 
 NCCL_PARAM(WinStride, "WIN_STRIDE", -1);
@@ -1329,6 +1333,8 @@ ncclResult_t ncclDevrCommCreateInternal(
   struct ncclDevrWindow* win = nullptr;
   struct ncclWindow_vidmem* winHost = nullptr;
   size_t ginSignalShadowsOffset = 0;
+  size_t ginAnvilNetSignalsOffset = 0;
+  int nGinContextsTotal = 0;
   void* outDevCommPreserve = nullptr;
   struct ncclDevComm outDevCommTmp;
 
@@ -1447,13 +1453,16 @@ ncclResult_t ncclDevrCommCreateInternal(
     bufSizeTotal= alignUp(bufSizeTotal, 128);
     ginSignalShadowsOffset = bufSizeTotal;
     bufSizeTotal += nGinContexts * ginSignalTotal * sizeof(uint64_t); // include signal shadows
+    ginAnvilNetSignalsOffset = bufSizeTotal;
+    if (devr->ginEnabled && ginSignalTotal > 0) {
+      int ginCommCount = comm->sharedRes->ginState.ginCommCount;
+      if (ginCommCount < 1) ginCommCount = 1;
+      nGinContextsTotal = ROUNDUP(nGinContexts, ginCommCount);
+      bufSizeTotal += (size_t)nGinContextsTotal * ginSignalTotal * sizeof(uint64_t);
+    } else {
+      nGinContextsTotal = nGinContexts;
+    }
     bufSizeTotal = alignUp(bufSizeTotal, devr->granularity);
-  }
-
-  if (devr->ginEnabled) {
-    reqs->ginSignalCount = ginSignalTotal;
-    reqs->ginCounterCount = ginCounterTotal;
-    NCCLCHECK(ncclGinDevCommSetup(comm, reqs, outDevComm));
   }
 
   CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, fail);
@@ -1522,6 +1531,19 @@ ncclResult_t ncclDevrCommCreateInternal(
     outDevComm->ginSignalShadows = (uint64_t*)add4G((char*)winHost->lsaFlatBase + ginSignalShadowsOffset, winHost->lsaRank*winHost->stride4G);
 
     CUDACHECKGOTO(cudaMemsetAsync(win->userPtr, 0, bufSizeTotal, stream), ret, fail_stream_mem_win);
+  }
+
+  if (devr->ginEnabled) {
+    reqs->ginSignalCount = ginSignalTotal;
+    reqs->ginCounterCount = ginCounterTotal;
+    NCCLCHECKGOTO(ncclGinDevCommSetup(comm, reqs, outDevComm), ret, fail_stream_mem_win);
+#ifdef ENABLE_ROCSHMEM_GIN
+    if (ginSignalTotal > 0 && win != nullptr) {
+      NCCLCHECKGOTO(ncclGinAnvilBindResourceWindowSignals(comm, win->userPtr, ginAnvilNetSignalsOffset,
+                                                          nGinContextsTotal, ginSignalTotal),
+                    ret, fail_stream_mem_win);
+    }
+#endif
   }
 
   CUDACHECKGOTO(cudaStreamSynchronize(stream), ret, fail_stream_mem_win);
