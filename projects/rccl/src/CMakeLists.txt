@@ -440,6 +440,7 @@ set(SRC_FILES
   gin/gin_host_rocshmem_common.cc
   gin/gin_plugin_rocshmem_gda.cc
   gin/gin_plugin_rocshmem_anvil.cc
+  gin/gin_anvil_ipc_table_host.cc
   gin/gin_rocshmem_gda_factory.cc
   include/latency_profiler/CollTrace.h
   include/latency_profiler/CollTraceEvent.h

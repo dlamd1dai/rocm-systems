@@ -9,24 +9,38 @@
 #include "nccl_device/gin/anvil_sdma/gin_anvil_ipc_table.h"
 #include <hip/hip_runtime.h>
 
-__constant__ ncclGinAnvilIpcBufEntry nccl_gin_anvil_ipc_table[NCCL_GIN_ANVIL_IPC_MAX_BUFS];
-__constant__ int nccl_gin_anvil_ipc_table_count = 0;
-
 namespace {
 
 ncclGinAnvilIpcBufEntry masterEntries[NCCL_GIN_ANVIL_IPC_MAX_BUFS];
 int masterEntryCount = 0;
 
+ncclGinAnvilIpcBufEntry* d_ipcTable = nullptr;
+int d_ipcTableCount = 0;
+int d_ipcTableCapacity = 0;
+
 static int syncTableToDevice() {
   int count = masterEntryCount;
   if (count > NCCL_GIN_ANVIL_IPC_MAX_BUFS) count = NCCL_GIN_ANVIL_IPC_MAX_BUFS;
+
+  if (count == 0) {
+    d_ipcTableCount = 0;
+    return 0;
+  }
+
+  if (count > d_ipcTableCapacity) {
+    if (d_ipcTable) (void)hipFree(d_ipcTable);
+    d_ipcTable = nullptr;
+    d_ipcTableCapacity = 0;
+    hipError_t err = hipMalloc(&d_ipcTable, count * sizeof(ncclGinAnvilIpcBufEntry));
+    if (err != hipSuccess) return -1;
+    d_ipcTableCapacity = count;
+  }
+
   hipError_t err =
-      hipMemcpyToSymbol(HIP_SYMBOL(nccl_gin_anvil_ipc_table), masterEntries,
-                        count * sizeof(ncclGinAnvilIpcBufEntry), 0, hipMemcpyHostToDevice);
+      hipMemcpy(d_ipcTable, masterEntries, count * sizeof(ncclGinAnvilIpcBufEntry), hipMemcpyHostToDevice);
   if (err != hipSuccess) return -1;
-  err = hipMemcpyToSymbol(HIP_SYMBOL(nccl_gin_anvil_ipc_table_count), &count, sizeof(int), 0,
-                          hipMemcpyHostToDevice);
-  return err == hipSuccess ? 0 : -1;
+  d_ipcTableCount = count;
+  return 0;
 }
 
 static int findEntryIndex(uintptr_t localBase) {
@@ -53,6 +67,11 @@ static int removeEntry(uintptr_t localBase) {
 }
 
 }  // namespace
+
+extern "C" void ncclGinAnvilIpcTableGetDevice(const ncclGinAnvilIpcBufEntry** outTable, int* outCount) {
+  if (outTable) *outTable = d_ipcTable;
+  if (outCount) *outCount = d_ipcTableCount;
+}
 
 extern "C" int ncclGinAnvilIpcTableRegisterVmm(void* localBase, size_t length, int myRank, int nRanks,
                                                ptrdiff_t strideBytes) {

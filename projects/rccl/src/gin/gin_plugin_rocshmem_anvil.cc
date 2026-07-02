@@ -8,7 +8,7 @@
 
 /**
  * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
- * Small messages use inlined IPC flat stores via GIN-owned constant-memory peer table.
+ * Small messages use inlined IPC flat stores via GIN-owned device-memory peer table in GPU context.
  * Large messages use standalone Anvil SDMA (rocshmem_gin_anvil_factory).
  */
 
@@ -357,6 +357,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
       goto fail;
     }
   }
+
+  ncclGinAnvilIpcTableGetDevice(&ctx->gpuCtxHost.ipcTable, &ctx->gpuCtxHost.ipcTableCount);
 
   if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
                 hipMemcpyHostToDevice) != hipSuccess) {
