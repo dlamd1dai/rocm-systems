@@ -10,7 +10,7 @@
 #include "../gin_device_common.h"
 #include "gin_anvil_sdma_device_host_common.h"
 #include "gin_anvil_ipc_copy.h"
-#include "gin_anvil_ipc_table.h"
+#include "gin_anvil_ipc_table_device.h"
 #include "sdma/anvil_device.hpp"
 #include "sdma/sdma_opcodes.h"
 
