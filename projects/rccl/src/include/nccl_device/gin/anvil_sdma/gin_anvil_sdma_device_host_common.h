@@ -42,8 +42,9 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  uintptr_t baseAddr;   // Local LSA flat VA (this rank)
-  uintptr_t* remoteVas; // Device array [peer] -> peer's base VA for this window
+  // Window base in this GPU's LSA flat address space (matches ncclWindow::lsaFlatBase).
+  uintptr_t lsaFlatBase;
+  uint32_t stride4G;  // devr->bigSize >> 32; peer stride for ncclGetLsaPointer-style lookup
 };
 
 #endif
