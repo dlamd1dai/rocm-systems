@@ -37,18 +37,18 @@ NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* r
   return signals + signalId;
 }
 
-// SDMA path: peer slot in local imported LSA flat layout (same as ncclGetLsaPointer).
-// `lsaPeer` is an LSA team rank index, not world rank.
-NCCL_DEVICE_INLINE void* resolveLsaPeerVa(ncclGinAnvilSdmaMemHandle* mh, int lsaPeer, size_t off) {
-  uintptr_t flatBase = loadConst(&mh->lsaFlatBase);
+// Peer VA on this GPU's imported symmetric heap (rocshmem_buffer_register_vmm layout).
+NCCL_DEVICE_INLINE void* resolveSymPeerVa(ncclGinAnvilSdmaMemHandle* mh, int myLsaRank,
+                                          int dstLsaRank, size_t off) {
+  uintptr_t selfBase = loadConst(&mh->baseAddr);
   uint32_t stride4G = loadConst(&mh->stride4G);
-  if (flatBase == 0 || stride4G == 0) return nullptr;
-  return reinterpret_cast<void*>(nccl::utility::add4G(flatBase, lsaPeer * static_cast<int>(stride4G)) + off);
+  if (selfBase == 0 || stride4G == 0) return nullptr;
+  int delta4G = (dstLsaRank - myLsaRank) * static_cast<int>(stride4G);
+  return reinterpret_cast<void*>(nccl::utility::add4G(selfBase, delta4G) + off);
 }
 
-// SDMA / cross-GPU: peer's native registration VA (allgathered at regMrSym).
-// `worldPeer` is a world-rank index into remoteVas[].
-NCCL_DEVICE_INLINE void* resolveIpcPeerVa(ncclGinAnvilSdmaMemHandle* mh, int worldPeer, size_t off) {
+// SDMA fallback: peer symmetric base from allgather + offset.
+NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaMemHandle* mh, int worldPeer, size_t off) {
   uintptr_t* remoteVas = loadConst(&mh->remoteVas);
   int nRanks = loadConst(&mh->nRanks);
   if (remoteVas == nullptr || worldPeer < 0 || worldPeer >= nRanks) return nullptr;
@@ -57,7 +57,6 @@ NCCL_DEVICE_INLINE void* resolveIpcPeerVa(ncclGinAnvilSdmaMemHandle* mh, int wor
   return reinterpret_cast<void*>(base + off);
 }
 
-// Map destination world rank to LSA flat slot (ncclGetPeerPointer indexing).
 NCCL_DEVICE_INLINE int worldRankToLsaSlot(ncclGinAnvilSdmaGPUContext* rsCtx, int worldPeer) {
   int lsaRank = loadConst(&rsCtx->lsaRank);
   int worldRank = loadConst(&rsCtx->rank);
@@ -163,8 +162,8 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
-    using nccl::gin::anvil::detail::resolveIpcPeerVa;
-    using nccl::gin::anvil::detail::resolveLsaPeerVa;
+    using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::resolveSymPeerVa;
     using nccl::gin::anvil::detail::worldRankToLsaSlot;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPut;
@@ -195,25 +194,18 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
       ncclGinAnvilSdmaMemHandle* srcMh = (ncclGinAnvilSdmaMemHandle*)srcWin;
-      int myWorldRank = loadConst(&rsCtx->rank);
-      int myLsaSlot = worldRankToLsaSlot(rsCtx, myWorldRank);
+      int myLsaSlot = worldRankToLsaSlot(rsCtx, loadConst(&rsCtx->rank));
       int dstLsaSlot = worldRankToLsaSlot(rsCtx, peer);
-      void* srcAddr = resolveLsaPeerVa(srcMh, myLsaSlot, srcOff);
+      void* srcAddr = resolveSymPeerVa(srcMh, myLsaSlot, myLsaSlot, srcOff);
 
       if (useIpcPut) {
-        // IPC flat stores target locally-imported LSA slots (ncclGetLsaPointer), not peer GPU VAs.
-        void* dstAddr = resolveLsaPeerVa(dstMh, dstLsaSlot, dstOff);
+        void* dstAddr = resolveSymPeerVa(dstMh, myLsaSlot, dstLsaSlot, dstOff);
         if (dstAddr != nullptr && srcAddr != nullptr) {
           ipcPut(dstAddr, srcAddr, bytes);
         }
       } else if (handle != nullptr) {
-        void* dstAddr = resolveLsaPeerVa(dstMh, dstLsaSlot, dstOff);
-        if (dstAddr == nullptr || srcAddr == nullptr) {
-          void* ipcDst = resolveIpcPeerVa(dstMh, peer, dstOff);
-          void* ipcSrc = resolveIpcPeerVa(srcMh, myWorldRank, srcOff);
-          if (ipcDst != nullptr && ipcSrc != nullptr) ipcPut(ipcDst, ipcSrc, bytes);
-          sdmaDataPath = false;
-        } else {
+        void* dstAddr = resolveSymPeerVa(dstMh, myLsaSlot, dstLsaSlot, dstOff);
+        if (dstAddr != nullptr && srcAddr != nullptr) {
           uint64_t* remoteSig = nullptr;
           if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
             remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
@@ -260,8 +252,8 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
-    using nccl::gin::anvil::detail::resolveIpcPeerVa;
-    using nccl::gin::anvil::detail::resolveLsaPeerVa;
+    using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::resolveSymPeerVa;
     using nccl::gin::anvil::detail::worldRankToLsaSlot;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPutScalar;
@@ -292,20 +284,18 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     if (useIpcPut) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
+      int myLsaSlot = worldRankToLsaSlot(rsCtx, loadConst(&rsCtx->rank));
       int dstLsaSlot = worldRankToLsaSlot(rsCtx, peer);
-      void* dstAddr = resolveLsaPeerVa(dstMh, dstLsaSlot, dstOff);
+      void* dstAddr = resolveSymPeerVa(dstMh, myLsaSlot, dstLsaSlot, dstOff);
       if (dstAddr != nullptr) {
         ipcPutScalar(dstAddr, &srcVal, bytes);
       }
     } else if (handle != nullptr) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
+      int myLsaSlot = worldRankToLsaSlot(rsCtx, loadConst(&rsCtx->rank));
       int dstLsaSlot = worldRankToLsaSlot(rsCtx, peer);
-      void* dstAddr = resolveLsaPeerVa(dstMh, dstLsaSlot, dstOff);
-      if (dstAddr == nullptr) {
-        void* ipcDst = resolveIpcPeerVa(dstMh, peer, dstOff);
-        if (ipcDst != nullptr) ipcPutScalar(ipcDst, &srcVal, bytes);
-        sdmaDataPath = false;
-      } else {
+      void* dstAddr = resolveSymPeerVa(dstMh, myLsaSlot, dstLsaSlot, dstOff);
+      if (dstAddr != nullptr) {
         uint64_t* remoteSig = nullptr;
         if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, /*hasCounter=*/false, signalOp)) {
           remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
