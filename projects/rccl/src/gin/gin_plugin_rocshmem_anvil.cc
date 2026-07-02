@@ -8,9 +8,8 @@
 
 /**
  * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
- * Host flow: regMrSym registers symmetric buffers with rocshmem_buffer_register_vmm
- * for constant-memory remote lookup; createContext allocates signals on the rocSHMEM heap.
- * Sub-threshold puts use rocshmem_putmem; larger transfers use standalone Anvil SDMA.
+ * Small messages use inlined IPC flat stores via GIN-owned constant-memory peer table.
+ * Large messages use standalone Anvil SDMA (rocshmem_gin_anvil_factory).
  */
 
 #include "gin/gin_host_rocshmem_common.h"
@@ -19,18 +18,14 @@
 #include "dev_runtime.h"
 #include "bootstrap.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_ipc_table.h"
 #include <rocshmem/gin_anvil_factory.h>
-#include <rocshmem/rocshmem.hpp>
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
 #include <map>
-#include <mutex>
 
-// Refcount for buffer registration: ncclGinRegister calls regMrSym once per connection.
 static std::map<void*, int> bufferRegRefcount;
-static std::mutex ginAnvilRocshmemInitMu;
-static bool ginAnvilRocshmemInited = false;
 
 struct ginAnvilCollCtx {
   int nranks;
@@ -52,6 +47,7 @@ struct ginAnvilGinCtx {
   int nSignals;
   int nCounters;
   bool hasError;
+  bool signalsRegistered;
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
@@ -71,44 +67,6 @@ struct ginAnvilListenCtx {
 
 static int ginAnvilBootstrapAllgather(void* ctx, void* buf, size_t perRankSize) {
   return (bootstrapAllGather(ctx, buf, (int)perRankSize) == ncclSuccess) ? 0 : -1;
-}
-
-// Lightweight rocSHMEM IPC init for GIN anvil (RCCL_ROCSHMEM_ENABLE=0 in perf tests).
-static ncclResult_t ginAnvilEnsureRocshmemInit(struct ncclComm* comm) {
-  std::lock_guard<std::mutex> lock(ginAnvilRocshmemInitMu);
-  if (ginAnvilRocshmemInited) return ncclSuccess;
-
-  int ret;
-  rocshmem::rocshmem_uniqueid_t rocshmemUniqueId;
-  rocshmem::rocshmem_init_attr_t rocshmemAttr;
-
-  if (comm->rank == 0) {
-    ret = rocshmem::rocshmem_get_uniqueid(&rocshmemUniqueId);
-    if (ret != rocshmem::ROCSHMEM_SUCCESS) {
-      WARN("GIN anvil-sdma: rocshmem_get_uniqueid failed");
-      return ncclSystemError;
-    }
-  }
-
-  NCCLCHECK(bootstrapBroadcast(comm->bootstrap, comm->rank, comm->nRanks, 0, &rocshmemUniqueId,
-                               sizeof(rocshmemUniqueId)));
-
-  ret = rocshmem::rocshmem_set_attr_uniqueid_args(comm->rank, comm->nRanks, &rocshmemUniqueId,
-                                                  &rocshmemAttr);
-  if (ret != rocshmem::ROCSHMEM_SUCCESS) {
-    WARN("GIN anvil-sdma: rocshmem_set_attr_uniqueid_args failed");
-    return ncclSystemError;
-  }
-
-  ret = rocshmem::rocshmem_init_attr(rocshmem::ROCSHMEM_INIT_WITH_UNIQUEID, &rocshmemAttr);
-  if (ret != rocshmem::ROCSHMEM_SUCCESS) {
-    WARN("GIN anvil-sdma: rocshmem_init_attr failed");
-    return ncclSystemError;
-  }
-
-  ginAnvilRocshmemInited = true;
-  INFO(NCCL_INIT, "GIN anvil-sdma: rocSHMEM IPC runtime initialized");
-  return ncclSuccess;
 }
 
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
@@ -170,13 +128,6 @@ static int ginAnvilSdmaNumChannelsFromEnv() {
   return v >= 1 && v <= 8 ? v : 1;
 }
 
-static uint32_t ginAnvilRocshmemSdmaEnabledFromEnv() {
-  const char* e = getenv("ROCSHMEM_SDMA_ENABLED");
-  if (!e || !e[0]) return 0u;
-  if (e[0] == '0' && e[1] == '\0') return 0u;
-  return atoi(e) != 0 ? 1u : 0u;
-}
-
 static uint32_t ginAnvilFusedSignalFromEnv() {
   const char* e = getenv("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL");
   if (!e || !e[0]) return NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT;
@@ -191,8 +142,6 @@ static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int 
   cctx->nranks = nranks;
   cctx->rank = rank;
   cctx->comm = ictx->comm;
-
-  NCCLCHECK(ginAnvilEnsureRocshmemInit(cctx->comm));
 
   int localDev = 0;
   if (hipGetDevice(&localDev) != hipSuccess) {
@@ -263,10 +212,10 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   }
 
   if (refcount == 0) {
-    int rc = rocshmem::rocshmem_buffer_register_vmm(lsaSelfAddr, size, devr->lsaSelf, devr->lsaSize,
-                                                    (ptrdiff_t)devr->bigSize);
+    int rc = ncclGinAnvilIpcTableRegisterVmm(lsaSelfAddr, size, devr->lsaSelf, devr->lsaSize,
+                                             (ptrdiff_t)devr->bigSize);
     if (rc != 0) {
-      WARN("GIN anvil-sdma: buffer register failed for %p (lsaSelf=%p) size %zu", data, lsaSelfAddr,
+      WARN("GIN anvil-sdma: IPC table register failed for %p (lsaSelf=%p) size %zu", data, lsaSelfAddr,
            size);
       bufferRegRefcount.erase(data);
       free(mh);
@@ -308,13 +257,30 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
     if (it != bufferRegRefcount.end()) {
       it->second--;
       if (it->second <= 0) {
-        if (mh->lsaSelfAddr) (void)rocshmem::rocshmem_buffer_unregister(mh->lsaSelfAddr);
+        if (mh->lsaSelfAddr) (void)ncclGinAnvilIpcTableUnregister(mh->lsaSelfAddr);
         bufferRegRefcount.erase(it);
       }
     }
   }
   if (mh->devHandle) (void)hipFree(mh->devHandle);
   free(mh);
+  return ncclSuccess;
+}
+
+static ncclResult_t ginAnvilRegisterSignals(ginAnvilCollCtx* cctx, uint64_t* signals, int nSignals) {
+  uintptr_t* remoteHost = (uintptr_t*)malloc(sizeof(uintptr_t) * cctx->nranks);
+  if (!remoteHost) return ncclSystemError;
+
+  remoteHost[cctx->rank] = (uintptr_t)signals;
+  NCCLCHECK(bootstrapAllGather(cctx->comm->bootstrap, remoteHost, sizeof(uintptr_t)));
+
+  size_t bytes = sizeof(uint64_t) * nSignals;
+  if (ncclGinAnvilIpcTableRegisterExplicit(signals, remoteHost, cctx->nranks, bytes) != 0) {
+    free(remoteHost);
+    WARN("GIN anvil-sdma: signal IPC table register failed");
+    return ncclSystemError;
+  }
+  free(remoteHost);
   return ncclSuccess;
 }
 
@@ -328,6 +294,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->nSignals = config->nSignals;
   ctx->nCounters = config->nCounters;
   ctx->hasError = false;
+  ctx->signalsRegistered = false;
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
@@ -339,8 +306,6 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
     ret = ncclSystemError;
     goto fail;
   }
-
-  NCCLCHECKGOTO(ginAnvilEnsureRocshmemInit(cctx->comm), ret, fail);
 
   NCCLCHECK(ncclCalloc(&ctx->devHandle, 1));
   ctx->devHandle->netDeviceType = NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
@@ -365,13 +330,11 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
-  ctx->gpuCtxHost.rocshmemSdmaEnabled = ginAnvilRocshmemSdmaEnabledFromEnv();
 
   if (config->nSignals > 0) {
-    ctx->gpuCtxHost.signals =
-        (uint64_t*)rocshmem::rocshmem_malloc(sizeof(uint64_t) * config->nSignals);
-    if (!ctx->gpuCtxHost.signals) {
-      WARN("GIN anvil-sdma: rocshmem_malloc failed for %d signals", config->nSignals);
+    if (hipExtMallocWithFlags((void**)&ctx->gpuCtxHost.signals, sizeof(uint64_t) * config->nSignals,
+                              hipDeviceMallocFinegrained) != hipSuccess) {
+      WARN("GIN anvil-sdma: hipExtMallocWithFlags failed for %d signals", config->nSignals);
       ret = ncclSystemError;
       goto fail;
     }
@@ -379,6 +342,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
       ret = ncclSystemError;
       goto fail;
     }
+    NCCLCHECKGOTO(ginAnvilRegisterSignals(cctx, ctx->gpuCtxHost.signals, config->nSignals), ret, fail);
+    ctx->signalsRegistered = true;
   }
 
   if (config->nCounters > 0) {
@@ -407,15 +372,17 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   *outDevHandle = ctx->devHandle;
   INFO(NCCL_INIT,
        "GIN anvil-sdma: context created (v%d, %d signals, %d counters, sdmaThreshold=%u, spread=%d, "
-       "fusedSignal=%u, rocshmemSdma=%u)",
+       "fusedSignal=%u)",
        NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters,
-       ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal,
-       ctx->gpuCtxHost.rocshmemSdmaEnabled);
+       ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
   return ncclSuccess;
 
 fail:
   if (ctx) {
-    if (ctx->gpuCtxHost.signals) rocshmem::rocshmem_free(ctx->gpuCtxHost.signals);
+    if (ctx->signalsRegistered && ctx->gpuCtxHost.signals) {
+      (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
+    }
+    if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
     if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
     if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
     free(ctx->devHandle);
@@ -427,7 +394,10 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
-  if (ctx->gpuCtxHost.signals) rocshmem::rocshmem_free(ctx->gpuCtxHost.signals);
+  if (ctx->signalsRegistered && ctx->gpuCtxHost.signals) {
+    (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
+  }
+  if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
   if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
   free(ctx->devHandle);
