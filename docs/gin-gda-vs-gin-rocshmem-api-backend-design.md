@@ -14,7 +14,7 @@ Read and understand GIN-GDA backend design and GIN-ROCSHMEM-API backend design. 
 
 ## Assistant reply (summary of sources)
 
-Sources: RCCL in-tree docs (`docs/docker-gin-gda-ruby-gin-backends-and-tests.md`), built-in plugins `projects/rccl/src/gin/gin_plugin_rocshmem_api.cc` and `gin_plugin_rocshmem_gda.cc`, and device templates `projects/rccl/src/include/nccl_device/gin/rocshmem_api/gin_rocshmem_api.h` and `rocshmem_gda/gin_rocshmem_gda.h`.
+Sources: RCCL in-tree docs (`docs/gin-anvil-sdma-backend-tests.md`), built-in plugins `projects/rccl/src/gin/gin_plugin_rocshmem_gda.cc`, and device templates `projects/rccl/src/include/nccl_device/gin/rocshmem_gda/gin_rocshmem_gda.h`.
 
 ### What they share
 
@@ -28,7 +28,7 @@ Both are **GIN net-device plugins**: they expose `ncclNetProperties_v12_t::netDe
 | Plugin name / `props->name` | `"rocshmem"` | `"rocshmem-gda"` |
 | Doc summary | Device puts on top of **rocSHMEM’s public API**; **`ROCSHMEM_SDMA_ENABLED`** steers **SDMA policy** inside rocSHMEM (not GDA QPs). | Device puts on **GDA `QueuePair`s** built by RCCL’s **GIN GDA factory** (NIC → IB/DV → QP lifecycle); datapath is **`put_nbi`** on the QP. **GDA** lives under `rocshmem/src/gda/`, distinct from Anvil SDMA. |
 
-High-level split: see `docs/docker-gin-gda-ruby-gin-backends-and-tests.md` (section 2).
+High-level split: see `docs/gin-anvil-sdma-backend-tests.md` (section 2).
 
 ### 2. Host init and when the plugin “accepts” load
 
