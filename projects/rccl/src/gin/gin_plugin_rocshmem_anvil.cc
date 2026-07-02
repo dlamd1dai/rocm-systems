@@ -42,17 +42,54 @@ struct ginAnvilGinCtx {
   ncclNetDeviceHandle_v11_t* devHandle;
   ncclGinAnvilSdmaGPUContext* gpuCtxDev;
   ncclGinAnvilSdmaGPUContext gpuCtxHost;
+  struct ncclComm* comm;
   int nRanks;
   int rank;
   int nSignals;
   int nCounters;
+  int signalSlot;
   bool hasError;
-  bool signalsRegistered;
+  bool signalsBound;
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
   int sdmaChannelStride;
 };
+
+struct GinAnvilPendingEntry {
+  ginAnvilGinCtx* ctx;
+  GinAnvilPendingEntry* next;
+};
+
+static std::map<struct ncclComm*, GinAnvilPendingEntry*> g_pendingByComm;
+static std::map<struct ncclComm*, int> g_nextSignalSlot;
+
+static void ginAnvilPendingAdd(struct ncclComm* comm, ginAnvilGinCtx* ctx) {
+  auto* e = new GinAnvilPendingEntry{ctx, g_pendingByComm[comm]};
+  g_pendingByComm[comm] = e;
+}
+
+static void ginAnvilPendingRemove(struct ncclComm* comm, ginAnvilGinCtx* ctx) {
+  GinAnvilPendingEntry** prev = &g_pendingByComm[comm];
+  for (GinAnvilPendingEntry* e = g_pendingByComm[comm]; e != nullptr; e = e->next) {
+    if (e->ctx == ctx) {
+      *prev = e->next;
+      delete e;
+      return;
+    }
+    prev = &e->next;
+  }
+}
+
+static void ginAnvilPendingClear(struct ncclComm* comm) {
+  for (GinAnvilPendingEntry* e = g_pendingByComm[comm]; e != nullptr;) {
+    GinAnvilPendingEntry* next = e->next;
+    delete e;
+    e = next;
+  }
+  g_pendingByComm.erase(comm);
+  g_nextSignalSlot.erase(comm);
+}
 
 struct ginAnvilMemHandle {
   ncclGinAnvilSdmaMemHandle* devHandle;
@@ -267,21 +304,56 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   return ncclSuccess;
 }
 
-static ncclResult_t ginAnvilRegisterSignals(ginAnvilCollCtx* cctx, uint64_t* signals, int nSignals) {
-  uintptr_t* remoteHost = (uintptr_t*)malloc(sizeof(uintptr_t) * cctx->nranks);
-  if (!remoteHost) return ncclSystemError;
-
-  remoteHost[cctx->rank] = (uintptr_t)signals;
-  NCCLCHECK(bootstrapAllGather(cctx->comm->bootstrap, remoteHost, sizeof(uintptr_t)));
-
-  size_t bytes = sizeof(uint64_t) * nSignals;
-  if (ncclGinAnvilIpcTableRegisterExplicit(signals, remoteHost, cctx->nranks, bytes) != 0) {
-    free(remoteHost);
-    WARN("GIN anvil-sdma: signal IPC table register failed");
+static ncclResult_t ginAnvilRegisterLsaSignals(ginAnvilGinCtx* ctx, void* lsaSelf, size_t bytes) {
+  struct ncclDevrState* devr = &ctx->comm->devrState;
+  int rc = ncclGinAnvilIpcTableRegisterVmm(lsaSelf, bytes, devr->lsaSelf, devr->lsaSize,
+                                           (ptrdiff_t)devr->bigSize);
+  if (rc != 0) {
+    WARN("GIN anvil-sdma: LSA signal IPC table register failed for %p size %zu", lsaSelf, bytes);
     return ncclSystemError;
   }
-  free(remoteHost);
+  ctx->gpuCtxHost.signals = (uint64_t*)lsaSelf;
+  ctx->signalsBound = true;
+  if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
+                hipMemcpyHostToDevice) != hipSuccess) {
+    return ncclSystemError;
+  }
+  INFO(NCCL_INIT,
+       "GIN anvil-sdma: bound LSA signals slot=%d lsaSelf=%p +%zu (rank %d, lsaSize=%d, bigSize=%zu)",
+       ctx->signalSlot, lsaSelf, bytes, devr->lsaSelf, devr->lsaSize, (size_t)devr->bigSize);
   return ncclSuccess;
+}
+
+ncclResult_t ncclGinAnvilBindResourceWindowSignals(struct ncclComm* comm, void* resourceUserPtr,
+                                                   size_t arenaByteOffset, int nContexts,
+                                                   int nSignalsPerContext) {
+  if (!comm || !resourceUserPtr || nContexts < 1 || nSignalsPerContext < 1) return ncclInvalidArgument;
+
+  ncclResult_t ret = ncclSuccess;
+  for (GinAnvilPendingEntry* e = g_pendingByComm[comm]; e != nullptr; e = e->next) {
+    ginAnvilGinCtx* ctx = e->ctx;
+    if (ctx->nSignals <= 0) continue;
+    if (ctx->signalSlot < 0 || ctx->signalSlot >= nContexts) {
+      WARN("GIN anvil-sdma: signal slot %d out of range (nContexts=%d)", ctx->signalSlot, nContexts);
+      return ncclInvalidArgument;
+    }
+
+    size_t off = arenaByteOffset + (size_t)ctx->signalSlot * (size_t)nSignalsPerContext * sizeof(uint64_t);
+    void* localPtr = (char*)resourceUserPtr + off;
+    void* lsaSelf = nullptr;
+    NCCLCHECK(ncclDevrGetLsaSelfAddr(&comm->devrState, localPtr, &lsaSelf));
+    if (lsaSelf == nullptr) {
+      WARN("GIN anvil-sdma: could not resolve LSA flat addr for resource-window signals at %p", localPtr);
+      return ncclSystemError;
+    }
+
+    size_t bytes = (size_t)ctx->nSignals * sizeof(uint64_t);
+    NCCLCHECKGOTO(ginAnvilRegisterLsaSignals(ctx, lsaSelf, bytes), ret, fail);
+  }
+
+fail:
+  ginAnvilPendingClear(comm);
+  return ret;
 }
 
 static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* config, void** outGinCtx,
@@ -293,8 +365,10 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->rank = cctx->rank;
   ctx->nSignals = config->nSignals;
   ctx->nCounters = config->nCounters;
+  ctx->comm = cctx->comm;
+  ctx->signalSlot = g_nextSignalSlot[cctx->comm]++;
   ctx->hasError = false;
-  ctx->signalsRegistered = false;
+  ctx->signalsBound = false;
   ctx->gpu_queue_handles = cctx->gpu_queue_handles;
   ctx->sdma_dirty_d = cctx->sdma_dirty_d;
   ctx->numChannels = cctx->numChannels;
@@ -330,21 +404,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
-
-  if (config->nSignals > 0) {
-    if (hipExtMallocWithFlags((void**)&ctx->gpuCtxHost.signals, sizeof(uint64_t) * config->nSignals,
-                              hipDeviceMallocFinegrained) != hipSuccess) {
-      WARN("GIN anvil-sdma: hipExtMallocWithFlags failed for %d signals", config->nSignals);
-      ret = ncclSystemError;
-      goto fail;
-    }
-    if (hipMemset(ctx->gpuCtxHost.signals, 0, sizeof(uint64_t) * config->nSignals) != hipSuccess) {
-      ret = ncclSystemError;
-      goto fail;
-    }
-    NCCLCHECKGOTO(ginAnvilRegisterSignals(cctx, ctx->gpuCtxHost.signals, config->nSignals), ret, fail);
-    ctx->signalsRegistered = true;
-  }
+  ctx->gpuCtxHost.signals = nullptr;
 
   if (config->nCounters > 0) {
     if (hipExtMallocWithFlags((void**)&ctx->gpuCtxHost.counters, sizeof(uint64_t) * config->nCounters,
@@ -369,24 +429,28 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
   ncclGinAnvilIpcTableTrackContext(&ctx->gpuCtxHost, ctx->gpuCtxDev);
 
+  if (config->nSignals > 0) {
+    ginAnvilPendingAdd(cctx->comm, ctx);
+  }
+
   ctx->devHandle->handle = ctx->gpuCtxDev;
   ctx->devHandle->size = sizeof(ncclGinAnvilSdmaGPUContext);
 
   *outGinCtx = ctx;
   *outDevHandle = ctx->devHandle;
   INFO(NCCL_INIT,
-       "GIN anvil-sdma: context created (v%d, %d signals, %d counters, sdmaThreshold=%u, spread=%d, "
+       "GIN anvil-sdma: context created (v%d, %d signals, %d counters, signalSlot=%d, sdmaThreshold=%u, spread=%d, "
        "fusedSignal=%u)",
-       NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters,
+       NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters, ctx->signalSlot,
        ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
   return ncclSuccess;
 
 fail:
   if (ctx) {
-    if (ctx->signalsRegistered && ctx->gpuCtxHost.signals) {
+    if (ctx->comm) ginAnvilPendingRemove(ctx->comm, ctx);
+    if (ctx->signalsBound && ctx->gpuCtxHost.signals) {
       (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
     }
-    if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
     if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
     if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
     free(ctx->devHandle);
@@ -398,11 +462,11 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
+  if (ctx->comm) ginAnvilPendingRemove(ctx->comm, ctx);
   ncclGinAnvilIpcTableUntrackContext(&ctx->gpuCtxHost);
-  if (ctx->signalsRegistered && ctx->gpuCtxHost.signals) {
+  if (ctx->signalsBound && ctx->gpuCtxHost.signals) {
     (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
   }
-  if (ctx->gpuCtxHost.signals) (void)hipFree(ctx->gpuCtxHost.signals);
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
   if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
   free(ctx->devHandle);
