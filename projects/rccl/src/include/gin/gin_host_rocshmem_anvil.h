@@ -11,4 +11,9 @@
 
 extern ncclGin_t ncclGinRocshmemAnvilPlugin;
 
+struct ncclComm;
+ncclResult_t ncclGinAnvilBindResourceWindowSignals(struct ncclComm* comm, void* resourceUserPtr,
+                                                   size_t arenaByteOffset, int nContexts,
+                                                   int nSignalsPerContext);
+
 #endif
