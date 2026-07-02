@@ -367,6 +367,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
     goto fail;
   }
 
+  ncclGinAnvilIpcTableTrackContext(&ctx->gpuCtxHost, ctx->gpuCtxDev);
+
   ctx->devHandle->handle = ctx->gpuCtxDev;
   ctx->devHandle->size = sizeof(ncclGinAnvilSdmaGPUContext);
 
@@ -396,6 +398,7 @@ fail:
 static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   ginAnvilGinCtx* ctx = (ginAnvilGinCtx*)ginCtx;
   if (!ctx) return ncclSuccess;
+  ncclGinAnvilIpcTableUntrackContext(&ctx->gpuCtxHost);
   if (ctx->signalsRegistered && ctx->gpuCtxHost.signals) {
     (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
   }
