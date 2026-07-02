@@ -1,7 +1,7 @@
 #! /usr/bin/env bash
 # Single-node GIN alltoall perf harness (docker, non-Ruby).
 # Usage: ./docker-gin-gda-sdma-test.bash [NP] [MAX_BYTES]
-# Options: docs/docker-gin-gda-ruby-gin-backends-and-tests.md
+# Options: docs/gin-anvil-sdma-backend-tests.md
 
 NP=${1:-8}
 MAX_BYTES="${2:-128M}"
