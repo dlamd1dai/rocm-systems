@@ -9,17 +9,16 @@
 /**
  * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
  * Small messages use inlined IPC flat stores via GIN-owned device-memory peer table in GPU context.
- * Large messages use standalone Anvil SDMA (rocshmem_gin_anvil_factory).
+ * Large messages use standalone Anvil SDMA (gin_anvil_sdma_factory).
  */
 
-#include "gin/gin_host_rocshmem_common.h"
-#include "gin/gin_host_rocshmem_anvil.h"
+#include "gin/gin_host_anvil_sdma.h"
 #include "comm.h"
 #include "dev_runtime.h"
 #include "bootstrap.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_ipc_table.h"
-#include <rocshmem/gin_anvil_factory.h>
+#include <gin_anvil/sdma_factory.h>
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
@@ -27,11 +26,15 @@
 
 static std::map<void*, int> bufferRegRefcount;
 
+struct ginAnvilInitCtx {
+  struct ncclComm* comm;
+};
+
 struct ginAnvilCollCtx {
   int nranks;
   int rank;
   struct ncclComm* comm;
-  rocshmem_gin_anvil_handle_t anvil;
+  gin_anvil_sdma_handle_t sdma;
   void** gpu_queue_handles;
   uint64_t* sdma_dirty_d;
   int numChannels;
@@ -106,11 +109,15 @@ static int ginAnvilBootstrapAllgather(void* ctx, void* buf, size_t perRankSize) 
   return (bootstrapAllGather(ctx, buf, (int)perRankSize) == ncclSuccess) ? 0 : -1;
 }
 
+void ncclGinAnvilSetInitContext(void* initCtx, struct ncclComm* comm) {
+  static_cast<ginAnvilInitCtx*>(initCtx)->comm = comm;
+}
+
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
   const char* gin_type = getenv("NCCL_GIN_TYPE");
   if (gin_type && atoi(gin_type) != NCCL_NET_DEVICE_GIN_ANVIL_SDMA) return ncclInternalError;
-  if (rocshmem_gin_anvil_probe() <= 0) return ncclInternalError;
-  struct ginRocshmemInitCtx* ictx = new ginRocshmemInitCtx{};
+  if (gin_anvil_sdma_probe() <= 0) return ncclInternalError;
+  auto* ictx = new ginAnvilInitCtx{};
   *ctx = ictx;
   return ncclSuccess;
 }
@@ -141,13 +148,8 @@ static ncclResult_t ginAnvilListen(void* ctx, int dev, void* handle, void** list
   return ncclSuccess;
 }
 
-static int ginAnvilEnvInt(const char* primary, const char* fallback, int defaultVal) {
-  const char* e = getenv(primary);
-  if (e && e[0]) {
-    int v = atoi(e);
-    return v > 0 ? v : defaultVal;
-  }
-  e = getenv(fallback);
+static int ginAnvilEnvInt(const char* name, int defaultVal) {
+  const char* e = getenv(name);
   if (e && e[0]) {
     int v = atoi(e);
     return v > 0 ? v : defaultVal;
@@ -156,12 +158,11 @@ static int ginAnvilEnvInt(const char* primary, const char* fallback, int default
 }
 
 static int ginAnvilSdmaThresholdFromEnv() {
-  return ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "ROCSHMEM_SDMA_THRESHOLD",
-                        (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
+  return ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_THRESHOLD", (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
 }
 
 static int ginAnvilSdmaNumChannelsFromEnv() {
-  int v = ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS", "ROCSHMEM_SDMA_NUM_CHANNELS", 1);
+  int v = ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS", 1);
   return v >= 1 && v <= 8 ? v : 1;
 }
 
@@ -174,7 +175,7 @@ static uint32_t ginAnvilFusedSignalFromEnv() {
 
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,
                                     void** collComm) {
-  struct ginRocshmemInitCtx* ictx = (struct ginRocshmemInitCtx*)ctx;
+  auto* ictx = (ginAnvilInitCtx*)ctx;
   auto* cctx = new ginAnvilCollCtx{};
   cctx->nranks = nranks;
   cctx->rank = rank;
@@ -188,21 +189,21 @@ static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int 
 
   int numCh = ginAnvilSdmaNumChannelsFromEnv();
 
-  rocshmem_gin_anvil_handle_t h = nullptr;
+  gin_anvil_sdma_handle_t h = nullptr;
   void* gpu_handles = nullptr;
   uint64_t* dirty = nullptr;
-  if (rocshmem_gin_anvil_create(nranks, rank, localDev, ginAnvilBootstrapAllgather, cctx->comm->bootstrap,
-                               numCh, &h, &gpu_handles, &dirty) != 0) {
-    WARN("GIN anvil-sdma: rocshmem_gin_anvil_create failed");
+  if (gin_anvil_sdma_create(nranks, rank, localDev, ginAnvilBootstrapAllgather, cctx->comm->bootstrap, numCh,
+                            &h, &gpu_handles, &dirty) != 0) {
+    WARN("GIN anvil-sdma: gin_anvil_sdma_create failed");
     delete cctx;
     return ncclSystemError;
   }
 
-  cctx->anvil = h;
+  cctx->sdma = h;
   cctx->gpu_queue_handles = (void**)gpu_handles;
   cctx->sdma_dirty_d = dirty;
-  cctx->numChannels = rocshmem_gin_anvil_get_num_channels(h);
-  cctx->sdmaChannelStride = rocshmem_gin_anvil_get_channel_stride(h);
+  cctx->numChannels = gin_anvil_sdma_get_num_channels(h);
+  cctx->sdmaChannelStride = gin_anvil_sdma_get_channel_stride(h);
 
   INFO(NCCL_INIT, "GIN anvil-sdma: standalone SDMA queues (%d ranks, %d ch, spread=%d)", nranks,
        cctx->numChannels, cctx->sdmaChannelStride);
@@ -218,14 +219,14 @@ static ncclResult_t ginAnvilCloseListen(void* listenComm) {
 static ncclResult_t ginAnvilCloseColl(void* collComm) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
   if (cctx) {
-    if (cctx->anvil) rocshmem_gin_anvil_destroy(cctx->anvil);
+    if (cctx->sdma) gin_anvil_sdma_destroy(cctx->sdma);
     delete cctx;
   }
   return ncclSuccess;
 }
 
 static ncclResult_t ginAnvilFinalize(void* ctx) {
-  delete (ginRocshmemInitCtx*)ctx;
+  delete (ginAnvilInitCtx*)ctx;
   return ncclSuccess;
 }
 
@@ -375,8 +376,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->sdmaChannelStride = cctx->sdmaChannelStride;
 
   if (!cctx->gpu_queue_handles || !cctx->sdma_dirty_d) {
-    WARN("GIN anvil-sdma: missing SDMA infrastructure (handles=%p dirty=%p)",
-         cctx->gpu_queue_handles, (void*)cctx->sdma_dirty_d);
+    WARN("GIN anvil-sdma: missing SDMA infrastructure (handles=%p dirty=%p)", cctx->gpu_queue_handles,
+         (void*)cctx->sdma_dirty_d);
     ret = ncclSystemError;
     goto fail;
   }
@@ -420,8 +421,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
 
   ncclGinAnvilIpcTableGetDevice(&ctx->gpuCtxHost.ipcTable, &ctx->gpuCtxHost.ipcTableCount);
 
-  if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
-                hipMemcpyHostToDevice) != hipSuccess) {
+  if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext), hipMemcpyHostToDevice) !=
+      hipSuccess) {
     WARN("GIN anvil-sdma: hipMemcpy gpu context failed");
     ret = ncclSystemError;
     goto fail;
@@ -439,8 +440,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   *outGinCtx = ctx;
   *outDevHandle = ctx->devHandle;
   INFO(NCCL_INIT,
-       "GIN anvil-sdma: context created (v%d, %d signals, %d counters, signalSlot=%d, sdmaThreshold=%u, spread=%d, "
-       "fusedSignal=%u)",
+       "GIN anvil-sdma: context created (v%d, %d signals, %d counters, signalSlot=%d, sdmaThreshold=%u, "
+       "spread=%d, fusedSignal=%u)",
        NCCL_GIN_ANVIL_SDMA_NET_VERSION, config->nSignals, config->nCounters, ctx->signalSlot,
        ctx->gpuCtxHost.sdmaThreshold, ctx->gpuCtxHost.sdmaChannelStride, ctx->gpuCtxHost.fusedSdmaSignal);
   return ncclSuccess;
@@ -481,7 +482,7 @@ static ncclResult_t ginAnvilQueryLastError(void* ginCtx, bool* hasError) {
   return ncclSuccess;
 }
 
-__attribute__((visibility("default"))) ncclGin_t ncclGinRocshmemAnvilPlugin = {
+__attribute__((visibility("default"))) ncclGin_t ncclGinAnvilSdmaPlugin = {
     .name = "gin-anvil-sdma",
     .init = ginAnvilInit,
     .devices = ginAnvilDevices,

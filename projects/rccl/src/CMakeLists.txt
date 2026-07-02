@@ -143,7 +143,7 @@ set(SRC_FILES
   include/gin/gin_host_proxy.h
   include/gin/gin_host_rocshmem_common.h
   include/gin/gin_host_rocshmem_gda.h
-  include/gin/gin_host_rocshmem_anvil.h
+  include/gin/gin_host_anvil_sdma.h
   include/gin/gin_rocshmem_gda_factory.h
   include/hip_rocm_version_info.h
   include/ibvcore.h
@@ -440,7 +440,7 @@ set(SRC_FILES
   gin/gin_host_proxy.cc
   gin/gin_host_rocshmem_common.cc
   gin/gin_plugin_rocshmem_gda.cc
-  gin/gin_plugin_rocshmem_anvil.cc
+  gin/gin_plugin_anvil_sdma.cc
   gin/gin_anvil_ipc_table_host.cc
   gin/gin_rocshmem_gda_factory.cc
   include/latency_profiler/CollTrace.h
