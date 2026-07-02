@@ -22,7 +22,7 @@
 #else
 #include "gin/gin_host.h"
 #ifdef ENABLE_ROCSHMEM_GIN
-#include "gin/gin_host_rocshmem_anvil.h"
+#include "gin/gin_host_anvil_sdma.h"
 #endif
 #endif
 #include "argcheck.h"

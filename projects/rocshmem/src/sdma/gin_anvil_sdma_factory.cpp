@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  *****************************************************************************/
 
-#include <rocshmem/gin_anvil_factory.h>
+#include <gin_anvil/sdma_factory.h>
 
 #include "anvil.hpp"
 #include <hip/hip_runtime.h>
@@ -15,32 +15,30 @@
 
 #include "log.hpp"
 
-struct rocshmem_gin_anvil_opaque {
+struct gin_anvil_sdma_opaque {
   int nRanks;
   int numChannels;
   int myRank;
   int myDeviceId;
   int sdmaChannelStride;
-  rocshmem::anvil::SdmaQueueDeviceHandle** deviceHandles_d;
+  gin_anvil::sdma::SdmaQueueDeviceHandle** deviceHandles_d;
   uint64_t* sdmaDirty_d;
 };
 
-extern "C" int rocshmem_gin_anvil_probe(void) {
+extern "C" int gin_anvil_sdma_probe(void) {
   int ndev = 0;
   if (hipGetDeviceCount(&ndev) != hipSuccess || ndev < 1) return 0;
-  return rocshmem::anvil::initEndpoint() ? 1 : 0;
+  return gin_anvil::sdma::initEndpoint() ? 1 : 0;
 }
 
 static int checkHip(hipError_t e, const char* what) {
   if (e != hipSuccess) {
-    LOG_ERROR("rocshmem_gin_anvil: %s: %s", what, hipGetErrorString(e));
+    LOG_ERROR("gin_anvil_sdma: %s: %s", what, hipGetErrorString(e));
     return -1;
   }
   return 0;
 }
 
-// Mirrors ROCSHMEM_SDMA_SPREAD_CHANNELS / default-context assignSdmaChannel:
-// stride=1 spreads wavefronts across channels; stride=0 pins to sdmaChannel.
 static int ginAnvilSpreadChannelsFromEnv() {
   const char* e = getenv("NCCL_GIN_ANVIL_SDMA_SPREAD_CHANNELS");
   if (!e || !e[0]) return 1;
@@ -48,11 +46,11 @@ static int ginAnvilSpreadChannelsFromEnv() {
   return atoi(e) != 0 ? 1 : 0;
 }
 
-extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_id,
-                                         int (*allgather)(void* ctx, void* buf, size_t bytes_per_rank),
-                                         void* allgather_ctx, int num_channels,
-                                         rocshmem_gin_anvil_handle_t* out_handle, void** out_gpu_handles,
-                                         uint64_t** out_sdma_dirty) {
+extern "C" int gin_anvil_sdma_create(int nRanks, int myRank, int my_device_id,
+                                     int (*allgather)(void* ctx, void* buf, size_t bytes_per_rank),
+                                     void* allgather_ctx, int num_channels,
+                                     gin_anvil_sdma_handle_t* out_handle, void** out_gpu_handles,
+                                     uint64_t** out_sdma_dirty) {
   if (!out_handle || !out_gpu_handles || !out_sdma_dirty || !allgather || nRanks < 1 || myRank < 0 ||
       myRank >= nRanks)
     return -1;
@@ -62,61 +60,57 @@ extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_i
   std::vector<int> devs(static_cast<size_t>(nRanks), -1);
   devs[static_cast<size_t>(myRank)] = my_device_id;
   if (allgather(allgather_ctx, devs.data(), sizeof(int)) != 0) {
-    LOG_ERROR("rocshmem_gin_anvil: allgather(device ids) failed");
+    LOG_ERROR("gin_anvil_sdma: allgather(device ids) failed");
     return -1;
   }
 
   for (int i = 0; i < nRanks; ++i) {
     if (devs[static_cast<size_t>(i)] < 0) {
-      LOG_ERROR("rocshmem_gin_anvil: invalid device id for rank %d", i);
+      LOG_ERROR("gin_anvil_sdma: invalid device id for rank %d", i);
       return -1;
     }
   }
 
   const int myDev = devs[static_cast<size_t>(myRank)];
 
-  if (!rocshmem::anvil::initEndpoint()) {
-    LOG_ERROR("rocshmem_gin_anvil: Anvil SDMA init failed");
+  if (!gin_anvil::sdma::initEndpoint()) {
+    LOG_ERROR("gin_anvil_sdma: Anvil SDMA init failed");
     return -1;
   }
 
-  // Standalone Anvil stack (independent of rocSHMEM IPC SDMA). Connection
-  // pattern matches SdmaImpl::sdmaHostInit: one queue set per local peer index.
   try {
     for (int local_pe = 0; local_pe < nRanks; ++local_pe) {
       const int remoteDev = devs[static_cast<size_t>(local_pe)];
-      if (rocshmem::anvil::anvil.getSdmaQueue(myDev, remoteDev, 0) != nullptr) continue;
-      if (myDev != remoteDev) rocshmem::anvil::EnablePeerAccess(myDev, remoteDev);
-      if (!rocshmem::anvil::anvil.connect(myDev, remoteDev, numChannels)) {
-        LOG_ERROR("rocshmem_gin_anvil: connect(%d -> %d) failed", myDev, remoteDev);
+      if (gin_anvil::sdma::anvil.getSdmaQueue(myDev, remoteDev, 0) != nullptr) continue;
+      if (myDev != remoteDev) gin_anvil::sdma::EnablePeerAccess(myDev, remoteDev);
+      if (!gin_anvil::sdma::anvil.connect(myDev, remoteDev, numChannels)) {
+        LOG_ERROR("gin_anvil_sdma: connect(%d -> %d) failed", myDev, remoteDev);
         return -1;
       }
     }
   } catch (const std::exception& e) {
-    LOG_ERROR("rocshmem_gin_anvil: SDMA connect failed: %s", e.what());
+    LOG_ERROR("gin_anvil_sdma: SDMA connect failed: %s", e.what());
     return -1;
   }
 
   const int total = nRanks * numChannels;
-  std::vector<rocshmem::anvil::SdmaQueueDeviceHandle*> host_handles(static_cast<size_t>(total),
-                                                                    nullptr);
+  std::vector<gin_anvil::sdma::SdmaQueueDeviceHandle*> host_handles(static_cast<size_t>(total), nullptr);
   int validHandles = 0;
   for (int local_pe = 0; local_pe < nRanks; ++local_pe) {
     const int remoteDev = devs[static_cast<size_t>(local_pe)];
     for (int c = 0; c < numChannels; ++c) {
-      rocshmem::anvil::SdmaQueue* q = rocshmem::anvil::anvil.getSdmaQueue(myDev, remoteDev, c);
-      auto* h = q ? reinterpret_cast<rocshmem::anvil::SdmaQueueDeviceHandle*>(q->deviceHandle())
-                  : nullptr;
+      gin_anvil::sdma::SdmaQueue* q = gin_anvil::sdma::anvil.getSdmaQueue(myDev, remoteDev, c);
+      auto* h = q ? reinterpret_cast<gin_anvil::sdma::SdmaQueueDeviceHandle*>(q->deviceHandle()) : nullptr;
       host_handles[static_cast<size_t>(local_pe * numChannels + c)] = h;
       if (h != nullptr) validHandles++;
     }
   }
   if (validHandles == 0) {
-    LOG_ERROR("rocshmem_gin_anvil: no SDMA queue handles for device %d", myDev);
+    LOG_ERROR("gin_anvil_sdma: no SDMA queue handles for device %d", myDev);
     return -1;
   }
 
-  rocshmem::anvil::SdmaQueueDeviceHandle** dev_row = nullptr;
+  gin_anvil::sdma::SdmaQueueDeviceHandle** dev_row = nullptr;
   if (checkHip(hipMalloc(&dev_row, static_cast<size_t>(total) * sizeof(void*)), "hipMalloc handles") != 0)
     return -1;
   if (checkHip(hipMemcpy(dev_row, host_handles.data(), static_cast<size_t>(total) * sizeof(void*),
@@ -138,7 +132,7 @@ extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_i
     return -1;
   }
 
-  auto* impl = new rocshmem_gin_anvil_opaque{};
+  auto* impl = new gin_anvil_sdma_opaque{};
   impl->nRanks = nRanks;
   impl->numChannels = numChannels;
   impl->myRank = myRank;
@@ -153,23 +147,22 @@ extern "C" int rocshmem_gin_anvil_create(int nRanks, int myRank, int my_device_i
   return 0;
 }
 
-extern "C" void rocshmem_gin_anvil_destroy(rocshmem_gin_anvil_handle_t handle) {
+extern "C" void gin_anvil_sdma_destroy(gin_anvil_sdma_handle_t handle) {
   if (!handle) return;
   auto* impl = handle;
   if (impl->deviceHandles_d) hipFree(impl->deviceHandles_d);
   if (impl->sdmaDirty_d) hipFree(impl->sdmaDirty_d);
   delete impl;
-  /* Intentionally do not call anvil.disconnect(): other libraries in-process may share AnvilLib. */
 }
 
-extern "C" int rocshmem_gin_anvil_get_n_ranks(rocshmem_gin_anvil_handle_t handle) {
+extern "C" int gin_anvil_sdma_get_n_ranks(gin_anvil_sdma_handle_t handle) {
   return handle ? handle->nRanks : 0;
 }
 
-extern "C" int rocshmem_gin_anvil_get_num_channels(rocshmem_gin_anvil_handle_t handle) {
+extern "C" int gin_anvil_sdma_get_num_channels(gin_anvil_sdma_handle_t handle) {
   return handle ? handle->numChannels : 0;
 }
 
-extern "C" int rocshmem_gin_anvil_get_channel_stride(rocshmem_gin_anvil_handle_t handle) {
+extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle) {
   return handle ? handle->sdmaChannelStride : 0;
 }

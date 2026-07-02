@@ -10,7 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** GIN-owned IPC lookup table (replaces rocshmem ipc_user_buf_table for anvil-sdma). */
+/** GIN-owned IPC lookup table for anvil-sdma peer VA resolution. */
 #define NCCL_GIN_ANVIL_IPC_MAX_BUFS 16
 #define NCCL_GIN_ANVIL_IPC_MAX_RANKS 16
 
