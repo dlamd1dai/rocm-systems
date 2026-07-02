@@ -272,6 +272,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   memset(&ctx->gpuCtxHost, 0, sizeof(ncclGinAnvilSdmaGPUContext));
   ctx->gpuCtxHost.nRanks = ctx->nRanks;
   ctx->gpuCtxHost.rank = ctx->rank;
+  ctx->gpuCtxHost.lsaRank = cctx->comm->devrState.lsaSelf;
   ctx->gpuCtxHost.nSignals = config->nSignals;
   ctx->gpuCtxHost.nCounters = config->nCounters;
   ctx->gpuCtxHost.numChannels = ctx->numChannels;

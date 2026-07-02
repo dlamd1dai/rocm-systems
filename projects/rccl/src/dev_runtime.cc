@@ -1887,14 +1887,14 @@ ncclResult_t ncclDevrGetGinAnvilMemLayout(struct ncclDevrState* devr, void* addr
   for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
     uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
     if (mbase != 0 && a >= mbase && a < mbase + mem->size) {
-      // rank-0 slot base: primaryAddr = flatBase + lsaSelf*bigSize + bigOffset
-      *outLsaFlatBase = mbase - devr->lsaSelf * devr->bigSize;
+      // Matches ncclWindow::lsaFlatBase for windows on this mem (rank-0 slot).
+      *outLsaFlatBase = flatBase + mem->bigOffset;
       *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
       return ncclSuccess;
     }
     uintptr_t localFlat = flatBase + devr->lsaSelf * devr->bigSize + mem->bigOffset;
     if (a >= localFlat && a < localFlat + mem->size) {
-      *outLsaFlatBase = localFlat - devr->lsaSelf * devr->bigSize;
+      *outLsaFlatBase = flatBase + mem->bigOffset;
       *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
       return ncclSuccess;
     }
