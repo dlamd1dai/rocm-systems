@@ -37,13 +37,12 @@ NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* r
   return signals + signalId;
 }
 
-// Resolve peer VA from the allgathered remote base table (GDA-style, no rocshmem_ptr).
-NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaMemHandle* mh, int peer, size_t off) {
-  uintptr_t* remoteVas = loadConst(&mh->remoteVas);
-  if (remoteVas == nullptr) return nullptr;
-  uintptr_t base = loadConst(remoteVas + peer);
-  if (base == 0) return nullptr;
-  return reinterpret_cast<void*>(base + off);
+// Intra-node peer VA via local LSA flat layout (same as ncclGetLsaPointer), not peer GPU VAs.
+NCCL_DEVICE_INLINE void* resolveLsaPeerVa(ncclGinAnvilSdmaMemHandle* mh, int peer, size_t off) {
+  uintptr_t flatBase = loadConst(&mh->lsaFlatBase);
+  uint32_t stride4G = loadConst(&mh->stride4G);
+  if (flatBase == 0 || stride4G == 0) return nullptr;
+  return reinterpret_cast<void*>(nccl::utility::add4G(flatBase, peer * static_cast<int>(stride4G)) + off);
 }
 
 NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
@@ -145,7 +144,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
-    using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::resolveLsaPeerVa;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPut;
     using nccl::utility::loadConst;
@@ -175,18 +174,19 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
       ncclGinAnvilSdmaMemHandle* srcMh = (ncclGinAnvilSdmaMemHandle*)srcWin;
-      void* srcAddr = (void*)(loadConst(&srcMh->baseAddr) + srcOff);
+      int myRank = loadConst(&rsCtx->rank);
+      void* srcAddr = resolveLsaPeerVa(srcMh, myRank, srcOff);
 
       if (useIpcPut) {
-        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
-        if (dstAddr != nullptr) {
+        void* dstAddr = resolveLsaPeerVa(dstMh, peer, dstOff);
+        if (dstAddr != nullptr && srcAddr != nullptr) {
           ipcPut(dstAddr, srcAddr, bytes);
         }
       } else if (handle != nullptr) {
-        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
-        if (dstAddr == nullptr) {
-          void* ipcDst = resolveRemotePeerVa(dstMh, peer, dstOff);
-          if (ipcDst != nullptr) ipcPut(ipcDst, srcAddr, bytes);
+        void* dstAddr = resolveLsaPeerVa(dstMh, peer, dstOff);
+        if (dstAddr == nullptr || srcAddr == nullptr) {
+          void* ipcDst = resolveLsaPeerVa(dstMh, peer, dstOff);
+          if (ipcDst != nullptr && srcAddr != nullptr) ipcPut(ipcDst, srcAddr, bytes);
           sdmaDataPath = false;
         } else {
           uint64_t* remoteSig = nullptr;
@@ -235,7 +235,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
-    using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::resolveLsaPeerVa;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPutScalar;
     using nccl::utility::loadConst;
@@ -265,15 +265,15 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     if (useIpcPut) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
-      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      void* dstAddr = resolveLsaPeerVa(dstMh, peer, dstOff);
       if (dstAddr != nullptr) {
         ipcPutScalar(dstAddr, &srcVal, bytes);
       }
     } else if (handle != nullptr) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
-      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      void* dstAddr = resolveLsaPeerVa(dstMh, peer, dstOff);
       if (dstAddr == nullptr) {
-        void* ipcDst = resolveRemotePeerVa(dstMh, peer, dstOff);
+        void* ipcDst = resolveLsaPeerVa(dstMh, peer, dstOff);
         if (ipcDst != nullptr) ipcPutScalar(ipcDst, &srcVal, bytes);
         sdmaDataPath = false;
       } else {
