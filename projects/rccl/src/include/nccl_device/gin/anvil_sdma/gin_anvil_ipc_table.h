@@ -20,6 +20,8 @@ struct ncclGinAnvilIpcBufEntry {
   size_t length;
 };
 
+struct ncclGinAnvilSdmaGPUContext;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,6 +32,9 @@ int ncclGinAnvilIpcTableRegisterExplicit(void* localBase, const uintptr_t* remot
                                          size_t length);
 int ncclGinAnvilIpcTableUnregister(void* localBase);
 void ncclGinAnvilIpcTableGetDevice(const ncclGinAnvilIpcBufEntry** outTable, int* outCount);
+void ncclGinAnvilIpcTableTrackContext(struct ncclGinAnvilSdmaGPUContext* hostCtx,
+                                      struct ncclGinAnvilSdmaGPUContext* devCtx);
+void ncclGinAnvilIpcTableUntrackContext(struct ncclGinAnvilSdmaGPUContext* hostCtx);
 
 #ifdef __cplusplus
 }
