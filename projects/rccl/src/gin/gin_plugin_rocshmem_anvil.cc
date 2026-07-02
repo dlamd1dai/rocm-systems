@@ -174,20 +174,6 @@ static ncclResult_t ginAnvilFinalize(void* ctx) {
   return ncclSuccess;
 }
 
-static ncclResult_t ginAnvilFindMem(struct ncclDevrState* devr, void* data, struct ncclDevrMemory** outMem,
-                                    size_t* outOff) {
-  uintptr_t a = reinterpret_cast<uintptr_t>(data);
-  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
-    uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
-    if (a >= mbase && a < mbase + mem->size) {
-      *outMem = mem;
-      *outOff = a - mbase;
-      return ncclSuccess;
-    }
-  }
-  return ncclInvalidArgument;
-}
-
 static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, int type, uint64_t mrFlags,
                                      void** mhandle, void** ginHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
@@ -196,15 +182,10 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   ginAnvilMemHandle* mh = nullptr;
   NCCLCHECK(ncclCalloc(&mh, 1));
 
-  struct ncclDevrMemory* mem = nullptr;
-  size_t memOff = 0;
-  if (ginAnvilFindMem(devr, data, &mem, &memOff) != ncclSuccess) {
-    WARN("GIN anvil-sdma: address %p is not in a registered symmetric memory", data);
-    free(mh);
-    return ncclSystemError;
-  }
-  if (devr->lsaFlatBase == nullptr || devr->bigSize == 0) {
-    WARN("GIN anvil-sdma: LSA flat heap is not initialized");
+  uintptr_t lsaFlatBase = 0;
+  uint32_t stride4G = 0;
+  if (ncclDevrGetGinAnvilMemLayout(devr, data, &lsaFlatBase, &stride4G) != ncclSuccess) {
+    WARN("GIN anvil-sdma: could not resolve LSA flat layout for %p", data);
     free(mh);
     return ncclSystemError;
   }
@@ -218,8 +199,8 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   }
 
   ncclGinAnvilSdmaMemHandle hostMh;
-  hostMh.lsaFlatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase) + mem->bigOffset + memOff;
-  hostMh.stride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+  hostMh.lsaFlatBase = lsaFlatBase;
+  hostMh.stride4G = stride4G;
   (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
 
   INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaFlatBase=%p stride4G=%u +%zu", data,

@@ -116,6 +116,10 @@ void freeDevCommRequirements(
 // outAddr is set to nullptr if addr cannot be resolved.
 ncclResult_t ncclDevrGetLsaSelfAddr(struct ncclDevrState* devr, void* addr, void** outAddr);
 
+// LSA flat window base + stride for GIN Anvil symmetric registration (ncclGetLsaPointer layout).
+ncclResult_t ncclDevrGetGinAnvilMemLayout(struct ncclDevrState* devr, void* addr,
+                                          uintptr_t* outLsaFlatBase, uint32_t* outStride4G);
+
 bool ncclDevrWindowIsMultiSegment(struct ncclDevrWindow* win);
 bool ncclDevrWindowHasSysmemSegment(struct ncclDevrWindow* win);
 

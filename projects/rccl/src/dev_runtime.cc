@@ -1858,6 +1858,34 @@ ncclResult_t ncclDevrGetLsaSelfAddr(struct ncclDevrState* devr, void* addr, void
   return ncclSuccess;
 }
 
+ncclResult_t ncclDevrGetGinAnvilMemLayout(struct ncclDevrState* devr, void* addr,
+                                          uintptr_t* outLsaFlatBase, uint32_t* outStride4G) {
+  if (!devr || !addr || !outLsaFlatBase || !outStride4G) return ncclInvalidArgument;
+  if (devr->lsaFlatBase == nullptr || devr->bigSize == 0) return ncclInvalidArgument;
+
+  uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t flatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase);
+  uintptr_t flatEnd = flatBase + static_cast<uintptr_t>(devr->lsaSize) * devr->bigSize;
+
+  if (a >= flatBase && a < flatEnd) {
+    *outLsaFlatBase = a;
+    *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+    return ncclSuccess;
+  }
+
+  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+    uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
+    if (a >= mbase && a < mbase + mem->size) {
+      size_t off = a - mbase;
+      *outLsaFlatBase = flatBase + mem->bigOffset + off;
+      *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+      return ncclSuccess;
+    }
+  }
+
+  return ncclInvalidArgument;
+}
+
 ncclResult_t ncclDevrWorldToLsaRank(struct ncclComm* comm, int peerWorldRank, int* peerLsaRank) {
   ncclTeam_t worldTeam = ncclTeamWorld(comm);
   ncclTeam_t lsaTeam = ncclTeamLsa(comm);
