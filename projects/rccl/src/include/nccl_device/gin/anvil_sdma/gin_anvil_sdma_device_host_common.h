@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#include "gin_anvil_ipc_table.h"
+struct ncclGinAnvilIpcBufEntry;
 
 #define NCCL_GIN_ANVIL_SDMA_NET_VERSION 115
 
