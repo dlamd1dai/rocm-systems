@@ -52,6 +52,7 @@ struct ginAnvilGinCtx {
 
 struct ginAnvilMemHandle {
   ncclGinAnvilSdmaMemHandle* devHandle;
+  uintptr_t* remoteVasDev;
   void* addr;
   size_t size;
 };
@@ -178,6 +179,9 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
                                      void** mhandle, void** ginHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
   struct ncclDevrState* devr = &cctx->comm->devrState;
+  ncclResult_t ret = ncclSuccess;
+  uintptr_t* vasHost = nullptr;
+  uintptr_t* vasDev = nullptr;
 
   ginAnvilMemHandle* mh = nullptr;
   NCCLCHECK(ncclCalloc(&mh, 1));
@@ -193,22 +197,54 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   mh->addr = data;
   mh->size = size;
 
+  NCCLCHECKGOTO(ncclCalloc(&vasHost, cctx->nranks), ret, fail);
+  vasHost[cctx->rank] = reinterpret_cast<uintptr_t>(data);
+  NCCLCHECKGOTO(bootstrapAllGather(cctx->comm->bootstrap, vasHost, sizeof(uintptr_t)), ret, fail);
+
+  if (hipMalloc(&vasDev, sizeof(uintptr_t) * cctx->nranks) != hipSuccess) {
+    ret = ncclSystemError;
+    goto fail;
+  }
+  if (hipMemcpy(vasDev, vasHost, sizeof(uintptr_t) * cctx->nranks, hipMemcpyHostToDevice) != hipSuccess) {
+    ret = ncclSystemError;
+    goto fail;
+  }
+  mh->remoteVasDev = vasDev;
+
   if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
-    free(mh);
-    return ncclSystemError;
+    ret = ncclSystemError;
+    goto fail;
   }
 
   ncclGinAnvilSdmaMemHandle hostMh;
   hostMh.lsaFlatBase = lsaFlatBase;
   hostMh.stride4G = stride4G;
-  (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
+  hostMh.remoteVas = vasDev;
+  hostMh.nRanks = cctx->nranks;
+  if (hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice) != hipSuccess) {
+    ret = ncclSystemError;
+    goto fail;
+  }
 
-  INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaFlatBase=%p stride4G=%u +%zu", data,
-       (void*)hostMh.lsaFlatBase, hostMh.stride4G, size);
+  INFO(NCCL_INIT,
+       "GIN anvil-sdma: registered addr=%p lsaFlatBase=%p stride4G=%u remoteVa[0]=%p remoteVa[1]=%p +%zu",
+       data, (void*)hostMh.lsaFlatBase, hostMh.stride4G,
+       cctx->nranks > 0 ? (void*)vasHost[0] : nullptr,
+       cctx->nranks > 1 ? (void*)vasHost[1] : nullptr, size);
 
+  free(vasHost);
   *mhandle = mh;
   *ginHandle = mh->devHandle;
   return ncclSuccess;
+
+fail:
+  if (vasDev) (void)hipFree(vasDev);
+  free(vasHost);
+  if (mh) {
+    if (mh->devHandle) (void)hipFree(mh->devHandle);
+    free(mh);
+  }
+  return ret;
 }
 
 static ncclResult_t ginAnvilRegMrSymDmaBuf(void* collComm, void* data, size_t size, int type, uint64_t offset,
@@ -220,6 +256,7 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   ginAnvilMemHandle* mh = (ginAnvilMemHandle*)mhandle;
   if (!mh) return ncclSuccess;
 
+  if (mh->remoteVasDev) (void)hipFree(mh->remoteVasDev);
   if (mh->devHandle) (void)hipFree(mh->devHandle);
   free(mh);
   return ncclSuccess;

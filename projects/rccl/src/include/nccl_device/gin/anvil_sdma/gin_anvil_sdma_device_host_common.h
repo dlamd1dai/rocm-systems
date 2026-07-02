@@ -42,9 +42,12 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  // Window base in this GPU's LSA flat address space (matches ncclWindow::lsaFlatBase).
+  // Rank-0 slot base in local LSA flat layout (SDMA path via add4G).
   uintptr_t lsaFlatBase;
   uint32_t stride4G;  // devr->bigSize >> 32; peer stride for ncclGetLsaPointer-style lookup
+  // Per-rank registration VAs (allgather at regMrSym). IPC flat stores use remoteVas[peer]+off.
+  uintptr_t* remoteVas;  // device pointer, length nRanks
+  int nRanks;
 };
 
 #endif
