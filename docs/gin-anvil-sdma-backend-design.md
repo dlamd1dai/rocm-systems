@@ -1,12 +1,12 @@
 # GIN Anvil SDMA backend — design and rationale
 
-This document describes the **GIN Anvil SDMA** backend added to RCCL (`NCCL_NET_DEVICE_GIN_ANVIL_SDMA` / `NCCL_GIN_TYPE=6`) and the supporting **rocSHMEM GIN Anvil factory** C API. It records the main **design choices** and why they were made.
+This document describes the **GIN Anvil SDMA** backend added to RCCL (`NCCL_NET_DEVICE_GIN_ANVIL_SDMA` / `NCCL_GIN_TYPE=6`) and the supporting **GIN Anvil SDMA factory** C API (`gin_anvil_sdma_*`). It records the main **design choices** and why they were made.
 
 ## Goal
 
 Provide a GIN path that **replaces** “GIN + rocSHMEM API + SDMA policy” (where device work goes through `rocshmem_putmem` / fence / quiet and SDMA is selected inside rocSHMEM) with a backend that:
 
-1. Issues **SDMA through Anvil** (`rocshmem::anvil::put`, `quiet`, `signal`) **directly** from the GIN device templates.
+1. Issues **SDMA through Anvil** (`gin_anvil::sdma::put`, `quiet`, `signal`) **directly** from the GIN device templates.
 2. Uses **IPC flat stores** (`gin_anvil_ipc_copy.h`) for small messages — same datapath as rocSHMEM’s `memcpy_lane` Put policy, without calling the rocSHMEM runtime API.
 3. Mirrors the **host-side lifecycle** of **GIN–GDA** as closely as practical: `connect()` establishes transport resources, `regMrSym()` exchanges per-rank addressing metadata, `createContext()` builds the device-visible context (signals, counters, handles).
 
@@ -17,11 +17,11 @@ Provide a GIN path that **replaces** “GIN + rocSHMEM API + SDMA policy” (whe
 
 **Reasoning:** Keeping `NCCL_GIN_TYPE` aligned with `ncclNetDeviceType` avoids special cases in host code that maps `getProperties()` to `ncclGinType_t`.
 
-## Why a rocSHMEM-hosted C factory (`rocshmem_gin_anvil_*`)
+## Why a standalone Anvil SDMA factory (`gin_anvil_sdma_*`)
 
-Anvil’s host implementation (`SdmaQueue`, `AnvilLib`, HSA/KFD) already lives in **rocSHMEM** and is linked into `librocshmem.a`. Duplicating `anvil.cpp` inside `librccl.so` would risk **duplicate globals** (singleton `AnvilLib`) and ODR violations when an application links both RCCL and rocSHMEM.
+Anvil’s host implementation (`SdmaQueue`, `AnvilLib`, HSA/KFD) is compiled into **`librocshmem.a`** alongside the rest of the rocSHMEM tree. Duplicating `anvil.cpp` inside `librccl.so` would risk **duplicate globals** (singleton `AnvilLib`) and ODR violations when an application links both RCCL and rocSHMEM.
 
-**Choice:** Add a small **C-linkage factory** in rocSHMEM (`include/rocshmem/gin_anvil_factory.h`, `src/sdma/gin_anvil_factory.cpp`) that:
+**Choice:** Add a small **C-linkage factory** in the rocSHMEM tree (`include/gin_anvil/sdma_factory.h`, `src/sdma/gin_anvil_sdma_factory.cpp`) that:
 
 - Runs the same **device discovery + `anvil.connect()` + handle table** pattern as `SdmaImpl::sdmaHostInit`, but keyed by **NCCL world rank → HIP ordinal** via bootstrap allgather (see below).
 - Is compiled into rocSHMEM for every build; when **`USE_SDMA` is off**, the implementation stubs return `probe()==0` / `create()==-1` so RCCL can still link.
@@ -40,19 +40,19 @@ rocSHMEM’s IPC SDMA path indexes queues by **local PE / device index** on a sy
 
 GDA registers GPU memory with the **GDA PD** and exchanges **rkeys + VAs**. Anvil SDMA over XGMI uses **GPU VAs** visible to peer SDMA engines once **P2P is enabled**; there is no lkey/rkey surface in this path.
 
-**Choice:** `regMrSym()` **allgathers each rank’s LSA flat base VA** and stores the result in a device-side `remoteVas[nRanks]` array inside `ncclGinAnvilSdmaMemHandle`. The device resolves `remoteVas[peer] + offset` directly — the same exchange step as GDA, without IB keys and without `rocshmem_buffer_register_vmm` / `rocshmem_ptr`.
+**Choice:** `regMrSym()` resolves each buffer’s **LSA flat self VA** via `ncclDevrGetLsaSelfAddr` and registers it in the **GIN-owned IPC table** (`ncclGinAnvilIpcTableRegisterVmm` with VMM stride across ranks). The device mem handle stores the symmetric **`baseAddr`**; **`ginAnvilResolvePeerVa`** maps local VA + peer to the remote GPU VA — without IB keys and without `rocshmem_buffer_register_vmm` / `rocshmem_ptr`.
 
-**Reasoning:** Constant-memory user-buffer lookup (rocSHMEM IPC) adds indirection and ties the backend to `rocshmem_init` semantics. Per-window GPU arrays match GDA’s `remote_vas` pattern and keep remote resolution to one HBM load per put.
+**Reasoning:** Constant-memory user-buffer lookup (legacy PGAS IPC) adds indirection and ties the backend to `rocshmem_init` semantics. A small host-side IPC table with device-visible entries keeps peer resolution to one table scan per put.
 
 ## Signals and counters
 
-- **Signals:** Fine-grained GPU memory via **`hipExtMallocWithFlags(..., hipDeviceMallocFinegrained)`** (not `rocshmem_malloc`). **`bootstrapAllGather`** of each rank’s signal base pointer into device array **`signalPeerAddrs[peer]`**; remote updates use **`__hip_atomic_fetch_add` with system scope** on the peer VA (same observable behaviour as `rocshmem_uint64_atomic_add`, without symmetric-heap lookup).
-- **Counters:** Local-only `uint64_t` array on device (same idea as API/GDA plugins).
-- **Ordering:** After `anvil::put`, use **`anvil::quiet`** when a **counter** is involved; else **`__builtin_amdgcn_fence(release, agent)`** before SDMA-fused signal, or **`__threadfence_system()`** after IPC flat stores before a separate signal atomic.
+- **Signals:** Carved from the communicator **LSA symmetric resource window** after `ncclDevComm` setup (`ncclGinAnvilBindResourceWindowSignals`). Each GIN context gets a slot in the window arena; **`ncclGinAnvilIpcTableRegisterVmm`** maps peer signal VAs using the same VMM stride as data buffers. Remote updates use **`ipcFlatAtomicAddSys64`** on the resolved peer VA.
+- **Counters:** Local-only `uint64_t` array on device via **`hipExtMallocWithFlags`** (same idea as GDA plugin).
+- **Ordering:** After `gin_anvil::sdma::put`, use **`gin_anvil::sdma::quiet`** when a **counter** is involved; else **`__builtin_amdgcn_fence(release, agent)`** before SDMA-fused signal, or **`__threadfence_system()`** after IPC flat stores before a separate signal atomic.
 
-**Reasoning:** Matches observable ordering from the API backend while using Anvil primitives and self-contained IPC helpers instead of `rocshmem_fence` / `rocshmem_quiet`.
+**Reasoning:** Signals must be peer-accessible through the same LSA flat / IPC table path as data. Counters stay local and do not need symmetric mapping.
 
-## `anvil::signal` and `SignalAdd`
+## `gin_anvil::sdma::signal` and `SignalAdd`
 
 The current Anvil helper **`signal()`** submits a fixed **64-bit atomic add of 1** (see `CreateAtomicIncPacket` in `anvil_device.hpp`). Arbitrary **`SignalAdd`** values are not implemented in this first revision.
 
@@ -68,13 +68,13 @@ Transfers of at most **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** bytes (default 128 B, t
 
 | Former rocSHMEM API | Replacement | Performance note |
 |---------------------|-------------|------------------|
-| `rocshmem_buffer_register_vmm` + `rocshmem_ptr` | `bootstrapAllGather` → `remoteVas[peer]` on mem handle | One HBM load vs constant-memory table scan |
+| `rocshmem_buffer_register_vmm` + `rocshmem_ptr` | `ncclGinAnvilIpcTableRegisterVmm` + `ginAnvilResolvePeerVa` | Host table + device lookup |
 | `rocshmem_putmem` / `*_p` | `ipcPut` / `ipcPutScalar` to resolved peer VA | Identical flat-store instructions |
-| `rocshmem_uint64_atomic_add` | `ipcFlatAtomicAddSys64` on `signalPeerAddrs[peer]` | Same system-scope flat atomic |
-| `rocshmem_quiet` / `rocshmem_fence` | `anvil::quiet` (SDMA dirty queues) + `__threadfence_system` (IPC) | Avoids nocall into uninitialised rocSHMEM context |
-| `rocshmem_malloc` / `rocshmem_free` (signals) | `hipExtMallocWithFlags` fine-grained + `hipFree` | Required for xGMI peer atomics on signals |
+| `rocshmem_uint64_atomic_add` | `ipcFlatAtomicAddSys64` on IPC-resolved peer signal VA | Same system-scope flat atomic |
+| `rocshmem_quiet` / `rocshmem_fence` | `gin_anvil::sdma::quiet` (SDMA dirty queues) + `__threadfence_system` (IPC) | Avoids nocall into uninitialised PGAS runtime context |
+| `rocshmem_malloc` / `rocshmem_free` (signals) | LSA resource-window arena + IPC table | Peer-accessible symmetric signal VAs |
 
-**Still in rocSHMEM (by design):** `rocshmem_gin_anvil_*` C factory and `rocshmem::anvil::*` SDMA device helpers live in `librocshmem` to avoid duplicating `AnvilLib` / KFD state inside `librccl.so`.
+**Still linked from `librocshmem.a` (by design):** `gin_anvil_sdma_*` C factory and `gin_anvil::sdma::*` SDMA device helpers live in the rocSHMEM build artifact to avoid duplicating `AnvilLib` / KFD state inside `librccl.so`. Naming is **gin-anvil**-specific; the backend does **not** call `rocshmem_init()` or other PGAS APIs.
 
 ## Dirty bitmask and channel selection
 
@@ -82,7 +82,7 @@ The device path sets a **per (peer, channel) dirty bit** after `put`, matching t
 
 **Reasoning:** Keeps the first implementation correct and small; channel striping can follow `sdma_policy.hpp` later without changing the host factory API.
 
-## `rocshmem_gin_anvil_destroy` and `anvil.disconnect()`
+## `gin_anvil_sdma_destroy` and `anvil.disconnect()`
 
 **Choice:** Destroy frees HIP allocations owned by the handle but **does not** call `anvil.disconnect()`, because disconnect tears down **all** SDMA queues in the process and could break concurrent rocSHMEM users sharing `AnvilLib`.
 
@@ -93,13 +93,13 @@ The device path sets a **per (peer, channel) dirty bit** after `put`, matching t
 | Area | Change |
 |------|--------|
 | `net_device.h` | `NCCL_NET_DEVICE_GIN_ANVIL_SDMA = 6` |
-| `gin_device_common.h` | `NCCL_GIN_ROCSHMEM_ANVIL_ENABLE`, backend mask, dispatch `switch` case |
+| `gin_device_common.h` | `NCCL_GIN_ANVIL_SDMA_ENABLE`, backend mask, dispatch `switch` case |
 | `gin_device_api.h` | Include `anvil_sdma/gin_anvil_sdma.h` when enabled |
 | `gin_host.cc` | Recognize new `netDeviceType` for `ginType` |
-| `plugin/gin.cc` | Third internal plugin (GDA + Anvil); `ncclGinRocshmemSetInitContext` for both |
-| `gin/CMakeLists.txt` | Build `gin_plugin_rocshmem_anvil.cc` |
-| New headers | `gin_host_rocshmem_anvil.h`, `gin_anvil_sdma*.h` |
-| rocSHMEM | `gin_anvil_factory.cpp` in `src/` + public header under `include/rocshmem/` |
+| `plugin/gin.cc` | Third internal plugin (GDA + Anvil); `ncclGinRocshmemSetInitContext` (GDA), `ncclGinAnvilSetInitContext` (Anvil) |
+| `gin/CMakeLists.txt` | Build `gin_plugin_anvil_sdma.cc` |
+| New headers | `gin_host_anvil_sdma.h`, `gin_anvil_sdma*.h` |
+| rocSHMEM tree | `gin_anvil_sdma_factory.cpp` in `src/sdma/` + public header `include/gin_anvil/sdma_factory.h` |
 
 ## Build requirements
 
@@ -176,13 +176,13 @@ Run with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET` and `NCCL_GIN_ENABLE=1 NCC
 
 | Test ID | Action | Pass criteria |
 |---------|--------|---------------|
-| **H1** | `rocshmem_gin_anvil_probe()` via tiny host binary or first RCCL init | Returns 1 on SDMA-capable HIP node; 0 when `USE_SDMA=OFF` stub build |
+| **H1** | `gin_anvil_sdma_probe()` via tiny host binary or first RCCL init | Returns 1 on SDMA-capable HIP node; 0 when `USE_SDMA=OFF` stub build |
 | **H2** | RCCL comm init, 8 ranks | Log: `GIN anvil-sdma: standalone SDMA queues (8 ranks, N ch, spread=…)` |
 | **H3** | Wrong `NCCL_GIN_TYPE` (e.g. 5) with Anvil plugin forced | Anvil `init()` returns error; no silent fallback |
 | **H4** | `connect()` rank ↔ GPU mapping | `bootstrapAllGather` of HIP ordinals; queue table `peer * numChannels + ch` |
-| **H5** | `regMrSym()` on symmetric LSA window | Allgather fills `remoteVas[peer]`; no `rocshmem_buffer_register_vmm` |
-| **H6** | `createContext()` | Device context `layoutMagic == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC`; fine-grained signal buffers allocated |
-| **H7** | Comm destroy | No crash; `rocshmem_gin_anvil_destroy` frees HIP-owned state (queues remain — by design) |
+| **H5** | `regMrSym()` on symmetric LSA window | IPC table entry via `ncclGinAnvilIpcTableRegisterVmm`; no `rocshmem_buffer_register_vmm` |
+| **H6** | `createContext()` + resource window bind | Device context `layoutMagic == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC`; LSA signal slots bound via `ncclGinAnvilBindResourceWindowSignals` |
+| **H7** | Comm destroy | No crash; `gin_anvil_sdma_destroy` frees HIP-owned state (queues remain — by design) |
 
 ### 6. Device datapath (functional)
 
@@ -197,7 +197,7 @@ Use `alltoall_perf -D 3 -V 1` (validation on). Sweep `-b` / `-e` / `-f 2`.
 | **D5** | `NCCL_GIN_ANVIL_SDMA_THRESHOLD=65536` | Force IPC for medium msgs | Correctness maintained |
 | **D6** | `NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL=1` | OSS7 copy+signal SDMA packet | Correctness on MI355; compare vs default `0` |
 | **D7** | `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1,2,4,8` | Multi-queue per peer | Init succeeds; `#wrong == 0` at 1 MiB |
-| **D8** | `Flush` after puts (`GinAlltoAllKernel` implicit quiet) | Dirty bitmask + `anvil::quiet` | No hang; validation pass |
+| **D8** | `Flush` after puts (`GinAlltoAllKernel` implicit quiet) | Dirty bitmask + `gin_anvil::sdma::quiet` | No hang; validation pass |
 
 **Signal / counter spot checks (if exposed via future micro-test or debugger):**
 
@@ -244,7 +244,7 @@ Record: hostname, GPU model, ROCm version, RCCL commit, `NCCL_GIN_ANVIL_SDMA_*` 
 |---------|----------|----------|
 | **N1** | `NCCL_GIN_TYPE=6` without `USE_SDMA` rocSHMEM | Probe/create fails; clear init error |
 | **N2** | Mismatched rank/GPU layout (ordinal ≠ rank) | Document failure or wrong results; file bug if silent corruption |
-| **N3** | Missing `remoteVas` / bad LSA registration | Init or run fails with WARN, not segfault |
+| **N3** | Missing IPC table entry / bad LSA registration | Init or run fails with WARN, not segfault |
 | **N4** | Invalid `layoutMagic` on device | Kernels no-op (`anvilCtxValid` false); no GPU fault |
 | **N5** | Concurrent rocSHMEM `rocshmem_init` + Anvil GIN | No duplicate `AnvilLib` crash (coexistence) |
 | **N6** | `TEST5_MLX5_PREFLIGHT=0` without MLX5 symbols | Test runs but may fail NET init — documents infra gap only |
@@ -281,8 +281,8 @@ Before merge or image publish:
 | `ginType NONE` / `-D 3` error | `NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=6`, `NCCL_DEBUG=INFO` NET lines |
 | Hang in AlltoAll | SDMA dirty / quiet; try `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1` |
 | Wrong results small sizes | Threshold / IPC path; `NCCL_GIN_ANVIL_SDMA_THRESHOLD` |
-| Wrong results large sizes | `remoteVas` allgather; LSA flat base resolution |
-| `rocshmem_gin_anvil_create failed` | `USE_SDMA`, HIP devices visible, xGMI peer access |
+| Wrong results large sizes | IPC table + LSA flat base resolution |
+| `gin_anvil_sdma_create failed` | `USE_SDMA`, HIP devices visible, xGMI peer access |
 
 ### 13. Key environment variables (test tuning)
 
@@ -300,4 +300,4 @@ Before merge or image publish:
 
 ---
 
-*File: `docs/gin-anvil-sdma-backend-design.md` — GIN Anvil SDMA backend design and test plan.*
+*File: `docs/gin-anvil-sdma-backend-design.md` / `docs/gin-anvil-sdma-backend-design.rst` — GIN Anvil SDMA backend design and test plan.*
