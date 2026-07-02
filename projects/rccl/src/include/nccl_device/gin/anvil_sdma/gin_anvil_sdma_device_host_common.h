@@ -35,7 +35,8 @@ struct ncclGinAnvilSdmaGPUContext {
   uint32_t sdmaThreshold;
   uint32_t fusedSdmaSignal;  // use COPY_LINEAR_WAIT_SIGNAL_MI4 for SignalInc SDMA puts
   int nRanks;
-  int rank;
+  int rank;       // world rank
+  int lsaRank;    // LSA team rank on this GPU (for flat slot indexing)
   int numChannels;
   int sdmaChannel;
   int sdmaChannelStride;
@@ -45,7 +46,7 @@ struct ncclGinAnvilSdmaMemHandle {
   // Rank-0 slot base in local LSA flat layout (SDMA path via add4G).
   uintptr_t lsaFlatBase;
   uint32_t stride4G;  // devr->bigSize >> 32; peer stride for ncclGetLsaPointer-style lookup
-  // Per-rank registration VAs (allgather at regMrSym). IPC flat stores use remoteVas[peer]+off.
+  // Per-rank registration VAs (allgather at regMrSym). SDMA may use remoteVas[worldRank]+off.
   uintptr_t* remoteVas;  // device pointer, length nRanks
   int nRanks;
 };
