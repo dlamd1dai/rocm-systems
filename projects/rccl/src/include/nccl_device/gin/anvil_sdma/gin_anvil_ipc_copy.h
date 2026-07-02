@@ -14,8 +14,8 @@ namespace gin {
 namespace anvil {
 namespace detail {
 
-// Local load + remote system-scope store (matches rocSHMEM memcpy_lane Put policies).
-// Self-contained: do not include rocshmem util.hpp (symbol clash with queue_pair_device.h).
+// Local load + remote system-scope store (memcpy_lane Put policy).
+// Self-contained: inlined flat stores; do not pull in unrelated queue_pair headers.
 // Local src uses cached loads (__builtin_memcpy); remote dst uses flat system-scope stores.
 
 NCCL_DEVICE_INLINE unsigned long long ipcLocalLoad8(const void* src) {
@@ -82,7 +82,7 @@ NCCL_DEVICE_INLINE void ipcFlatStoreSys1(void* dst, unsigned char val) {
 #endif
 }
 
-// Mirrors rocSHMEM copy_remainder<Standard, SystemScope>.
+// Mirrors memcpy_lane remainder handling for sub-8-byte tails.
 NCCL_DEVICE_INLINE void ipcPutRemainder(uint8_t* dst, uint8_t* src, int remainder) {
   if (remainder == 0) return;
   if (remainder & 1) {
@@ -125,7 +125,7 @@ NCCL_DEVICE_INLINE void ipcPutScalar(void* dst, const void* src, size_t bytes) {
                          static_cast<int>(bytes));
 }
 
-// IPC load/store path for transfers below the SDMA threshold (mirrors rocSHMEM memcpy_lane Put).
+// IPC load/store path for transfers below the SDMA threshold.
 NCCL_DEVICE_INLINE void ipcPut(void* dst, const void* src, size_t bytes) {
   if (bytes == 0) return;
   auto* d = static_cast<uint8_t*>(dst);

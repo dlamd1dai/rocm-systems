@@ -42,12 +42,12 @@
 #endif
 #endif
 
-#ifndef NCCL_GIN_ROCSHMEM_ANVIL_ENABLE
+#ifndef NCCL_GIN_ANVIL_SDMA_ENABLE
 #if defined(__HIP_PLATFORM_AMD__) && defined(ENABLE_ROCSHMEM)
-#define NCCL_GIN_ROCSHMEM_ANVIL_ENABLE 1
+#define NCCL_GIN_ANVIL_SDMA_ENABLE 1
 #warning "ANVIL_ENABLED=1"
 #else
-#define NCCL_GIN_ROCSHMEM_ANVIL_ENABLE 0
+#define NCCL_GIN_ANVIL_SDMA_ENABLE 0
 #endif
 #endif
 
@@ -61,7 +61,7 @@ enum ncclGinOptFlags {
   (((NCCL_GIN_PROXY_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_PROXY | \
    ((NCCL_GIN_GDAKI_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_GDAKI | \
    ((NCCL_GIN_ROCSHMEM_GDA_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA | \
-   ((NCCL_GIN_ROCSHMEM_ANVIL_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_ANVIL_SDMA)
+   ((NCCL_GIN_ANVIL_SDMA_ENABLE) ? 1u : 0u) << (unsigned)NCCL_NET_DEVICE_GIN_ANVIL_SDMA)
 
 // Resource sharing mode for a given ncclGin/ncclGin_C *instance*.
 // This mode is selected at construction time and is carried by the ncclGin
@@ -205,7 +205,7 @@ NCCL_DEVICE_INLINE static decltype(auto) ncclGinCallImpl(unsigned beMask, ncclGi
       if (!(1 & (beMask >> (int)NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA))) __builtin_unreachable();
       return ApiFn<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ctx, static_cast<Arg&&>(arg)...);
 #endif
-#if NCCL_GIN_ROCSHMEM_ANVIL_ENABLE
+#if NCCL_GIN_ANVIL_SDMA_ENABLE
     case (int)NCCL_NET_DEVICE_GIN_ANVIL_SDMA:
       if (!(1 & (beMask >> (int)NCCL_NET_DEVICE_GIN_ANVIL_SDMA))) __builtin_unreachable();
       return ApiFn<NCCL_NET_DEVICE_GIN_ANVIL_SDMA>::call(ctx, static_cast<Arg&&>(arg)...);
