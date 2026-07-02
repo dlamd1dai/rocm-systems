@@ -1865,19 +1865,19 @@ ncclResult_t ncclDevrGetGinAnvilMemLayout(struct ncclDevrState* devr, void* addr
 
   uintptr_t a = reinterpret_cast<uintptr_t>(addr);
   uintptr_t flatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase);
-  uintptr_t flatEnd = flatBase + static_cast<uintptr_t>(devr->lsaSize) * devr->bigSize;
 
-  if (a >= flatBase && a < flatEnd) {
-    *outLsaFlatBase = a;
-    *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
-    return ncclSuccess;
-  }
-
+  // Device resolveLsaPeerVa expects window base at rank-0 slot (ncclWindow::lsaFlatBase),
+  // not the registering rank's local flat VA. Offsets are applied separately on device.
   for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
     uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
-    if (a >= mbase && a < mbase + mem->size) {
-      size_t off = a - mbase;
-      *outLsaFlatBase = flatBase + mem->bigOffset + off;
+    if (mbase != 0 && a >= mbase && a < mbase + mem->size) {
+      *outLsaFlatBase = flatBase + mem->bigOffset;
+      *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+      return ncclSuccess;
+    }
+    uintptr_t localFlat = flatBase + devr->lsaSelf * devr->bigSize + mem->bigOffset;
+    if (a >= localFlat && a < localFlat + mem->size) {
+      *outLsaFlatBase = flatBase + mem->bigOffset;
       *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
       return ncclSuccess;
     }
