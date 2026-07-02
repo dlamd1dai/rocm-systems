@@ -9,14 +9,13 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 113
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 114
 
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
 
-/** Default SDMA threshold (bytes). Transfers of at most this size use rocshmem_putmem;
- *  larger transfers use direct Anvil SDMA. Tuned for MI355: putmem wins below ~128 B
- *  per message; Anvil SDMA plateaus ~24.5 us for 2 KiB–64 KiB. */
+/** Default SDMA threshold (bytes). Transfers of at most this size use inlined IPC flat stores;
+ *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
 /** Default off: fused OSS7 copy+signal needs remote GPU signal VA; opt-in via env on MI355. */
@@ -25,14 +24,13 @@
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
   void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
-  uint64_t* sdmaDirty;   // GIN-owned dirty bitmask (separate from rocSHMEM IPC SDMA)
+  uint64_t* sdmaDirty;   // GIN-owned dirty bitmask
   uint64_t* signals;
   uint64_t* counters;
   uint32_t nSignals;
   uint32_t nCounters;
   uint32_t sdmaThreshold;
   uint32_t fusedSdmaSignal;  // use COPY_LINEAR_WAIT_SIGNAL_MI4 for SignalInc SDMA puts
-  uint32_t rocshmemSdmaEnabled;  // ROCSHMEM_SDMA_ENABLED: putmem may use IpcSdmaImpl
   int nRanks;
   int rank;
   int numChannels;
@@ -41,7 +39,7 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  uintptr_t baseAddr;  // Symmetric LSA flat VA; remote resolved via rocshmem_ptr
+  uintptr_t baseAddr;  // Symmetric LSA flat VA; peer resolved via ginAnvilResolvePeerVa
 };
 
 #endif

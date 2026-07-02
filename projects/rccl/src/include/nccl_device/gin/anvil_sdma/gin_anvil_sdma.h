@@ -9,11 +9,10 @@
 
 #include "../gin_device_common.h"
 #include "gin_anvil_sdma_device_host_common.h"
+#include "gin_anvil_ipc_copy.h"
+#include "gin_anvil_ipc_table.h"
 #include "sdma/anvil_device.hpp"
 #include "sdma/sdma_opcodes.h"
-#if defined(__HIPCC__) || defined(__CUDACC__)
-#include <rocshmem/rocshmem.hpp>
-#endif
 
 namespace nccl {
 namespace gin {
@@ -27,8 +26,6 @@ NCCL_DEVICE_INLINE bool anvilCtxValid(ncclGinAnvilSdmaGPUContext* rsCtx) {
          loadConst(&rsCtx->layoutMagic) == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC;
 }
 
-// Fallback when host/device context is corrupt or signals were not allocated.
-// Avoids null deref in generic readSignal/waitSignal (GinAlltoAllKernel line 1).
 __device__ uint64_t anvilGinDummySignal;
 
 NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* rsCtx,
@@ -39,23 +36,18 @@ NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* r
   return signals + signalId;
 }
 
-// Resolve symmetric baseAddr+offset to the peer's VA via rocSHMEM's constant-memory
-// user-buffer table (populated by rocshmem_buffer_register_vmm on the host).
 NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaMemHandle* mh, int peer, size_t off) {
-  void* sym = (void*)(loadConst(&mh->baseAddr) + off);
-  return rocshmem::rocshmem_ptr(sym, peer);
+  void* sym = reinterpret_cast<void*>(loadConst(&mh->baseAddr) + off);
+  return ginAnvilResolvePeerVa(sym, peer);
 }
 
 NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                               ncclGinSignal_t signalId) {
   uint64_t* signals = loadConst(&rsCtx->signals);
   if (signals == nullptr) return nullptr;
-  void* sym = (void*)(signals + signalId);
-  return (uint64_t*)rocshmem::rocshmem_ptr(sym, peer);
+  return reinterpret_cast<uint64_t*>(ginAnvilResolvePeerVa(signals + signalId, peer));
 }
 
-// SignalInc + SDMA: fuse copy and remote signal (OSS7 COPY_LINEAR_WAIT_SIGNAL_MI4).
-// Caller must still verify remoteSig and dstAddr before issuing putSignal.
 NCCL_DEVICE_INLINE bool useSdmaFusedSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                            bool hasSignal, bool hasCounter,
                                            ncclGinSignalOp_t signalOp) {
@@ -96,31 +88,24 @@ NCCL_DEVICE_INLINE rocshmem::anvil::SdmaQueueDeviceHandle* queueHandle(
   return loadConst(handles + peer * numCh + effCh);
 }
 
-// Remote signal completion via symmetric rocSHMEM atomics (matches GIN rocSHMEM API path).
-NCCL_DEVICE_INLINE void shmemSignalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
-                                        ncclGinSignal_t signalId, uint64_t value) {
-  uint64_t* signals = loadConst(&rsCtx->signals);
-  if (signals == nullptr) return;
-  rocshmem::rocshmem_uint64_atomic_add(signals + signalId, value, peer);
+NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
+                                   ncclGinSignal_t signalId, uint64_t value) {
+  uint64_t* remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
+  if (remoteSig == nullptr) return;
+  ipcFlatAtomicAddSys64(remoteSig, value);
 }
 
-// Order data movement before remote signal/counter updates.
-// putmem/memcpy_lane: threadfence when IPC-only; rocshmem_fence when ROCSHMEM_SDMA_ENABLED
-// (putmem may route through IpcSdmaImpl). Direct Anvil SDMA always uses rocshmem_fence.
-NCCL_DEVICE_INLINE void fenceBeforeShmemSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
-                                              rocshmem::anvil::SdmaQueueDeviceHandle* handle,
-                                              bool hasCounter) {
+NCCL_DEVICE_INLINE void fenceBeforeSignal(bool sdmaDataPath,
+                                          rocshmem::anvil::SdmaQueueDeviceHandle* handle,
+                                          bool hasCounter) {
   if (hasCounter) {
     if (sdmaDataPath && handle != nullptr) {
       rocshmem::anvil::quiet(*handle);
     } else {
-      // Matches GIN rocSHMEM API path after rocshmem_putmem (memcpy_lane / IPC / IpcSdma).
-      rocshmem::rocshmem_quiet();
+      __threadfence_system();
     }
   } else if (sdmaDataPath) {
-    rocshmem::rocshmem_fence();
-  } else if (anvilCtxValid(rsCtx) && loadConst(&rsCtx->rocshmemSdmaEnabled)) {
-    rocshmem::rocshmem_fence();
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else {
     __threadfence_system();
   }
@@ -145,11 +130,12 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::effectiveChannel;
     using nccl::gin::anvil::detail::remoteSignalAddr;
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
-    using nccl::gin::anvil::detail::fenceBeforeShmemSignal;
+    using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
-    using nccl::gin::anvil::detail::shmemSignalPeer;
+    using nccl::gin::anvil::detail::signalPeer;
+    using nccl::gin::anvil::ipcPut;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
@@ -164,30 +150,35 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-    // At or below threshold: rocshmem_putmem (memcpy_lane). Above: direct Anvil SDMA.
-    bool useRocshmemPutmem = hasWins && bytes <= threshold;
+    bool useIpcPut = hasWins && bytes <= threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
-    if (hasWins && !useRocshmemPutmem) {
+    if (hasWins && !useIpcPut) {
       handle = queueHandle(rsCtx, peer, blockId);
-      if (handle == nullptr) useRocshmemPutmem = true;
+      if (handle == nullptr) useIpcPut = true;
     }
-    bool sdmaDataPath = hasWins && !useRocshmemPutmem && handle != nullptr;
+    bool sdmaDataPath = hasWins && !useIpcPut && handle != nullptr;
     bool sdmaFusedSignal = false;
 
     if (hasWins) {
       ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
       ncclGinAnvilSdmaMemHandle* srcMh = (ncclGinAnvilSdmaMemHandle*)srcWin;
-      void* dstSym = (void*)(loadConst(&dstMh->baseAddr) + dstOff);
-      void* srcAddr = (void*)(loadConst(&srcMh->baseAddr) + srcOff);
+      void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
+      void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcOff);
 
-      if (useRocshmemPutmem) {
-        rocshmem::rocshmem_putmem(dstSym, srcAddr, bytes, peer);
+      if (useIpcPut) {
+        void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+        if (dstAddr != nullptr && srcAddr != nullptr) {
+          ipcPut(dstAddr, srcAddr, bytes);
+        }
       } else if (handle != nullptr) {
         void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
         if (dstAddr == nullptr) {
-          rocshmem::rocshmem_putmem(dstSym, srcAddr, bytes, peer);
+          void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer);
+          if (fallbackDst != nullptr && srcAddr != nullptr) {
+            ipcPut(fallbackDst, srcAddr, bytes);
+          }
           sdmaDataPath = false;
-        } else {
+        } else if (srcAddr != nullptr) {
           uint64_t* remoteSig = nullptr;
           if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
             remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
@@ -206,11 +197,11 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if ((hasSignal || hasCounter) && !sdmaFusedSignal) {
-      fenceBeforeShmemSignal(rsCtx, sdmaDataPath, handle, hasCounter);
+      fenceBeforeSignal(sdmaDataPath, handle, hasCounter);
 
       if (hasSignal) {
         if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-        shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
+        signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
       }
       if (hasCounter) {
         atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
@@ -231,11 +222,12 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::effectiveChannel;
     using nccl::gin::anvil::detail::remoteSignalAddr;
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
-    using nccl::gin::anvil::detail::fenceBeforeShmemSignal;
+    using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
-    using nccl::gin::anvil::detail::shmemSignalPeer;
+    using nccl::gin::anvil::detail::signalPeer;
+    using nccl::gin::anvil::ipcPutScalar;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
@@ -245,7 +237,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     if (!anvilCtxValid(rsCtx)) return;
     const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
     ncclGinAnvilSdmaMemHandle* dstMh = (ncclGinAnvilSdmaMemHandle*)dstWin;
-    void* dstSym = (void*)(loadConst(&dstMh->baseAddr) + dstOff);
     T tmp = srcVal;
 
     if ((required == cuda::thread_scope_system) && (given > required)) {
@@ -254,37 +245,28 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
-    bool useRocshmemPutmem = bytes <= threshold;
+    bool useIpcPut = bytes <= threshold;
     rocshmem::anvil::SdmaQueueDeviceHandle* handle = nullptr;
-    if (!useRocshmemPutmem) {
+    if (!useIpcPut) {
       handle = queueHandle(rsCtx, peer, blockId);
-      if (handle == nullptr) useRocshmemPutmem = true;
+      if (handle == nullptr) useIpcPut = true;
     }
-    bool sdmaDataPath = !useRocshmemPutmem && handle != nullptr;
+    bool sdmaDataPath = !useIpcPut && handle != nullptr;
     bool sdmaFusedSignal = false;
 
-    if (useRocshmemPutmem) {
-      static_assert(sizeof(T) <= 8, "PutValue requires sizeof(T) <= 8");
-      if constexpr (sizeof(T) == 8)
-        rocshmem::rocshmem_longlong_p((long long*)dstSym, (long long)srcVal, peer);
-      else if constexpr (sizeof(T) == 4)
-        rocshmem::rocshmem_int_p((int*)dstSym, (int)srcVal, peer);
-      else if constexpr (sizeof(T) == 2)
-        rocshmem::rocshmem_short_p((short*)dstSym, (short)srcVal, peer);
-      else if constexpr (sizeof(T) == 1)
-        rocshmem::rocshmem_char_p((char*)dstSym, (char)srcVal, peer);
+    if (useIpcPut) {
+      void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
+      if (dstAddr != nullptr) {
+        ipcPutScalar(dstAddr, &srcVal, bytes);
+      }
     } else if (handle != nullptr) {
       void* dstAddr = resolveRemotePeerVa(dstMh, peer, dstOff);
       if (dstAddr == nullptr) {
-        static_assert(sizeof(T) <= 8, "PutValue requires sizeof(T) <= 8");
-        if constexpr (sizeof(T) == 8)
-          rocshmem::rocshmem_longlong_p((long long*)dstSym, (long long)srcVal, peer);
-        else if constexpr (sizeof(T) == 4)
-          rocshmem::rocshmem_int_p((int*)dstSym, (int)srcVal, peer);
-        else if constexpr (sizeof(T) == 2)
-          rocshmem::rocshmem_short_p((short*)dstSym, (short)srcVal, peer);
-        else if constexpr (sizeof(T) == 1)
-          rocshmem::rocshmem_char_p((char*)dstSym, (char)srcVal, peer);
+        void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
+        void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer);
+        if (fallbackDst != nullptr) {
+          ipcPutScalar(fallbackDst, &srcVal, bytes);
+        }
         sdmaDataPath = false;
       } else {
         uint64_t* remoteSig = nullptr;
@@ -303,9 +285,9 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if (hasSignal && !sdmaFusedSignal) {
-      fenceBeforeShmemSignal(rsCtx, sdmaDataPath, handle, /*hasCounter=*/false);
+      fenceBeforeSignal(sdmaDataPath, handle, /*hasCounter=*/false);
       if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-      shmemSignalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
+      signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }
   }
 };
@@ -354,10 +336,12 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   template <typename Coop>
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, Coop coop, cuda::memory_order ord,
                                       uint32_t* abortFlag) {
+    (void)ord;
+    (void)abortFlag;
     using nccl::utility::loadConst;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) {
-      rocshmem::rocshmem_quiet();
+      __threadfence_system();
       return;
     }
     uint64_t* sdmaDirty = loadConst(&rsCtx->sdmaDirty);
@@ -370,13 +354,13 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       int nr = ctx.nRanks;
       int numCh = loadConst(&rsCtx->numChannels);
 #pragma unroll 1
-      for (int peer = coop.thread_rank(); peer < nr; peer += coop.size()) {
-        uint64_t peerMask = ((1ULL << numCh) - 1) << (peer * numCh);
+      for (int p = coop.thread_rank(); p < nr; p += coop.size()) {
+        uint64_t peerMask = ((1ULL << numCh) - 1) << (p * numCh);
         if ((dirty & peerMask) == 0) continue;
         for (int ch = 0; ch < numCh; ++ch) {
-          uint64_t bit = 1ULL << (peer * numCh + ch);
+          uint64_t bit = 1ULL << (p * numCh + ch);
           if ((dirty & bit) == 0) continue;
-          auto* h = loadConst(handles + peer * numCh + ch);
+          auto* h = loadConst(handles + p * numCh + ch);
           if (h != nullptr) rocshmem::anvil::quiet(*h);
         }
       }
@@ -386,8 +370,7 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       }
       coop.sync();
     }
-    // Drain rocSHMEM putmem / IPC completions, then any Anvil SDMA work above.
-    rocshmem::rocshmem_quiet();
+    __threadfence_system();
   }
 };
 
