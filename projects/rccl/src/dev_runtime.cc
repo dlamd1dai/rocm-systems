@@ -734,8 +734,12 @@ static ncclResult_t symMemoryObtain(
     NCCLCHECKGOTO(symBindTeamMemory(comm, t, mem), ret, fail_mem_space_teams);
   }
 
+  // Link before GIN registration: plugins resolve LSA layout via memHead walk.
+  mem->next = devr->memHead;
+  devr->memHead = mem;
+
   if (devr->ginEnabled) {
-    NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, fail_mem_space_teams);
+    NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, fail_mem_space_teams_gin);
   } else {
     // Default to single segment when GIN is not yet enabled.
     // This will be recomputed in ncclDevrCommCreateInternal when GIN is activated.
@@ -746,19 +750,31 @@ static ncclResult_t symMemoryObtain(
   // so we introduce rmaProxyEnabled to track if RMA proxy is enabled
   devr->rmaProxyEnabled = devr->nLsaTeams > 1 && comm->config.numRmaCtx > 0 && comm->globalRmaProxySupport;
   if (devr->rmaProxyEnabled && mem->maxGlobalNumSegments == 1) {
-    NCCLCHECKGOTO(symMemoryRegisterRma(comm, mem), ret, fail_mem_space_teams);
+    NCCLCHECKGOTO(symMemoryRegisterRma(comm, mem), ret, fail_mem_space_teams_gin);
   }
 
-  // Add to list of mems.
-  mem->next = devr->memHead;
-  devr->memHead = mem;
-
-leave:
   mem->refCount += 1;
   *outMem = mem;
   free(globalSegmentInfo);
   return ret;
 
+leave:
+  mem->refCount += 1;
+  *outMem = mem;
+  free(globalSegmentInfo);
+  return ncclSuccess;
+
+fail_mem_space_teams_gin:
+  if (devr->memHead == mem) {
+    devr->memHead = mem->next;
+  } else {
+    for (struct ncclDevrMemory** pp = &devr->memHead; *pp != nullptr; pp = &(*pp)->next) {
+      if (*pp == mem) {
+        *pp = mem->next;
+        break;
+      }
+    }
+  }
 fail_mem_space_teams:
   for (struct ncclDevrTeam* t = devr->teamHead; t != nullptr; t = t->next) {
     symUnbindTeamMemory(comm, t, mem);
