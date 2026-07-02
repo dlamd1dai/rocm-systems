@@ -8,7 +8,6 @@ set -euo pipefail
 # libmlx5/libmlx5dv export mlx5dv_reg_dmabuf_mr (MOFED / newer rdma-core). Default 0: stock Ubuntu 24.04
 # often lacks those symbols (ddai-gin-build.log); test scripts can skip Test#5 via MLX5 preflight.
 # Optional: export RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 for strict MLX5 DMA-BUF symbol check at docker build.
-# BuildKit: hosts without docker0 fail with "network bridge not found" — default
 # DOCKER_BUILD_NETWORK=host. Override: DOCKER_BUILD_NETWORK=default
 
 DOCKER_CMD="sudo docker"
@@ -20,7 +19,7 @@ ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA:-1}"
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
 ROCSHMEM_CACHE_BUST="${ROCSHMEM_CACHE_BUST:-1}"
 RCCL_CACHE_BUST="${RCCL_CACHE_BUST:-1}"
-BUILD_LOG="${BUILD_LOG:-ddai-docker-ruby-build.log}"
+BUILD_LOG="${BUILD_LOG:-ddai-gin-rudy-build.log}"
 
 N=1
 DOCKER_BUILD_NETWORK="${DOCKER_BUILD_NETWORK:-host}"

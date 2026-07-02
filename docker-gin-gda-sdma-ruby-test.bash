@@ -29,11 +29,13 @@
 #
 
 NP=${1:-8}
-
-DOCKER_CMD="sudo docker"
-DOCKER_IMAGE="rccl-gin-gda-sdma-713"
+MAX_BYTES="${2:-${RCCL_GIN_GDA_MAX_BYTES:-128M}}"
+DOCKER_CMD="${DOCKER_CMD:-sudo docker}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 RCCL_GIN_GDA_SCRIPT_MARK="${RCCL_GIN_GDA_SCRIPT_MARK:-ruby-20260618e}"
-MAX_BYTES="${RCCL_GIN_GDA_MAX_BYTES:-1024M}"
+RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
+GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${TEST2_HOST_SO_SEARCH_DIRS:-/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}"
+ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
 
 # Batch / Slurm / non-interactive SSH: do not use docker -it (no TTY → docker can appear hung).
 # For an interactive shell: export RCCL_GIN_GDA_DOCKER_IT=1 before running this script.
