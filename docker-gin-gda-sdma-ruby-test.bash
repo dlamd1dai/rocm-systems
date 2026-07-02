@@ -305,7 +305,7 @@ fi
 
 _rccl_test5_mlx5_ok() {
   [[ -n "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR:-}}" ]] && return 0
-  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
+  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
     'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
      rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
     >/dev/null 2>&1
@@ -314,7 +314,7 @@ _rccl_test5_mlx5_ok() {
 _should_run_test5() {
   _run_test 5 || return 1
   [[ "${TEST5_MODE:-${TEST5_MODE:-run}}" != skip ]] || return 1
-  if [[ "${TEST5_MLX5_PREFLIGHT:-${TEST5_MLX5_PREFLIGHT:-1}}" != 0 ]]; then
+  if [[ "${TEST5_MLX5_PREFLIGHT:-${TEST5_MLX5_PREFLIGHT:-0}}" != 0 ]]; then
     if ! _rccl_test5_mlx5_ok; then
       echo "=== RCCL_GIN_GDA: skipping Test#5 (image libmlx5 lacks mlx5dv_reg_dmabuf_mr); set TEST5_MLX5_PREFLIGHT=0 or TEST5_HOST_MLX5_LIB_DIR ===" >&2
       return 1
@@ -372,7 +372,7 @@ fi
 if _should_run_test5; then
   _trace_on
   echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=6) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \

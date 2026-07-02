@@ -54,7 +54,6 @@ struct ginAnvilMemHandle {
   ncclGinAnvilSdmaMemHandle* devHandle;
   void* addr;
   size_t size;
-  uintptr_t* remoteVasDev;
 };
 
 struct ginAnvilListenCtx {
@@ -175,6 +174,20 @@ static ncclResult_t ginAnvilFinalize(void* ctx) {
   return ncclSuccess;
 }
 
+static ncclResult_t ginAnvilFindMem(struct ncclDevrState* devr, void* data, struct ncclDevrMemory** outMem,
+                                    size_t* outOff) {
+  uintptr_t a = reinterpret_cast<uintptr_t>(data);
+  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+    uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
+    if (a >= mbase && a < mbase + mem->size) {
+      *outMem = mem;
+      *outOff = a - mbase;
+      return ncclSuccess;
+    }
+  }
+  return ncclInvalidArgument;
+}
+
 static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, int type, uint64_t mrFlags,
                                      void** mhandle, void** ginHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
@@ -183,10 +196,15 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   ginAnvilMemHandle* mh = nullptr;
   NCCLCHECK(ncclCalloc(&mh, 1));
 
-  void* lsaSelfAddr = nullptr;
-  NCCLCHECK(ncclDevrGetLsaSelfAddr(devr, data, &lsaSelfAddr));
-  if (lsaSelfAddr == nullptr) {
-    WARN("GIN anvil-sdma: could not resolve LSA flat addr for %p", data);
+  struct ncclDevrMemory* mem = nullptr;
+  size_t memOff = 0;
+  if (ginAnvilFindMem(devr, data, &mem, &memOff) != ncclSuccess) {
+    WARN("GIN anvil-sdma: address %p is not in a registered symmetric memory", data);
+    free(mh);
+    return ncclSystemError;
+  }
+  if (devr->lsaFlatBase == nullptr || devr->bigSize == 0) {
+    WARN("GIN anvil-sdma: LSA flat heap is not initialized");
     free(mh);
     return ncclSystemError;
   }
@@ -194,40 +212,18 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   mh->addr = data;
   mh->size = size;
 
-  uintptr_t* vasBuf = (uintptr_t*)malloc(sizeof(uintptr_t) * cctx->nranks);
-  if (!vasBuf) {
-    free(mh);
-    return ncclSystemError;
-  }
-  vasBuf[cctx->rank] = (uintptr_t)lsaSelfAddr;
-  NCCLCHECK(bootstrapAllGather(cctx->comm->bootstrap, vasBuf, sizeof(uintptr_t)));
-
-  if (hipMalloc(&mh->remoteVasDev, sizeof(uintptr_t) * cctx->nranks) != hipSuccess) {
-    free(vasBuf);
-    free(mh);
-    return ncclSystemError;
-  }
-  if (hipMemcpy(mh->remoteVasDev, vasBuf, sizeof(uintptr_t) * cctx->nranks, hipMemcpyHostToDevice) !=
-      hipSuccess) {
-    (void)hipFree(mh->remoteVasDev);
-    free(vasBuf);
-    free(mh);
-    return ncclSystemError;
-  }
-  free(vasBuf);
-
   if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
-    (void)hipFree(mh->remoteVasDev);
     free(mh);
     return ncclSystemError;
   }
 
   ncclGinAnvilSdmaMemHandle hostMh;
-  hostMh.baseAddr = (uintptr_t)lsaSelfAddr;
-  hostMh.remoteVas = mh->remoteVasDev;
+  hostMh.lsaFlatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase) + mem->bigOffset + memOff;
+  hostMh.stride4G = static_cast<uint32_t>(devr->bigSize >> 32);
   (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
 
-  INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaSelf=%p +%zu", data, lsaSelfAddr, size);
+  INFO(NCCL_INIT, "GIN anvil-sdma: registered addr=%p lsaFlatBase=%p stride4G=%u +%zu", data,
+       (void*)hostMh.lsaFlatBase, hostMh.stride4G, size);
 
   *mhandle = mh;
   *ginHandle = mh->devHandle;
@@ -243,7 +239,6 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   ginAnvilMemHandle* mh = (ginAnvilMemHandle*)mhandle;
   if (!mh) return ncclSuccess;
 
-  if (mh->remoteVasDev) (void)hipFree(mh->remoteVasDev);
   if (mh->devHandle) (void)hipFree(mh->devHandle);
   free(mh);
   return ncclSuccess;
