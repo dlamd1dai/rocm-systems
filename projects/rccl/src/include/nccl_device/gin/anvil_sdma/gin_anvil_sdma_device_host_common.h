@@ -9,7 +9,7 @@
 
 #include <stdint.h>
 
-#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 111
+#define NCCL_GIN_ANVIL_SDMA_NET_VERSION 112
 
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17111u
@@ -43,10 +43,10 @@ struct ncclGinAnvilSdmaGPUContext {
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  // Rank-0 slot base in local LSA flat layout (SDMA path via add4G).
-  uintptr_t lsaFlatBase;
-  uint32_t stride4G;  // devr->bigSize >> 32; peer stride for ncclGetLsaPointer-style lookup
-  // Per-rank registration VAs (allgather at regMrSym). SDMA may use remoteVas[worldRank]+off.
+  // This rank's symmetric LSA flat VA (ncclDevrGetLsaSelfAddr); peer slots via add4G delta.
+  uintptr_t baseAddr;
+  uint32_t stride4G;  // devr->bigSize >> 32
+  // Per-rank symmetric bases (allgather at regMrSym); optional SDMA fallback.
   uintptr_t* remoteVas;  // device pointer, length nRanks
   int nRanks;
 };
