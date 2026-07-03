@@ -23,7 +23,6 @@
  *****************************************************************************/
 
 #include "build_info.hpp"
-#include "rocshmem/rocshmem.hpp"
 #include "rocshmem_config_embedded.hpp"
 #include "util.hpp"
 
@@ -156,7 +155,7 @@ void print_build_info(std::ostream& os) {
   os << "#                                rocSHMEM Info                                 #\n";
   os << "################################################################################\n";
 
-  print_entry(os, "Version", rocshmem::VERSION);
+  print_entry(os, "Version", ROCSHMEM_VERSION);
   print_entry(os, "Vendor String", ROCSHMEM_VENDOR_STRING);
   print_entry(os, "Git Hash", ROCSHMEM_GIT_HASH);
   print_entry(os, "Build Type", ROCSHMEM_BUILD_TYPE);
