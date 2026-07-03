@@ -217,6 +217,11 @@ RUN cd rocshmem/src/projects/rocshmem \
       -DCMAKE_INSTALL_PREFIX=${ROCSHMEM_INSTALL_DIR} \
       -DUSE_IPC=ON \
       -DUSE_SDMA=$([ "${ROCSHMEM_USE_SDMA}" = "1" ] && echo ON || echo OFF) \
+      -DBUILD_FUNCTIONAL_TESTS=OFF \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_CTESTS=OFF \
+      -DBUILD_PYTHON_TESTS=OFF \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug")
 
 ## building RCCL

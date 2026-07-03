@@ -127,7 +127,7 @@ RUN set -eu; \
 
 ## Set ROCm path
 ENV ROCM_PATH=/opt/rocm
-# System OpenMPI from apt. 
+# System OpenMPI from apt.
 # rocSHMEM MPI_ROOT, rccl-tests CMAKE_PREFIX_PATH use these.
 ENV MPI_INSTALL_PREFIX=/usr
 ENV MPI_INSTALL_DIR=/usr
@@ -218,6 +218,11 @@ RUN cd rocshmem/src/projects/rocshmem \
       -DCMAKE_INSTALL_PREFIX=${ROCSHMEM_INSTALL_DIR} \
       -DUSE_IPC=ON \
       -DUSE_SDMA=ON \
+      -DBUILD_FUNCTIONAL_TESTS=OFF \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DBUILD_EXAMPLES=OFF \
+      -DBUILD_CTESTS=OFF \
+      -DBUILD_PYTHON_TESTS=OFF \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug")
 
 ## building RCCL
