@@ -21,12 +21,62 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 # IN THE SOFTWARE.
 ###############################################################################
-# SOURCES
+# rocshmem_info — host-only diagnostic binary
 ###############################################################################
+
+# Do not link roc::rocshmem: its PUBLIC -fgpu-rdc interface triggers HIP device
+# link / LTO that records RHEL-style /usr/lib64/libc.so prerequisites and breaks
+# on Debian/Ubuntu (Dockerfile-rccl-gin-gda-sdma, Ubuntu 24.04).
+
+set(_rocshmem_info_sources
+  ${CMAKE_SOURCE_DIR}/src/build_info.cpp
+  ${CMAKE_SOURCE_DIR}/src/envvar.cpp
+  ${CMAKE_SOURCE_DIR}/tools/rocshmem_info_alloc_stub.cpp
+)
+
+if(USE_GDA)
+  list(APPEND _rocshmem_info_sources
+    ${CMAKE_SOURCE_DIR}/src/gda/topology.cpp
+    ${CMAKE_SOURCE_DIR}/src/gda/ibv_wrapper.cpp
+    ${CMAKE_SOURCE_DIR}/src/memory/memory_allocator.cpp
+  )
+endif()
+
+add_library(rocshmem_info_host STATIC ${_rocshmem_info_sources})
+
+target_include_directories(rocshmem_info_host
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_BINARY_DIR}/include/rocshmem
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_compile_options(rocshmem_info_host PRIVATE -fno-gpu-rdc)
+
+target_link_libraries(rocshmem_info_host
+  PUBLIC
+    hip::host
+    hsa-runtime64::hsa-runtime64
+    Threads::Threads
+    dl
+)
+
+if(USE_GDA)
+  target_link_libraries(rocshmem_info_host PUBLIC numa::numa)
+endif()
 
 add_executable(rocshmem_info rocshmem_info.cpp)
 
-target_link_libraries(rocshmem_info
+target_include_directories(rocshmem_info
   PRIVATE
-    roc::rocshmem
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
 )
+
+target_compile_options(rocshmem_info PRIVATE -fno-gpu-rdc)
+
+target_link_libraries(rocshmem_info PRIVATE rocshmem_info_host)
+
+set_target_properties(rocshmem_info PROPERTIES LINKER_LANGUAGE CXX)
