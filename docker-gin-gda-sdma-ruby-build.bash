@@ -34,6 +34,7 @@ mkdir -p extra-rdma-debs
 
 N=1
 ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
+    --network="${DOCKER_BUILD_NETWORK}" \
     --no-cache \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
