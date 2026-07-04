@@ -52,6 +52,12 @@ target_include_directories(rocshmem_info_host
     ${CMAKE_SOURCE_DIR}/src
 )
 
+# GDA sources include rocshmem.hpp, which pulls in <mpi.h> when HAVE_EXTERNAL_MPI
+# is set.  hipcc does not inherit MPI include paths from FindMPI unless we add them.
+if(HAVE_EXTERNAL_MPI AND MPI_CXX_FOUND)
+  target_include_directories(rocshmem_info_host PRIVATE ${MPI_CXX_INCLUDE_DIRS})
+endif()
+
 target_compile_options(rocshmem_info_host PRIVATE -fno-gpu-rdc)
 
 target_link_libraries(rocshmem_info_host
