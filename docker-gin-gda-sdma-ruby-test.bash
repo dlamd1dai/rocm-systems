@@ -346,7 +346,7 @@ if _run_test 2; then
     -x NCCL_NET_PLUGIN=none \
     -x NCCL_ENV_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x NCCL_DEBUG=VERSION \
+    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=2 \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
