@@ -243,7 +243,7 @@ if(BUILD_TESTS)
     )
   endif()
 
-  if(ENABLE_ROCSHMEM_GIN AND ENABLE_ROCSHMEM)
+  if(ENABLE_ROCSHMEM_GIN AND (ENABLE_ROCSHMEM OR GIN_ANVIL_UNIT_TESTS))
     list(APPEND TEST_FIXTURE_SOURCE_FILES
       device/GinAnvilSdmaTemplate_test.cpp
     )
@@ -260,7 +260,7 @@ if(BUILD_TESTS)
     target_compile_definitions(rccl-UnitTestsFixtures PRIVATE ENABLE_ROCSHMEM_GIN)
   endif()
 
-  if(ENABLE_ROCSHMEM_GIN AND ENABLE_ROCSHMEM)
+  if(ENABLE_ROCSHMEM_GIN AND (ENABLE_ROCSHMEM OR GIN_ANVIL_UNIT_TESTS))
     target_compile_definitions(rccl-UnitTestsFixtures PRIVATE ENABLE_ROCSHMEM)
   endif()
 
@@ -436,7 +436,7 @@ if(BUILD_TESTS)
   endforeach()
 
   # Suite H: shadow rocSHMEM sdma headers with no-op test stubs (higher-priority include path).
-  if(ENABLE_ROCSHMEM_GIN AND ENABLE_ROCSHMEM)
+  if(ENABLE_ROCSHMEM_GIN AND (ENABLE_ROCSHMEM OR GIN_ANVIL_UNIT_TESTS))
     target_include_directories(rccl-UnitTestsFixtures PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device)
     if(ROCSHMEM_SOURCE_DIR)
       target_include_directories(rccl-UnitTestsFixtures PRIVATE ${ROCSHMEM_SOURCE_DIR}/src)
