@@ -59,6 +59,7 @@ RCCL_TESTS_SRC="${REPO_ROOT}/projects/rccl-tests"
 
 BM_BUILD_ROCSHMEM="${GIN_ANVIL_BM_ROOT}/build/rocshmem"
 BM_BUILD_RCCL_UNIT="${GIN_ANVIL_BM_ROOT}/build/rccl-unit"
+BM_BUILD_RCCL_LIB="${GIN_ANVIL_BM_ROOT}/build/rccl-lib"
 BM_BUILD_RCCL_TESTS="${GIN_ANVIL_BM_ROOT}/build/rccl-tests"
 BM_LOG_DIR="${GIN_ANVIL_BM_ROOT}/logs"
 
@@ -226,13 +227,9 @@ _build_docker() {
   _log "docker image: ${DOCKER_IMAGE}"
 }
 
-_build_bare_metal() {
-  _log "=== Phase: build (bare-metal → ${GIN_ANVIL_BM_ROOT}) ==="
-  _clean_bm_build
-  mkdir -p "${GIN_ANVIL_BM_ROOT}/install" "${BM_BUILD_ROCSHMEM}" "${BM_BUILD_RCCL_TESTS}" "${BM_BUILD_RCCL_UNIT}"
-
+_build_bare_metal_rocshmem() {
   local -a rocmshmem_extra=()
-  local build_unit_tests=OFF use_external_mpi=OFF
+  local build_unit_tests=OFF
 
   if _rocshmem_want_suite_f; then
     if ! _mpi_dev_ready; then
@@ -240,7 +237,6 @@ _build_bare_metal() {
       _die "MPI dev headers not found (set GIN_ANVIL_BUILD_SUITE_F=0 to skip suite F)"
     fi
     build_unit_tests=ON
-    use_external_mpi=ON
     _log "MPI prefix: ${MPI_PREFIX} (suite F enabled)"
     rocmshmem_extra+=(
       -DUSE_EXTERNAL_MPI=ON
@@ -267,8 +263,9 @@ _build_bare_metal() {
       -DBUILD_PYTHON_TESTS=OFF \
       "${rocmshmem_extra[@]}"
   )
+}
 
-  _log "building RCCL (ENABLE_ROCSHMEM_GIN=ON)..."
+_apply_rccl_wrap_patch() {
   local rccl_wrap="${RCCL_SRC}/src/rccl_wrap.cc"
   local rccl_wrap_bak="${RCCL_SRC}/src/rccl_wrap.cc.gin-anvil-bak"
   if [[ ! -f "${rccl_wrap_bak}" ]]; then
@@ -277,6 +274,26 @@ _build_bare_metal() {
   sed -i \
     's/if (comm->enableRocshmem && comm->nNodes > 1 && (comm->nRanks\/comm->nNodes == 8) && comm->rocshmemThreshold <= 1048576)/if (comm->enableRocshmem)/' \
     "${rccl_wrap}"
+}
+
+_build_bare_metal_rccl_unit() {
+  _log "building RCCL unit tests (suites A–H, G) in ${BM_BUILD_RCCL_UNIT}..."
+  cmake -S "${RCCL_SRC}" -B "${BM_BUILD_RCCL_UNIT}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_ROCSHMEM_GIN=ON \
+    -DENABLE_ROCSHMEM=ON \
+    -DBUILD_TESTS=ON \
+    -DGPU_TARGETS="${GIN_ANVIL_GPU_ARCH}" \
+    -DROCSHMEM_INSTALL_DIR="${ROCSHMEM_INSTALL_DIR}" \
+    -DROCSHMEM_SOURCE_DIR="${ROCSHMEM_SRC}" \
+    -DROCSHMEM_BUILD_DIR="${BM_BUILD_ROCSHMEM}/include/rocshmem"
+  cmake --build "${BM_BUILD_RCCL_UNIT}" \
+    --target rccl-UnitTestsFixtures rccl-UnitTestsGinAnvilPlugin -j"$(nproc)"
+}
+
+_build_bare_metal_rccl_install() {
+  _log "building RCCL library (install.sh → ${RCCL_INSTALL_PREFIX})..."
+  _apply_rccl_wrap_patch
   (
     cd "${RCCL_SRC}"
     ./install.sh \
@@ -290,7 +307,9 @@ _build_bare_metal() {
          -DROCSHMEM_SOURCE_DIR=${ROCSHMEM_SRC} \
          -DROCSHMEM_BUILD_DIR=${BM_BUILD_ROCSHMEM}/include/rocshmem"
   )
+}
 
+_build_bare_metal_rccl_tests() {
   _log "building rccl-tests (alltoall_perf)..."
   local rccl_tests_prefix="${RCCL_INSTALL_PREFIX}"
   if _mpi_dev_ready; then
@@ -308,21 +327,31 @@ _build_bare_metal() {
     -DRCCL_SOURCE_DIR="${RCCL_SRC}" \
     -DCMAKE_PREFIX_PATH="${rccl_tests_prefix}"
   cmake --build "${BM_BUILD_RCCL_TESTS}" -j"$(nproc)"
+}
 
-  _log "building RCCL unit tests (suites A–H, G)..."
-  cmake -S "${RCCL_SRC}" -B "${BM_BUILD_RCCL_UNIT}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_ROCSHMEM_GIN=ON \
-    -DENABLE_ROCSHMEM=ON \
-    -DBUILD_TESTS=ON \
-    -DGPU_TARGETS="${GIN_ANVIL_GPU_ARCH}" \
-    -DROCSHMEM_INSTALL_DIR="${ROCSHMEM_INSTALL_DIR}" \
-    -DROCSHMEM_SOURCE_DIR="${ROCSHMEM_SRC}" \
-    -DROCSHMEM_BUILD_DIR="${BM_BUILD_ROCSHMEM}/include/rocshmem"
-  cmake --build "${BM_BUILD_RCCL_UNIT}" \
-    --target rccl-UnitTestsFixtures rccl-UnitTestsGinAnvilPlugin -j"$(nproc)"
+_build_bare_metal_unit_only() {
+  _log "=== Phase: build (bare-metal unit → ${GIN_ANVIL_BM_ROOT}) ==="
+  _clean_bm_build
+  mkdir -p "${GIN_ANVIL_BM_ROOT}/install" "${BM_BUILD_ROCSHMEM}" "${BM_BUILD_RCCL_UNIT}"
+  _build_bare_metal_rocshmem
+  _build_bare_metal_rccl_unit
+  _log "bare-metal unit build complete"
+}
 
-  _log "bare-metal build complete"
+_build_bare_metal_full() {
+  _log "=== Phase: build (bare-metal full → ${GIN_ANVIL_BM_ROOT}) ==="
+  _clean_bm_build
+  mkdir -p "${GIN_ANVIL_BM_ROOT}/install" \
+    "${BM_BUILD_ROCSHMEM}" "${BM_BUILD_RCCL_UNIT}" "${BM_BUILD_RCCL_TESTS}"
+  _build_bare_metal_rocshmem
+  _build_bare_metal_rccl_install
+  _build_bare_metal_rccl_tests
+  _build_bare_metal_rccl_unit
+  _log "bare-metal full build complete"
+}
+
+_build_bare_metal() {
+  _build_bare_metal_full
 }
 
 _build() {
@@ -369,8 +398,8 @@ _unit_build_if_missing() {
   if [[ -x "${fixtures}" && -x "${plugin}" && -x "${factory}" ]]; then
     return 0
   fi
-  _log "unit test binaries missing; running bare-metal build..."
-  GIN_ANVIL_LAYOUT=bare-metal _build_bare_metal
+  _log "unit test binaries missing; running bare-metal unit build..."
+  _build_bare_metal_unit_only
 }
 
 _unit() {
