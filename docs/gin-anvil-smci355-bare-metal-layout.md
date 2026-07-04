@@ -69,7 +69,18 @@ Set these before running integration tests manually, or let `gin-anvil-smci355-t
 | `GIN_ANVIL_BM_ROOT` | `$REPO_ROOT/gin-anvil-bm` | Layout root |
 | `ROCM_PATH` | `/opt/rocm` | ROCm install |
 | `GIN_ANVIL_GPU_ARCH` | `gfx950` | `-DGPU_TARGETS` / `--amdgpu_targets` |
-| `MPI_PREFIX` | `/usr` | Open MPI for rocSHMEM cmake |
+| `MPI_PREFIX` | auto-detected | Open MPI prefix; Debian layout is often `/usr/lib/x86_64-linux-gnu/openmpi` |
+| `GIN_ANVIL_BUILD_SUITE_F` | `0` | **Off by default.** Set `1` to build/run rocSHMEM factory unit tests (suite F) on host |
+| `GIN_ANVIL_PREFLIGHT_MPI` | `warn` (docker) / `require` (bare-metal) | `libopenmpi-dev` / `mpi.h` preflight; see `docker-gin-gda-sdma-preflight.bash` |
+| `GIN_ANVIL_CLEAN` | `0` | Set `1` to wipe `gin-anvil-bm/build` before a bare-metal rebuild |
+
+**Open MPI on host:** Preflight checks for `libopenmpi-dev` / `mpi.h`. With the default workflow (suite F off, docker integration), a missing package produces a **warning** only. Install when using bare-metal integration or opt-in suite F:
+
+```bash
+sudo apt-get install -y openmpi-bin libopenmpi-dev
+```
+
+Factory / SDMA queue coverage on MI355X is expected from **docker Test#5** (`RCCL_GIN_RUN_TESTS=5`), not host suite F.
 | `ROCSHMEM_INSTALL_DIR` | `$GIN_ANVIL_BM_ROOT/install/rocshmem` | rocSHMEM prefix |
 | `RCCL_INSTALL_PREFIX` | `$GIN_ANVIL_BM_ROOT/install/rccl` | RCCL prefix |
 
@@ -123,7 +134,7 @@ export MPI_PREFIX=/usr
 
 source ./docker-gin-gda-sdma-preflight.bash
 
-# 1) rocSHMEM (USE_SDMA=ON, unit tests ON for suite F)
+# 1) rocSHMEM (USE_SDMA=ON; BUILD_UNIT_TESTS=ON only when GIN_ANVIL_BUILD_SUITE_F=1)
 mkdir -p "${GIN_ANVIL_BM_ROOT}/build/rocshmem"
 cd "${GIN_ANVIL_BM_ROOT}/build/rocshmem"
 "${REPO_ROOT}/projects/rocshmem/scripts/build_configs/all_backends" \
@@ -243,9 +254,10 @@ mpirun -n 8 --allow-run-as-root \
 
 Recommended workflow on `smci355-ccs-aus-m03-17`:
 
-1. `./gin-anvil-smci355-test.bash all` — full docker regression + host unit tests.
-2. After code edits: `GIN_ANVIL_LAYOUT=bare-metal ./gin-anvil-smci355-test.bash build unit integration` — faster loop.
-3. Before merge: docker `all` again for image parity with CI.
+1. `./gin-anvil-smci355-test.bash all` — docker C1+C2 + host unit suites A–H, G (suite F off).
+2. After code edits: `GIN_ANVIL_SKIP_DOCKER_REBUILD=1 ./gin-anvil-smci355-test.bash unit` — RCCL unit only.
+3. Optional host suite F: `GIN_ANVIL_BUILD_SUITE_F=1` after `libopenmpi-dev` install.
+4. Bare-metal integration: `GIN_ANVIL_LAYOUT=bare-metal` (requires host MPI; preflight enforces).
 
 ---
 

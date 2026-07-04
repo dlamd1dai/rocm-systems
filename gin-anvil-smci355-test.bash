@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # gin-anvil-smci355-test.bash — GIN Anvil SDMA test runner for smci355-ccs-aus-m03-17 (MI355X / gfx950)
 #
-# Runs preflight, build, GTest unit suites A–H, and integration tests (C1/C2) per
+# Runs preflight, build, GTest unit suites A–H + G (suite F opt-in), and integration (C1/C2) per
 # docs/gin-anvil-sdma-unit-test-plan.md and docs/gin-anvil-sdma-backend-design.md.
 #
 # Usage:
@@ -46,8 +46,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-${SCRIPT_DIR}}"
 GIN_ANVIL_BM_ROOT="${GIN_ANVIL_BM_ROOT:-${REPO_ROOT}/gin-anvil-bm}"
 ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
-MPI_PREFIX="${MPI_PREFIX:-/usr}"
+MPI_PREFIX="${MPI_PREFIX:-}"
 ROCSHMEM_INSTALL_DIR="${ROCSHMEM_INSTALL_DIR:-${GIN_ANVIL_BM_ROOT}/install/rocshmem}"
+GIN_ANVIL_BUILD_SUITE_F="${GIN_ANVIL_BUILD_SUITE_F:-0}"
+GIN_ANVIL_SKIP_DOCKER_REBUILD="${GIN_ANVIL_SKIP_DOCKER_REBUILD:-0}"
 RCCL_INSTALL_PREFIX="${RCCL_INSTALL_PREFIX:-${GIN_ANVIL_BM_ROOT}/install/rccl}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-${GIN_ANVIL_DOCKER_IMAGE_DEFAULT}}"
 
@@ -109,22 +111,115 @@ _setup_log() {
 }
 
 _bm_runtime_env() {
-  export PATH="${ROCSHMEM_INSTALL_DIR}/bin:${RCCL_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${MPI_PREFIX}/bin:${PATH}"
+  export PATH="${ROCSHMEM_INSTALL_DIR}/bin:${RCCL_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${MPI_PREFIX:+$MPI_PREFIX/bin:}${PATH}"
   export LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${ROCSHMEM_INSTALL_DIR}/lib:${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
   export ROCM_PATH
+}
+
+_docker_gpu_run() {
+  # verify/integration need GPU + IPC; plain `docker run --rm` fails rocshmem_info.
+  docker run --rm --init \
+    --device /dev/dri --device /dev/kfd --ipc host \
+    --group-add video --group-add render \
+    ${DOCKER_EXTRA:-} \
+    "$@"
+}
+
+_resolve_mpi() {
+  local cand inc
+
+  if [[ -n "${MPI_PREFIX}" && -f "${MPI_PREFIX}/include/mpi.h" ]]; then
+    return 0
+  fi
+
+  if command -v mpicc >/dev/null 2>&1; then
+    inc="$(mpicc -showme:incdirs 2>/dev/null | awk '{print $1}')"
+    if [[ -n "${inc}" && -f "${inc}/mpi.h" ]]; then
+      MPI_PREFIX="$(dirname "${inc}")"
+      return 0
+    fi
+  fi
+
+  for cand in \
+    /usr/lib/x86_64-linux-gnu/openmpi \
+    /usr/lib64/openmpi \
+    /opt/openmpi \
+    /opt/ompi \
+    /usr/local \
+    /usr; do
+    if [[ -f "${cand}/include/mpi.h" ]]; then
+      MPI_PREFIX="${cand}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+_mpi_dev_ready() {
+  _resolve_mpi
+}
+
+_rocshmem_want_suite_f() {
+  case "${GIN_ANVIL_BUILD_SUITE_F}" in
+    0|off|no|false|skip) return 1 ;;
+    1|on|yes|true|force) return 0 ;;
+    auto) _mpi_dev_ready ;;
+    *)
+      _log "warning: unknown GIN_ANVIL_BUILD_SUITE_F=${GIN_ANVIL_BUILD_SUITE_F}; suite F disabled"
+      return 1
+      ;;
+  esac
+}
+
+_mpi_missing_hint() {
+  cat >&2 <<EOF
+[gin-anvil-smci355] Open MPI development headers are required when GIN_ANVIL_BUILD_SUITE_F=1
+or GIN_ANVIL_LAYOUT=bare-metal.  On Ubuntu 22.04:
+
+  sudo apt-get install -y openmpi-bin libopenmpi-dev
+
+Then re-run with a clean rocSHMEM build dir:
+
+  GIN_ANVIL_CLEAN=1 ./gin-anvil-smci355-test.bash unit
+
+Default workflow skips suite F (suites A–H and G on host; factory coverage via docker Test#5).
+EOF
+}
+
+_clean_bm_build() {
+  if [[ "${GIN_ANVIL_CLEAN:-0}" == 1 ]]; then
+    _log "GIN_ANVIL_CLEAN=1: removing ${GIN_ANVIL_BM_ROOT}/build"
+    rm -rf "${GIN_ANVIL_BM_ROOT}/build"
+  fi
 }
 
 _preflight() {
   _log "=== Phase: preflight (B1) ==="
   cd "${REPO_ROOT}"
+
+  if [[ -z "${GIN_ANVIL_PREFLIGHT_MPI:-}" ]]; then
+    if [[ "${GIN_ANVIL_LAYOUT}" == bare-metal ]] || _rocshmem_want_suite_f; then
+      GIN_ANVIL_PREFLIGHT_MPI=require
+    else
+      GIN_ANVIL_PREFLIGHT_MPI=warn
+    fi
+  fi
+  export GIN_ANVIL_PREFLIGHT_MPI
+
   # shellcheck source=docker-gin-gda-sdma-preflight.bash
   source ./docker-gin-gda-sdma-preflight.bash
-  _log "preflight OK"
+  _log "preflight OK (GIN_ANVIL_PREFLIGHT_MPI=${GIN_ANVIL_PREFLIGHT_MPI})"
 }
 
 _build_docker() {
   _log "=== Phase: build (docker, gfx950) ==="
   cd "${REPO_ROOT}"
+  if [[ "${GIN_ANVIL_SKIP_DOCKER_REBUILD}" == 1 ]] \
+     && docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+    _log "GIN_ANVIL_SKIP_DOCKER_REBUILD=1: reusing existing image ${DOCKER_IMAGE}"
+    return 0
+  fi
   mkdir -p extra-rdma-debs
   RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}" \
     ./docker-gin-gda-sdma-build.bash
@@ -133,21 +228,44 @@ _build_docker() {
 
 _build_bare_metal() {
   _log "=== Phase: build (bare-metal → ${GIN_ANVIL_BM_ROOT}) ==="
+  _clean_bm_build
   mkdir -p "${GIN_ANVIL_BM_ROOT}/install" "${BM_BUILD_ROCSHMEM}" "${BM_BUILD_RCCL_TESTS}" "${BM_BUILD_RCCL_UNIT}"
 
-  _log "building rocSHMEM (USE_SDMA=ON, BUILD_UNIT_TESTS=ON)..."
+  local -a rocmshmem_extra=()
+  local build_unit_tests=OFF use_external_mpi=OFF
+
+  if _rocshmem_want_suite_f; then
+    if ! _mpi_dev_ready; then
+      _mpi_missing_hint
+      _die "MPI dev headers not found (set GIN_ANVIL_BUILD_SUITE_F=0 to skip suite F)"
+    fi
+    build_unit_tests=ON
+    use_external_mpi=ON
+    _log "MPI prefix: ${MPI_PREFIX} (suite F enabled)"
+    rocmshmem_extra+=(
+      -DUSE_EXTERNAL_MPI=ON
+      -DMPI_ROOT="${MPI_PREFIX}"
+      -DCMAKE_PREFIX_PATH="${MPI_PREFIX}"
+    )
+  else
+    _log "building rocSHMEM without external MPI (suite F skipped; matches docker image flags)"
+    rocmshmem_extra+=(-DUSE_EXTERNAL_MPI=OFF)
+  fi
+
+  _log "building rocSHMEM (USE_SDMA=ON, BUILD_UNIT_TESTS=${build_unit_tests})..."
   (
     cd "${BM_BUILD_ROCSHMEM}"
     "${ROCSHMEM_SRC}/scripts/build_configs/all_backends" \
       -DUSE_SDMA=ON \
+      -DUSE_IPC=ON \
       -DGPU_TARGETS="${GIN_ANVIL_GPU_ARCH}" \
       -DCMAKE_INSTALL_PREFIX="${ROCSHMEM_INSTALL_DIR}" \
-      -DMPI_ROOT="${MPI_PREFIX}" \
       -DBUILD_FUNCTIONAL_TESTS=OFF \
-      -DBUILD_UNIT_TESTS=ON \
+      -DBUILD_UNIT_TESTS="${build_unit_tests}" \
       -DBUILD_EXAMPLES=OFF \
       -DBUILD_CTESTS=OFF \
-      -DBUILD_PYTHON_TESTS=OFF
+      -DBUILD_PYTHON_TESTS=OFF \
+      "${rocmshmem_extra[@]}"
   )
 
   _log "building RCCL (ENABLE_ROCSHMEM_GIN=ON)..."
@@ -174,6 +292,10 @@ _build_bare_metal() {
   )
 
   _log "building rccl-tests (alltoall_perf)..."
+  local rccl_tests_prefix="${RCCL_INSTALL_PREFIX}"
+  if _mpi_dev_ready; then
+    rccl_tests_prefix="${RCCL_INSTALL_PREFIX};${MPI_PREFIX}"
+  fi
   cmake -S "${RCCL_TESTS_SRC}" -B "${BM_BUILD_RCCL_TESTS}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DUSE_MPI=ON \
@@ -184,7 +306,7 @@ _build_bare_metal() {
     -DROCSHMEM_SOURCE_DIR="${ROCSHMEM_SRC}" \
     -DROCSHMEM_BUILD_DIR="${BM_BUILD_ROCSHMEM}/include/rocshmem" \
     -DRCCL_SOURCE_DIR="${RCCL_SRC}" \
-    -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_PREFIX}"
+    -DCMAKE_PREFIX_PATH="${rccl_tests_prefix}"
   cmake --build "${BM_BUILD_RCCL_TESTS}" -j"$(nproc)"
 
   _log "building RCCL unit tests (suites A–H, G)..."
@@ -217,8 +339,8 @@ _verify() {
   _log "=== Phase: verify (B3/B4) ==="
   case "${GIN_ANVIL_LAYOUT}" in
     docker)
-      docker run --rm "${DOCKER_IMAGE}" rocshmem/bin/rocshmem_info | head -40 || true
-      docker run --rm "${DOCKER_IMAGE}" sh -lc \
+      _docker_gpu_run "${DOCKER_IMAGE}" rocshmem/bin/rocshmem_info | head -40 || true
+      _docker_gpu_run "${DOCKER_IMAGE}" sh -lc \
         'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
          rf=$(readlink -f "$f"); objdump -T "$rf" 2>/dev/null | grep mlx5dv_reg_dmabuf_mr || echo "MLX5 DMA-BUF symbol missing"' \
         || true
@@ -262,7 +384,6 @@ _unit() {
 
   [[ -x "${fixtures}" ]] || _die "missing ${fixtures}"
   [[ -x "${plugin}" ]] || _die "missing ${plugin}"
-  [[ -x "${factory}" ]] || _die "missing ${factory}"
 
   _log "--- Suite A–E + H: rccl-UnitTestsFixtures (GinAnvil*) ---"
   "${fixtures}" --gtest_filter='GinAnvil*'
@@ -273,8 +394,12 @@ _unit() {
   _log "--- Suite G: rccl-UnitTestsGinAnvilPlugin ---"
   "${plugin}" --gtest_filter='GinAnvilPluginTest.*'
 
-  _log "--- Suite F: rocshmem_unit_tests (factory) ---"
-  "${factory}" --gtest_filter='GinAnvilSdmaFactoryTest.*'
+  if [[ -x "${factory}" ]]; then
+    _log "--- Suite F: rocshmem_unit_tests (factory) ---"
+    "${factory}" --gtest_filter='GinAnvilSdmaFactoryTest.*'
+  else
+    _log "note: suite F skipped (default; factory covered by docker Test#5). Opt in: GIN_ANVIL_BUILD_SUITE_F=1 + libopenmpi-dev"
+  fi
 
   _log "unit tests passed"
 }
@@ -294,6 +419,11 @@ _integration_bare_metal() {
   _log "=== Phase: integration (bare-metal) RCCL_GIN_RUN_TESTS=${RCCL_GIN_RUN_TESTS} ==="
   local perf="${BM_BUILD_RCCL_TESTS}/alltoall_perf"
   [[ -x "${perf}" ]] || _die "missing ${perf}; run: GIN_ANVIL_LAYOUT=bare-metal $0 build"
+
+  if ! command -v mpirun >/dev/null 2>&1; then
+    _mpi_missing_hint
+    _die "mpirun not found on PATH"
+  fi
 
   _bm_runtime_env
 
@@ -389,7 +519,7 @@ Phases:
   all           preflight + build + unit + integration (default)
   preflight     source docker-gin-gda-sdma-preflight.bash
   build         docker image OR bare-metal tree (GIN_ANVIL_LAYOUT)
-  unit          GTest suites A–H, F, G on host (always bare-metal binaries)
+  unit          GTest suites A–H + G on host; suite F off by default (opt-in)
   integration   Test#1 + Test#5 (docker or bare-metal)
   isolation     Test#5 with THRESHOLD=0 and THRESHOLD=65536
   verify        rocshmem_info + MLX5 symbol check
@@ -400,6 +530,11 @@ Key environment variables:
   GIN_ANVIL_NP=8                       mpirun rank count
   GIN_ANVIL_MAX_BYTES=128M             alltoall_perf -e
   GIN_ANVIL_BM_ROOT=~/rocm-systems/gin-anvil-bm
+  GIN_ANVIL_BUILD_SUITE_F=0|1|auto       default 0; 1=host rocSHMEM factory tests (suite F)
+  GIN_ANVIL_PREFLIGHT_MPI=skip|warn|require  libopenmpi-dev check (auto: warn for docker, require for bare-metal)
+  GIN_ANVIL_CLEAN=1                    wipe gin-anvil-bm/build before bare-metal build
+  GIN_ANVIL_SKIP_DOCKER_REBUILD=1      reuse existing docker image if present
+  MPI_PREFIX=/usr/lib/x86_64-linux-gnu/openmpi
   RCCL_GIN_RUN_TESTS=1,5               harness test selection
   TEST5_NUM_CHANNELS=1                 NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS
   NCCL_GIN_ANVIL_SDMA_THRESHOLD        IPC vs SDMA boundary (optional)
