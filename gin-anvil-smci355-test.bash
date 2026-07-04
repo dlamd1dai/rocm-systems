@@ -278,10 +278,16 @@ _apply_rccl_wrap_patch() {
 
 _build_bare_metal_rccl_unit() {
   _log "building RCCL unit tests (suites A–H, G) in ${BM_BUILD_RCCL_UNIT}..."
+  # Match docker image RCCL profile: GIN plugin only in librccl (no full rocSHMEM device
+  # sym kernels), no custom device linker.  GIN_ANVIL_UNIT_TESTS enables suite H on the
+  # test binary via ENABLE_ROCSHMEM compile def without linking librocshmem into librccl.
   cmake -S "${RCCL_SRC}" -B "${BM_BUILD_RCCL_UNIT}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_ROCSHMEM_GIN=ON \
-    -DENABLE_ROCSHMEM=ON \
+    -DENABLE_ROCSHMEM=OFF \
+    -DGIN_ANVIL_UNIT_TESTS=ON \
+    -DENABLE_DEVICE_LINKER=OFF \
+    -DONLY_FUNCS='SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda' \
     -DBUILD_TESTS=ON \
     -DGPU_TARGETS="${GIN_ANVIL_GPU_ARCH}" \
     -DROCSHMEM_INSTALL_DIR="${ROCSHMEM_INSTALL_DIR}" \

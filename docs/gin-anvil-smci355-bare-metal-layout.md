@@ -179,11 +179,14 @@ cmake -S "${REPO_ROOT}/projects/rccl-tests" -B "${GIN_ANVIL_BM_ROOT}/build/rccl-
   -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_PREFIX}"
 cmake --build "${GIN_ANVIL_BM_ROOT}/build/rccl-tests" -j"$(nproc)"
 
-# 4) GTest unit binaries (suites A–H, G)
+# 4) GTest unit binaries (suites A–H, G) — match docker librccl profile
 cmake -S "${REPO_ROOT}/projects/rccl" -B "${GIN_ANVIL_BM_ROOT}/build/rccl-unit" \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_ROCSHMEM_GIN=ON \
-  -DENABLE_ROCSHMEM=ON \
+  -DENABLE_ROCSHMEM=OFF \
+  -DGIN_ANVIL_UNIT_TESTS=ON \
+  -DENABLE_DEVICE_LINKER=OFF \
+  -DONLY_FUNCS='SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda' \
   -DBUILD_TESTS=ON \
   -DGPU_TARGETS="${GIN_ANVIL_GPU_ARCH}" \
   -DROCSHMEM_INSTALL_DIR="${ROCSHMEM_INSTALL_DIR}" \
