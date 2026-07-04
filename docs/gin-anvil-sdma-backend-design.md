@@ -2,6 +2,8 @@
 
 This document describes the **GIN Anvil SDMA** backend added to RCCL (`NCCL_NET_DEVICE_GIN_ANVIL_SDMA` / `NCCL_GIN_TYPE=5`) and the supporting **GIN Anvil SDMA factory** C API (`gin_anvil_sdma_*`). It records the main **design choices** and why they were made.
 
+**Related test docs:** integration harness — [`gin-anvil-sdma-backend-tests.md`](gin-anvil-sdma-backend-tests.md); GTest unit suites A–H — [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
+
 ## Goal
 
 Provide an **intra-node GIN backend** for xGMI topologies that:
@@ -246,7 +248,7 @@ No `rocshmem_init()` is required for this backend’s host setup (mirroring the 
 
 ## Test plan
 
-This section is the **authoritative test plan** for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in [`gin-anvil-sdma-backend-tests.md`](gin-anvil-sdma-backend-tests.md).
+This section is the **authoritative test plan** for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in [`gin-anvil-sdma-backend-tests.md`](gin-anvil-sdma-backend-tests.md). **GTest unit suites A–H** (line/branch coverage, no MPI) are documented in [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
 
 ### 1. Objectives
 
@@ -294,6 +296,53 @@ Verify that the Anvil SDMA GIN backend:
 | **B3** | `docker run --rm $IMAGE rocshmem/bin/rocshmem_info` | Reports SDMA / Anvil enabled when `USE_SDMA=ON` |
 | **B4** | `objdump -T $(readlink -f /usr/lib/x86_64-linux-gnu/libmlx5.so.1) \| grep mlx5dv_reg_dmabuf_mr` inside image | Symbol present (Test#5 preflight green) |
 | **B5** | `grep -r gin_host_rocshmem_common projects/rccl/src/CMakeLists.txt` + files on disk | CMake hipify list matches filesystem (avoids `ddai-gin-build.log` CMake failure) |
+
+### 4.1 Unit tests (GTest suites A–H)
+
+Automated **unit tests** complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target **~96% weighted line / ~95% weighted branch** across Anvil SDMA sources. Full per-test mapping and `llvm-cov` recipes: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
+
+| Suite | Binary / target | CMake flags | Source focus |
+|-------|-----------------|-------------|--------------|
+| **A** | `rccl-UnitTestsFixtures` | `ENABLE_ROCSHMEM_GIN=ON` | `gin_anvil_ipc_table_host.cc` |
+| **B–E** | `rccl-UnitTestsFixtures` | `+ ENABLE_ROCSHMEM=ON` | Device IPC resolve, copy, detail helpers, template IPC paths |
+| **H** | `rccl-UnitTestsFixtures` | same as B–E | SDMA template paths (no-op `sdma/` stubs) |
+| **F** | `rocshmem_unit_tests` | `USE_SDMA=ON`, `BUILD_TESTS=ON` | `gin_anvil_sdma_factory.cpp` |
+| **G** | `rccl-UnitTestsGinAnvilPlugin` | `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+ | `gin_plugin_anvil_sdma.cc` (mock factory) |
+
+**Quick run:**
+
+```bash
+# RCCL: suites A–E + H
+cmake -S projects/rccl -B build/rccl \
+  -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
+cmake --build build/rccl --target rccl-UnitTestsFixtures
+./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+
+# rocSHMEM: suite F
+cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
+cmake --build build/rocshmem --target rocshmem_unit_tests
+./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
+  --gtest_filter='GinAnvilSdmaFactoryTest.*'
+
+# RCCL: suite G (plugin)
+cmake --build build/rccl --target rccl-UnitTestsGinAnvilPlugin
+./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+```
+
+**Integration ↔ unit mapping** (unit tests reduce manual coverage of these integration IDs):
+
+| Integration ID | Unit coverage |
+|----------------|---------------|
+| **H3** (wrong `NCCL_GIN_TYPE`) | Suite **G1** |
+| **H4** (`connect` / bootstrap) | Suite **G4–G6**, **F** |
+| **H5** (`regMrSym` / IPC table) | Suite **A**, **G7–G9** |
+| **H6** (`createContext` + signal bind) | Suite **G10–G19** |
+| **H7** (destroy) | Suite **G19**, **F9** |
+| **D4–D8**, **N4** (device datapath / invalid ctx) | Suites **B–E**, **H** |
+| **N1** (probe without SDMA) | Suite **G2**, **F1** |
+| **N3** (bad LSA / IPC table) | Suite **G17–G18**, **A10** |
+
+Unit tests do **not** replace **C1–C2** (multi-GPU `alltoall_perf`), **D6** (OSS7 fused signal on hardware), or **P1–P5** (performance regression).
 
 ### 5. Host / plugin lifecycle
 
@@ -406,10 +455,11 @@ Anvil should lead intra-node xGMI for mid/large messages vs Test#1; vs GDA depen
 Before merge or image publish:
 
 - [ ] **B1–B5** pass on builder
+- [ ] **Unit suites A–H** pass on at least one GPU node (`GinAnvil*` gtest filters; see §4.1)
 - [ ] **C1 + C2** pass on at least one MI300/MI355 8-GPU node
 - [ ] **D1–D3** validation clean on Test#5
 - [ ] **P1** no regression vs last green perf log
-- [ ] Docs: `gin-anvil-sdma-backend-design.md` + `gin-anvil-sdma-backend-tests.md` updated
+- [ ] Docs: `gin-anvil-sdma-backend-design.md` + `gin-anvil-sdma-backend-tests.md` + `gin-anvil-sdma-unit-test-plan.md` updated
 
 ### 12. Debugging playbook
 

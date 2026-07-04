@@ -276,7 +276,7 @@ Test plan
 ---------
 
 
-This section is the authoritative test plan for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in `gin-anvil-sdma-backend-tests.md`.
+This section is the authoritative test plan for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in `gin-anvil-sdma-backend-tests.md`. GTest unit suites A–H are documented in `gin-anvil-sdma-unit-test-plan.md`.
 
 
 1. Objectives
@@ -343,6 +343,43 @@ B3       `docker run --rm $IMAGE rocshmem/bin/rocshmem_info`                    
 B4       `objdump -T $(readlink -f /usr/lib/x86_64-linux-gnu/libmlx5.so.1) \                  grep mlx5dv_reg_dmabuf_mr` inside image                                                                Symbol present (Test#5 preflight green)
 B5       `grep -r gin_host_rocshmem_common projects/rccl/src/CMakeLists.txt` + files on disk  CMake hipify list matches filesystem (avoids `ddai-gin-build.log` CMake failure)
 =======  ===================================================================================  =====================================================================================================  =======================================
+
+
+4.1 Unit tests (GTest suites A–H)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+Automated unit tests complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target ~96% weighted line / ~95% weighted branch across Anvil SDMA sources. Full per-test mapping: `gin-anvil-sdma-unit-test-plan.md`.
+
+
+=======  ============================  =====================================================  ==============================
+Suite    Binary / target               CMake flags                                            Source focus
+=======  ============================  =====================================================  ==============================
+A        `rccl-UnitTestsFixtures`      `ENABLE_ROCSHMEM_GIN=ON`                               `gin_anvil_ipc_table_host.cc`
+B–E      `rccl-UnitTestsFixtures`      `+ ENABLE_ROCSHMEM=ON`                                   Device IPC, detail, template IPC
+H        `rccl-UnitTestsFixtures`      same as B–E                                            SDMA templates (no-op stubs)
+F        `rocshmem_unit_tests`         `USE_SDMA=ON`, `BUILD_TESTS=ON`                          `gin_anvil_sdma_factory.cpp`
+G        `rccl-UnitTestsGinAnvilPlugin`  `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+                  `gin_plugin_anvil_sdma.cc`
+=======  ============================  =====================================================  ==============================
+
+
+.. code-block:: bash
+
+   cmake -S projects/rccl -B build/rccl \
+     -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
+   cmake --build build/rccl --target rccl-UnitTestsFixtures
+   ./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+
+   cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
+   cmake --build build/rocshmem --target rocshmem_unit_tests
+   ./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
+     --gtest_filter='GinAnvilSdmaFactoryTest.*'
+
+   cmake --build build/rccl --target rccl-UnitTestsGinAnvilPlugin
+   ./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+
+
+Unit tests do not replace C1–C2 (multi-GPU `alltoall_perf`), D6 (OSS7 fused signal on hardware), or P1–P5 (performance regression). See `gin-anvil-sdma-unit-test-plan.md` for integration ↔ unit ID mapping.
 
 
 5. Host / plugin lifecycle
@@ -497,10 +534,11 @@ Anvil should lead intra-node xGMI for mid/large messages vs Test#1; vs GDA depen
 Before merge or image publish:
 
 - B1–B5 pass on builder
+- Unit suites A–H pass on at least one GPU node (see §4.1)
 - C1 + C2 pass on at least one MI300/MI355 8-GPU node
 - D1–D3 validation clean on Test#5
 - P1 no regression vs last green perf log
-- Docs: `gin-anvil-sdma-backend-design.md` / `.rst` + `gin-anvil-sdma-backend-tests.md` updated
+- Docs: `gin-anvil-sdma-backend-design.md` / `.rst` + `gin-anvil-sdma-backend-tests.md` + `gin-anvil-sdma-unit-test-plan.md` updated
 
 
 12. Debugging playbook

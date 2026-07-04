@@ -1,6 +1,33 @@
 # GIN Anvil SDMA — Docker build/test harness and `alltoall_perf` command lines
 
-This note documents the **Docker build and test scripts** at the repository root for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`): how tests are selected, what each run executes, and how to tune or debug failures. For backend design and the formal pass/fail matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md).
+This note documents the **Docker build and test scripts** at the repository root for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`): how tests are selected, what each run executes, and how to tune or debug failures. For backend design and the formal pass/fail matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md). For **GTest unit suites A–H** (single-GPU, no MPI), see [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
+
+---
+
+## Unit tests (GTest, optional pre-integration)
+
+Run on **one GPU** before or alongside the Docker harness. These are **not** invoked by `docker-gin-gda-sdma-test.bash`; build RCCL/rocSHMEM tests from the same tree.
+
+| Suite | Target | Filter |
+|-------|--------|--------|
+| A–E, H | `rccl-UnitTestsFixtures` | `--gtest_filter='GinAnvil*'` |
+| G | `rccl-UnitTestsGinAnvilPlugin` | `--gtest_filter='GinAnvilPluginTest.*'` |
+| F | `rocshmem_unit_tests` | `--gtest_filter='GinAnvilSdmaFactoryTest.*'` |
+
+```bash
+cmake -S projects/rccl -B build/rccl \
+  -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
+cmake --build build/rccl --target rccl-UnitTestsFixtures rccl-UnitTestsGinAnvilPlugin
+./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+
+cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
+cmake --build build/rocshmem --target rocshmem_unit_tests
+./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
+  --gtest_filter='GinAnvilSdmaFactoryTest.*'
+```
+
+**Coverage (estimated):** ~96% weighted line / ~95% weighted branch across Anvil SDMA sources. Per-suite tables and `llvm-cov` commands: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
 
 ---
 
@@ -355,4 +382,4 @@ Do **not** bind-mount all of **`/lib/x86_64-linux-gnu`** (host glibc vs image mi
 
 ---
 
-*File: `docs/gin-anvil-sdma-backend-tests.md` — harness and command-line reference for GIN Anvil SDMA.*
+*File: `docs/gin-anvil-sdma-backend-tests.md` — harness and command-line reference for GIN Anvil SDMA. Unit tests: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).*
