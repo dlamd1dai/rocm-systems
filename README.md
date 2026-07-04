@@ -72,6 +72,7 @@ projects/
   hipother/
   hip-tests/
   rccl/
+  rccl-tests/
   rdc/
   rocdbgapi/
   rocdecode/
@@ -98,6 +99,28 @@ projects/
 - Enable unified build and test workflows across ROCm libraries.
 - Facilitate shared tooling, CI, and contributor experience.
 - Improve integration, visibility, and collaboration across ROCm library teams.
+
+## Documentation
+
+Super-repo guides live under [`docs/`](./docs/). Highlights for **RCCL GPU-Initiated Networking (GIN)** and the **GIN Anvil SDMA** intra-node backend:
+
+| Document | Description |
+|----------|-------------|
+| [`docs/gin-anvil-sdma-backend-design.md`](./docs/gin-anvil-sdma-backend-design.md) | Design, architecture, and formal test plan (`NCCL_GIN_TYPE=5`) |
+| [`docs/gin-anvil-sdma-backend-tests.md`](./docs/gin-anvil-sdma-backend-tests.md) | Docker build/test harness, `alltoall_perf -D` mapping, env tuning |
+| [`docs/continuous-integration.md`](./docs/continuous-integration.md#rccl-gin-anvil-sdma-local-validation) | CI overview and local Docker validation workflow |
+
+**Quick start (single-node MI300/MI355, 8 GPUs):**
+
+```bash
+source ./docker-gin-gda-sdma-preflight.bash   # Ruby build does this automatically
+./docker-gin-gda-sdma-build.bash
+./docker-gin-gda-sdma-test.bash 8 128M
+```
+
+Default run executes Test#1 (host baseline) and Test#5 (`NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=5`, `alltoall_perf -D 3 -V 1`). See [`docs/gin-anvil-sdma-backend-tests.md`](./docs/gin-anvil-sdma-backend-tests.md) for full harness options.
+
+Related: [`extra-rdma-debs/README.md`](./extra-rdma-debs/README.md) (newer `libmlx5` for RCCL NET init in the test image).
 
 ## Getting Started
 

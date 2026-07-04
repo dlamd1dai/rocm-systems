@@ -1,225 +1,357 @@
 # GIN Anvil SDMA — Docker build/test harness and `alltoall_perf` command lines
 
-This note documents the **Docker build and test scripts** for GIN Anvil SDMA (`NCCL_GIN_TYPE=6`), how each harness test maps to GIN backends and **`alltoall_perf -D`** modes, and practical tuning / troubleshooting. For backend design and the formal test matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md).
+This note documents the **Docker build and test scripts** at the repository root for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`): how tests are selected, what each run executes, and how to tune or debug failures. For backend design and the formal pass/fail matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md).
 
-**Scripts at repo root:**
+---
 
-| Script | Use |
-|--------|-----|
-| **`docker-gin-gda-sdma-build.bash`** | Build image on MI355X / general nodes (`docker`) |
-| **`docker-gin-gda-sdma-test.bash`** | Run Test#1–#5 harness (`docker`) |
-| **`docker-gin-gda-sdma-ruby-build.bash`** | Build on Ruby cluster (`sudo docker`, BuildKit `--network=host`) |
-| **`docker-gin-gda-sdma-ruby-test.bash`** | Same harness as above (`sudo docker`) |
-| **`docker-gin-gda-sdma-preflight.bash`** | Sourced by build scripts; validates tree before `docker build` |
+## Scripts and image
 
-**Dockerfiles / image:**
+| Script | Role |
+|--------|------|
+| [`docker-gin-gda-sdma-build.bash`](../docker-gin-gda-sdma-build.bash) | Build image (`docker`, repo root) |
+| [`docker-gin-gda-sdma-test.bash`](../docker-gin-gda-sdma-test.bash) | Run harness (`docker`) |
+| [`docker-gin-gda-sdma-ruby-build.bash`](../docker-gin-gda-sdma-ruby-build.bash) | Build on Ruby (`sudo docker`, `--network=host`) |
+| [`docker-gin-gda-sdma-ruby-test.bash`](../docker-gin-gda-sdma-ruby-test.bash) | Same harness as above (`sudo docker`) |
+| [`docker-gin-gda-sdma-preflight.bash`](../docker-gin-gda-sdma-preflight.bash) | Tree validation (sourced by Ruby build; run manually before MI355 build) |
 
 | Artifact | Value |
 |----------|--------|
-| MI355 / default Dockerfile | **`Dockerfile-rccl-gin-gda-sdma`** |
-| Ruby Dockerfile | **`Dockerfile-rccl-gin-gda-sdma-ruby`** |
+| Default Dockerfile | [`Dockerfile-rccl-gin-gda-sdma`](../Dockerfile-rccl-gin-gda-sdma) |
+| Ruby Dockerfile | [`Dockerfile-rccl-gin-gda-sdma-ruby`](../Dockerfile-rccl-gin-gda-sdma-ruby) |
 | Image tag (both) | **`rccl-gin-gda-sdma-713`** |
 
-**Sources of truth:** `projects/rccl/src/gin/`, `projects/rccl/src/include/nccl_device/net_device.h`, `projects/rccl-tests/src/alltoall.cu`.
+**Sources of truth in tree:** `projects/rccl/src/gin/`, `projects/rccl/src/include/nccl_device/net_device.h`, `projects/rccl-tests/src/alltoall.cu`.
 
 ---
 
-## 1. GIN design overview
+## Harness overview
 
-**GIN** is a **device-visible RMA abstraction**: device code issues **`gin.put`**, signals, and **`flush`** over a registered path selected by a **GIN plugin**.
-
-| Knob | Meaning |
-|------|--------|
-| **`NCCL_GIN_ENABLE`** | Master switch for GIN plugin paths. |
-| **`NCCL_GIN_TYPE`** | Selects which GIN net device / plugin RCCL wires up. |
-
-**`NCCL_GIN_TYPE` is not the same as `alltoall_perf -D`.** `-D` picks the HIP kernel (`ncclAlltoAll` vs `GinAlltoAllKernel`, etc.). There is **no `-D 5`**; **`NCCL_GIN_TYPE=5`** (GDA) still pairs with **`-D 3`**.
-
----
-
-## 2. GIN backends (`NCCL_GIN_TYPE`)
-
-| Value | Name | Role |
-|------:|------|------|
-| **0** | (none) | No GIN net device. |
-| **2** | **`NCCL_NET_DEVICE_GIN_PROXY`** | Host proxy GIN (Ib progress on host). Test#2. |
-| **3** | **`NCCL_NET_DEVICE_GIN_GDAKI`** | GDAKI path; not in default harness. |
-| *(removed)* | *was **4** = rocSHMEM API GIN* | Use **6** (Anvil SDMA) or **5** (GDA). |
-| **5** | **`NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA`** | rocSHMEM GDA `QueuePair` GIN. Test#4 (bnxt gate). |
-| **6** | **`NCCL_NET_DEVICE_GIN_ANVIL_SDMA`** | Direct Anvil SDMA GIN (`gin_plugin_anvil_sdma.cc`). **Test#5.** |
-
----
-
-## 3. `alltoall_perf -D` (rccl-tests)
-
-| **`-D`** | Kernel |
-|---------|--------|
-| **0** | Host **`ncclAlltoAll`** |
-| **1** | `NvlAlltoAllKernel` |
-| **2** | `NvlAlltoAllKernelOptimized` |
-| **3** | **`GinAlltoAllKernel`** |
-| **4** | `HybridAlltoAllKernel` |
-
-Tests **#2, #4, #5** use **`-D 3`**. Test **#1** uses **`-D 0`**.
-
----
-
-## 4. Build scripts
-
-### `docker-gin-gda-sdma-build.bash`
-
-**Purpose:** Build **`rccl-gin-gda-sdma-713`** from **`Dockerfile-rccl-gin-gda-sdma`**.
-
-```bash
-USE_LOCAL_SRC=1 ./docker-gin-gda-sdma-build.bash      # cached build
-USE_LOCAL_SRC=1 ./docker-gin-gda-sdma-build.bash 1    # --no-cache
+```text
+  docker-gin-gda-sdma-test.bash [NP] [MAX_BYTES]
+           │
+           ├─ RCCL_GIN_RUN_TESTS filter (default 1,5)
+           │
+           ├─ Test#1  Host ncclAlltoAll           (-D 0)
+           ├─ Test#2  GIN Ib proxy (opt-in)       (-D 3, TYPE=2)  + RDMA bind mounts
+           ├─ Test#4  GIN GDA (opt-in)            (-D 3, TYPE=4)  + bnxt/fw gate
+           └─ Test#5  GIN Anvil SDMA (primary)    (-D 3, TYPE=5)
 ```
 
-- **`DOCKER_CMD`**: `docker` (override via env).
-- **`GPU_TARGETS`**: default **`gfx950`** (`TARGET_GPU_ARCH`).
-- **`USE_LOCAL_SRC=1`**: build from local `projects/` tree.
-- **`ROCSHMEM_USE_SDMA=1`**: required for Test#5 (`USE_SDMA=ON` in rocSHMEM).
-- **`ROCSHMEM_CACHE_BUST` / `RCCL_CACHE_BUST`**: bump to invalidate Docker layers.
-- **`RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS`**: optional strict MLX5 symbol check at image build (default **0**).
-- Sources **`docker-gin-gda-sdma-preflight.bash`** before build.
-- Log: **`ddai-gin-build.log`** (override **`BUILD_LOG`**).
+- **`NP`** (arg 1, default **8**): `mpirun -n` rank count (one rank per GPU).
+- **`MAX_BYTES`** (arg 2, default **`128M`**): passed to `alltoall_perf -e`.
+- Tests run **sequentially** in one script invocation; any failing `docker run` fails the script (`set -e` on Ruby test wrapper; MI355 test relies on `docker run` exit status per block).
 
-### `docker-gin-gda-sdma-ruby-build.bash`
-
-Same build args and image tag; Ruby-specific:
-
-- **`sudo docker`** (override **`DOCKER_CMD`**).
-- **`Dockerfile-rccl-gin-gda-sdma-ruby`**.
-- **`--network="${DOCKER_BUILD_NETWORK:-host}"`** for BuildKit on hosts without `docker0`.
-- Log: **`ddai-docker-ruby-build.log`**.
-
----
-
-## 5. Test scripts
-
-### Usage
+**Default selection:** `RCCL_GIN_RUN_TESTS=1,5` — host baseline plus Anvil SDMA only. Tests **#2** and **#4** are **not** in the default list; add them explicitly when needed.
 
 ```bash
-# MI355X / default (8 GPUs, 128M max message):
+# Default (baseline + Anvil):
 ./docker-gin-gda-sdma-test.bash 8 128M
 
-# Ruby cluster:
-./docker-gin-gda-sdma-ruby-test.bash 8 128M
+# Full GIN sweep on a bnxt + MLX5-capable node:
+RCCL_GIN_RUN_TESTS=1,2,4,5 ./docker-gin-gda-sdma-test.bash 8 128M
 
-# Test#5 only, with isolation:
+# Anvil only, force all puts through SDMA:
 NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RCCL_GIN_RUN_TESTS=5 ./docker-gin-gda-sdma-test.bash 8
 ```
 
-**Arguments:** `[NP]` (default **8**), **`[MAX_BYTES]`** (default **`128M`**).
-
-**Defaults:** **`RCCL_GIN_RUN_TESTS=1,5`** (baseline + Anvil SDMA). Override with **`RCCL_GIN_RUN_TESTS`** or legacy **`RUN_TESTS`**.
-
-**Image:** **`DOCKER_IMAGE=rccl-gin-gda-sdma-713`** (overridable on MI355 script; Ruby defaults the same).
-
-### Shared harness behavior
-
-Both **`docker-gin-gda-sdma-test.bash`** and **`docker-gin-gda-sdma-ruby-test.bash`** share the same test logic; only **`DOCKER_CMD`** differs (`docker` vs `sudo docker`).
-
-**Docker / MPI defaults:**
-
-- **`--ulimit memlock=-1:-1`**, **`--shm-size 64G`**, **`--network host`**, **`/dev/dri`**, **`/dev/kfd`**, **`/dev/infiniband`**, **`--ipc host`**, **`--group-add video` + `render`**, **`--privileged`**.
-- Per-host **`/dev/infiniband/uverbs*`** / **`/dev/uverbs*`** via **`DOCKER_UVERBS`** (default **1**); optional **`--group-add rdma`**.
-- Open MPI: `pml ob1`, `btl self,vader,tcp`, **`btl_vader_single_copy_mechanism none`**, **`hwloc_base_binding_policy none`**; extend with **`MPI_MCA_EXTRA`**.
-- **`NCCL_GIN_PLUGIN=none`** on GIN tests (unless **`USE_EXTERNAL_PLUGIN=1`**).
-
-**Test selection env (both scripts):**
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| **`TEST4_MODE`** | `auto` | `skip` \| `run` \| `auto` (skip GDA when no `bnxt_en` or fw too old) |
-| **`MIN_BNXT_FW_FOR_GDA`** | `233.2.104.0` | Firmware gate for Test#4 `auto` |
-| **`TEST5_MODE`** | `run` | Set **`skip`** to skip Test#5 |
-| **`TEST5_MLX5_PREFLIGHT`** | `0` | Set **`1`** to skip Test#5 if image `libmlx5` lacks `mlx5dv_reg_dmabuf_mr` |
-| **`TEST5_HOST_MLX5_LIB_DIR`** | unset | Bind-mount newer host `libmlx5*` / `libmlx5dv*` for Test#5 |
-| **`TEST5_NUM_CHANNELS`** | `1` | Maps to **`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS`** |
-| **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** | unset (128 B in RCCL) | Passthrough for IPC vs SDMA isolation |
-
-**Test#2 RDMA bind-mount env:**
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| **`TEST2_HOST_SO_SEARCH_DIRS`** | `/lib64` … `/usr/lib/x86_64-linux-gnu` | Host lib search paths |
-| **`TEST2_BIND_HOST_RDMA_SO`** | `1` | Per-file RDMA `.so` bind mounts |
-| **`TEST2_BIND_HOST_MLX5_SO`** | `adjacent` | `0` \| `1` \| `adjacent` (mlx5 from same dir as `libibverbs.so.1`) |
-| **`TEST2_BIND_HOST_IB_SYSFS`** | `1` | Bind `/sys/class/infiniband`, `/etc/libibverbs.d` |
-| **`TEST2_BIND_HOST_DEV_IFB`** | `auto` | `auto` \| `on` \| `off` for `/dev/infiniband` volume |
-| **`DOCKER_UVERBS`** | `1` | `0` to skip uverbs `--device` discovery |
-| **`DOCKER_RDMA_GROUP`** | `1` | `0` to skip `--group-add rdma` |
+Legacy alias: **`RUN_TESTS`** is accepted if **`RCCL_GIN_RUN_TESTS`** is unset.
 
 ---
 
-## 6. Per-test validity
+## GIN type vs `alltoall_perf -D`
+
+**`NCCL_GIN_TYPE`** selects the RCCL GIN plugin. **`-D`** selects the HIP kernel in `alltoall_perf`; they are independent.
+
+| `NCCL_GIN_TYPE` | Net device | Harness | `-D` |
+|----------------:|------------|---------|------|
+| 0 | (none) | Test#1 | **0** (`ncclAlltoAll`) |
+| 2 | `GIN_PROXY` | Test#2 | **3** (`GinAlltoAllKernel`) |
+| 4 | `GIN_ROCSHMEM_GDA` | Test#4 | **3** |
+| 5 | `GIN_ANVIL_SDMA` | Test#5 | **3** |
+
+There is **no `-D 5`**. Types **4** and **5** both use **`-D 3`**.
+
+Other `-D` values in rccl-tests (not used by this harness): **1** / **2** NVL kernels, **4** hybrid.
+
+---
+
+## Build
+
+### Preflight (`docker-gin-gda-sdma-preflight.bash`)
+
+Run from repo root before building (Ruby build sources this automatically):
+
+```bash
+source ./docker-gin-gda-sdma-preflight.bash
+```
+
+Checks:
+
+- Required shared GIN host sources: `gin_host_rocshmem_common.h` / `.cc`
+- Removed plugin paths must **not** exist (`gin_plugin_rocshmem_api.cc`, old `rocshmem_api` headers)
+- Exactly **one** `markSdmaDirty` definition in `gin_anvil_sdma.h`
+
+**Note:** [`docker-gin-gda-sdma-build.bash`](../docker-gin-gda-sdma-build.bash) does **not** source preflight today; run it manually or use the Ruby build script.
+
+### `docker-gin-gda-sdma-build.bash` (MI355 / default)
+
+```bash
+./docker-gin-gda-sdma-build.bash
+```
+
+Current behavior:
+
+- **`docker build`** with **`--no-cache`** (every invocation is a full rebuild)
+- Build args: `GPU_TARGETS=gfx950`, `USE_LOCAL_SRC=1`, `ROCSHMEM_USE_SDMA=1`, `RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=0` (set in script; edit script or export build-args via `docker build` manually to override)
+- Creates empty **`extra-rdma-debs/`** for optional `.deb` COPY into the image
+- Image tag: **`rccl-gin-gda-sdma-713`**
+
+Override arch for MI300X: edit `TARGET_GPU_ARCH=gfx942` in the script or run `docker build` yourself with `--build-arg GPU_TARGETS=gfx942`.
+
+### `docker-gin-gda-sdma-ruby-build.bash`
+
+Same image tag and build args as above, plus:
+
+- **`sudo docker`** (`DOCKER_CMD` overridable)
+- **`--network="${DOCKER_BUILD_NETWORK:-host}"`** for BuildKit
+- Sources **preflight** before build
+- Optional log: **`BUILD_LOG`** (default `ddai-gin-rudy-build.log` — script does not tee automatically; redirect shell output if needed)
+
+### Build requirements (image contents)
+
+- rocSHMEM configured with **`USE_SDMA=ON`** (`ROCSHMEM_USE_SDMA=1` build-arg)
+- RCCL with **`ENABLE_ROCSHMEM_GIN=ON`** and Anvil plugin
+- Optional: place newer rdma-core **`.deb`** files under [`extra-rdma-debs/`](../extra-rdma-debs/) so the image exports **`mlx5dv_reg_dmabuf_mr`**
+- Optional strict build: `RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1` (fails image build if symbols missing)
+
+Verify SDMA in image:
+
+```bash
+docker run --rm rccl-gin-gda-sdma-713 rocshmem/bin/rocshmem_info
+```
+
+---
+
+## Test run (`docker-gin-gda-sdma-test.bash`)
+
+Ruby: [`docker-gin-gda-sdma-ruby-test.bash`](../docker-gin-gda-sdma-ruby-test.bash) — **identical logic**; only default **`DOCKER_CMD=sudo docker`**.
+
+### Container / MPI setup
+
+Each test is one `docker run` + `mpirun`:
+
+| Docker | Value |
+|--------|--------|
+| GPU / IPC | `--device /dev/dri`, `/dev/kfd`, `/dev/infiniband`, `--ipc host`, `--network host` |
+| Limits | `--ulimit memlock=-1:-1` (disable: `DOCKER_ULIMIT_MEMLOCK=0`), `--shm-size 64G` |
+| Groups | `video`, `render`; optional `rdma` (`DOCKER_RDMA_GROUP=1`) |
+| uverbs | Per-host `/dev/infiniband/uverbs*`, `/dev/uverbs*` (`DOCKER_UVERBS=1`) |
+| Extra | `DOCKER_EXTRA` appended to run line; `GIN_GDA_DOCKER_IT=1` adds `-it` |
+
+Open MPI: `pml ob1`, `btl self,vader,tcp`, `btl_vader_single_copy_mechanism none`, `hwloc_base_binding_policy none`; extend with **`MPI_MCA_EXTRA`**.
+
+Tracing: **`RCCL_GIN_ECHO=1`** (default) wraps each test in `set -x` / `set +x`.
+
+### Shared `MPI_BASE` environment (all tests)
+
+Passed on every `mpirun`:
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `RCCL_ROCSHMEM_ENABLE` | `0` | Disable RCCL rocSHMEM collective path in harness |
+| `ROCSHMEM_BACKEND` | `ipc` | rocSHMEM backend hint |
+| `ROCSHMEM_DISABLE_MIXED_IPC` | `1` | |
+| `ROCSHMEM_DEBUG_LEVEL` | `info:noversion` | |
+| `RCCL_ROCSHMEM_THRESHOLD` | `134217728` (128 MiB) | |
+| `NCCL_DEBUG` | `VERSION` (overridable) | Test#5 does **not** force `INFO` unless you export it |
+| `NCCL_DEBUG_SUBSYS` | `INIT,NET` | |
+| `NCCL_CUMEM_ENABLE` | `1` | |
+| `RCCL_ENABLE_INTRANET` | `1` | |
+| `NCCL_DMABUF_ENABLE` | `1` | |
+| `NCCL_MSCCL_ENABLE` | `0` | |
+| `HSA_NO_SCRATCH_RECLAIM` | `1` | |
+
+GIN tests also set **`NCCL_GIN_PLUGIN=none`** unless **`USE_EXTERNAL_PLUGIN=1`**.
+
+### Shared `alltoall_perf` arguments
+
+Every harness test uses:
+
+```text
+-b 128 -e ${MAX_BYTES} -f 2 -g 1 -R 2 -A 1 -V 1 -D <mode>
+```
+
+| Flag | Meaning |
+|------|---------|
+| `-b 128` | Min message 128 B |
+| `-e` | Max message (`MAX_BYTES` script arg) |
+| `-f 2` | Size factor 2 (powers of two) |
+| `-g 1` | One GPU per rank |
+| `-R 2` | Two warmup iterations |
+| `-A 1` | Async error check |
+| `-V 1` | **Validation on** (`#wrong` must be 0) |
+| `-D` | Kernel mode (0 or 3 per test) |
+
+---
+
+## Per-test detail
 
 ### Test#1 — Host baseline
 
-- **Env:** `NCCL_GIN_ENABLE=0`, `NCCL_GIN_TYPE=0`, `ROCSHMEM_SDMA_ENABLED=0`.
-- **`alltoall_perf`:** **`-D 0`**, **`-R 2`**.
+| | |
+|--|--|
+| **Selection** | In default `RCCL_GIN_RUN_TESTS=1,5` |
+| **Env** | `NCCL_GIN_ENABLE=0`, `NCCL_GIN_TYPE=0`, `ROCSHMEM_SDMA_ENABLED=0` |
+| **`alltoall_perf`** | **`-D 0`** |
+| **Role** | CPU/host `ncclAlltoAll` reference for perf comparison (P1) |
 
-### Test#2 — GIN Ib host proxy
+### Test#2 — GIN Ib host proxy (optional)
 
-- **Env:** `NCCL_GIN_ENABLE=1`, **`NCCL_GIN_TYPE=2`**, `NCCL_GIN_PLUGIN=none`, `NCCL_NET_PLUGIN=none`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, `NCCL_DEBUG=INFO`.
-- **`alltoall_perf`:** **`-D 3`** (`GinAlltoAllKernel`).
-- Needs **`ncclNIbDevs > 0`** and verbs visible in container (see §8).
+| | |
+|--|--|
+| **Selection** | Add **`2`** to `RCCL_GIN_RUN_TESTS` (e.g. `1,2,5`) |
+| **Env** | `NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=2`, `NCCL_NET_PLUGIN=none`, `NCCL_ENV_PLUGIN=none`, `ROCSHMEM_SDMA_ENABLED=0`, `HSA_FORCE_FINE_GRAIN_PCIE=1` |
+| **`alltoall_perf`** | **`-D 3`** |
+| **RDMA** | Host **bind-mounts** for verbs/mlx5 (see §Test#2 volumes) |
+| **Needs** | `ncclNIbDevs > 0`, IB devices visible in container |
 
 ### Test#4 — GIN GDA (optional)
 
-- **Env:** `NCCL_GIN_ENABLE=1`, **`NCCL_GIN_TYPE=5`**, `ROCSHMEM_SDMA_ENABLED=1`.
-- **`alltoall_perf`:** **`-D 3`**.
-- Skipped when **`TEST4_MODE=auto`** and host has no **`bnxt_en`** or firmware &lt; **`MIN_BNXT_FW_FOR_GDA`**.
+| | |
+|--|--|
+| **Selection** | Add **`4`** to `RCCL_GIN_RUN_TESTS`; gated by **`TEST4_MODE`** |
+| **Env** | `NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=4`, `NCCL_NET_PLUGIN=none`, `ROCSHMEM_SDMA_ENABLED=1` |
+| **`alltoall_perf`** | **`-D 3`** |
+| **`TEST4_MODE=auto`** (default) | Skip if no **`bnxt_en`** NIC or firmware &lt; **`MIN_BNXT_FW_FOR_GDA`** (`233.2.104.0`) |
+| **`TEST4_MODE=run`** | Force run |
+| **`TEST4_MODE=skip`** | Never run |
 
 ### Test#5 — GIN Anvil SDMA (primary)
 
-Formal matrix: **[`gin-anvil-sdma-backend-design.md` — Test plan](gin-anvil-sdma-backend-design.md#test-plan)**.
+Formal matrix: **[design doc — Test plan](gin-anvil-sdma-backend-design.md#test-plan)**.
 
-- **Env:** `NCCL_GIN_ENABLE=1`, **`NCCL_GIN_TYPE=6`**, `ROCSHMEM_SDMA_ENABLED=0`, **`NCCL_DEBUG=INFO`** (script default), `NCCL_GIN_PLUGIN=none`, `NCCL_NET_PLUGIN=none`, `HSA_FORCE_FINE_GRAIN_PCIE=1`.
-- Optional: **`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS`**, **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`**.
-- **`alltoall_perf`:** **`-D 3`**, **`-R 2`**, **`-V 1`** (validation).
-- Requires rocSHMEM **`USE_SDMA=ON`** in image and RCCL Anvil plugin; **`libmlx5`** DMA-BUF symbols for RCCL NET init (see **`extra-rdma-debs/`** or **`TEST5_HOST_MLX5_LIB_DIR`**).
+| | |
+|--|--|
+| **Selection** | In default `RCCL_GIN_RUN_TESTS=1,5`; gated by **`TEST5_MODE`** |
+| **Env** | `NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=5`, `NCCL_NET_PLUGIN=none`, `ROCSHMEM_SDMA_ENABLED=0`, `HSA_FORCE_FINE_GRAIN_PCIE=1`, `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=${TEST5_NUM_CHANNELS:-1}` |
+| **Optional passthrough** | `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (script forwards if set) |
+| **`alltoall_perf`** | **`-D 3`**, validation **`-V 1`** |
+| **Image** | rocSHMEM **`USE_SDMA=ON`**; RCCL Anvil plugin present |
+| **MLX5** | RCCL NET init may need **`mlx5dv_reg_dmabuf_mr`** in image (see §MLX5) |
 
----
+**`TEST5_MODE=skip`** — never run Test#5.
 
-## 7. Performance tuning
-
-1. **`GPU_TARGETS` / `TARGET_GPU_ARCH`** — must match node ISA (`gfx950` MI355X, `gfx942` MI300X).
-2. **`MAX_BYTES`** script arg — smoke vs peak sweep (`128M` default).
-3. **`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS`** / **`TEST5_NUM_CHANNELS`** — channel A/B on MI-class hosts.
-4. **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** — IPC vs SDMA boundary (default 128 B).
-5. **`ROCSHMEM_USE_SDMA=1`** at image build for Test#5.
-6. **`MPI_MCA_EXTRA`** — only if you understand Docker MPI trade-offs.
+**`TEST5_MLX5_PREFLIGHT=1`** — skip Test#5 if image `libmlx5` lacks `mlx5dv_reg_dmabuf_mr`. Default **`0`**: run Test#5 anyway (may fail at NET init if symbols missing).
 
 ---
 
-## 8. Troubleshooting
+## Environment reference
 
-1. **Stale script on node** — `docker run` must show `--group-add render`, `/dev/dri`, `/dev/kfd`, uverbs devices. Rsync **`docker-gin-gda-sdma-test.bash`** or **`docker-gin-gda-sdma-ruby-test.bash`** from this tree.
+### Test selection
 
-2. **`ginType NONE` with `-D 3`** — set `NCCL_GIN_ENABLE=1`, correct `NCCL_GIN_TYPE`, run with **`NCCL_DEBUG=INFO`**.
+| Variable | Default | Effect |
+|----------|---------|--------|
+| **`RCCL_GIN_RUN_TESTS`** | `1,5` | Comma list: `1`, `2`, `4`, `5` |
+| **`RUN_TESTS`** | — | Legacy alias for `RCCL_GIN_RUN_TESTS` |
+| **`TEST4_MODE`** | `auto` | `skip` \| `run` \| `auto` |
+| **`MIN_BNXT_FW_FOR_GDA`** | `233.2.104.0` | Test#4 firmware gate |
+| **`TEST5_MODE`** | `run` | `skip` to skip Test#5 |
+| **`TEST5_MLX5_PREFLIGHT`** | `0` | `1` = skip Test#5 when image lacks DMA-BUF symbols |
+| **`TEST5_HOST_MLX5_LIB_DIR`** | unset | Bind-mount host `libmlx5*` / `libmlx5dv*` into container for Test#5 |
+| **`TEST5_NUM_CHANNELS`** | `1` | Sets `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS` for Test#5 |
+| **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** | unset (128 B in RCCL) | IPC vs SDMA boundary; passthrough on Test#5 |
 
-3. **MLX5 / DMA-BUF (`dlvsym` … `mlx5dv_reg_dmabuf_mr`)** — use **`TEST2_BIND_HOST_MLX5_SO=adjacent`**, **`extra-rdma-debs/*.deb`** at build, or **`TEST5_HOST_MLX5_LIB_DIR`**. Do not bind-mount entire **`/lib/x86_64-linux-gnu`** (breaks glibc vs image).
+### Docker / harness
 
-4. **Test#5 skipped** — **`TEST5_MLX5_PREFLIGHT=1`** without symbols; set **`TEST5_MLX5_PREFLIGHT=0`** or fix MLX5 libs.
+| Variable | Default | Effect |
+|----------|---------|--------|
+| **`DOCKER_IMAGE`** | `rccl-gin-gda-sdma-713` | Image tag |
+| **`DOCKER_CMD`** | `docker` / `sudo docker` (Ruby) | Container CLI |
+| **`DOCKER_UVERBS`** | `1` | `0` = skip uverbs `--device` scan |
+| **`DOCKER_RDMA_GROUP`** | `1` | `0` = skip `--group-add rdma` |
+| **`DOCKER_ULIMIT_MEMLOCK`** | `1` | `0` = omit memlock ulimit |
+| **`DOCKER_EXTRA`** | empty | Extra `docker run` flags |
+| **`GIN_GDA_DOCKER_IT`** | `0` | `1` = interactive `-it` |
+| **`RCCL_GIN_ECHO`** | `1` | `0` = disable `set -x` per test |
+| **`MPI_MCA_EXTRA`** | empty | Extra Open MPI MCA flags |
+| **`NCCL_DEBUG`** | `VERSION` | Override for all tests |
+| **`USE_EXTERNAL_PLUGIN`** | `0` | `1` = do not set `NCCL_GIN_PLUGIN=none` |
 
-5. **GPU fault at 128 B on Test#5** — signal VA not peer-mapped; see design doc (LSA resource window + IPC table).
+### Test#2 RDMA bind-mounts
 
-6. **Hang in AlltoAll** — try **`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1`**; check SDMA dirty / quiet in logs.
+Used when Test#2 is selected. Search paths: **`TEST2_HOST_SO_SEARCH_DIRS`** (default `/lib64`, `/usr/lib64`, `/lib/x86_64-linux-gnu`, `/usr/lib/x86_64-linux-gnu`) — internal name **`GDA_HOST_LIB_DIRS`**.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| **`TEST2_BIND_HOST_RDMA_SO`** | `1` | Mount host RDMA `.so` files |
+| **`TEST2_BIND_HOST_MLX5_SO`** | `adjacent` | `0` \| `1` \| `adjacent` (mlx5 from libibverbs dir) |
+| **`TEST2_BIND_HOST_IB_SYSFS`** | `1` | `/sys/class/infiniband`, `/etc/libibverbs.d` |
+| **`TEST2_BIND_HOST_DEV_IFB`** | `auto` | `auto` \| `on` \| `off` for `/dev/infiniband` volume |
+| **`TEST2_BIND_HOST_GNU_DIRS`** | `0` | **`1` dangerous** — whole gnu lib dirs (glibc mismatch) |
+| **`TEST2_BIND_HOST_LIBDIRS`** | `/lib/x86_64-linux-gnu` … | Used when `TEST2_BIND_HOST_GNU_DIRS=1` |
+| **`TEST2_BIND_HOST_RDMA_BASE`** | — | Explicit list of `.so` basenames to bind |
+| **`TEST2_BIND_HOST_RDMA_EXTRA`** | — | Extra `.so` basenames |
 
 ---
 
-## 9. Quick reference
+## MLX5 / DMA-BUF (Test#5)
 
-| Test | `NCCL_GIN_ENABLE` | `NCCL_GIN_TYPE` | `-D` | Backend |
-|------|-------------------|-----------------|------|---------|
-| #1 | 0 | 0 | 0 | Host `ncclAlltoAll` |
-| #2 | 1 | 2 | 3 | GIN Ib proxy + `GinAlltoAllKernel` |
-| #4 | 1 | 5 | 3 | GDA `QueuePair` + `GinAlltoAllKernel` |
-| #5 | 1 | 6 | 3 | **GIN Anvil SDMA** + `GinAlltoAllKernel` |
+RCCL NET initialization may `dlopen` **`mlx5dv_reg_dmabuf_mr`**. Stock Ubuntu 24.04 image `libmlx5` often lacks it.
 
-Default run: **`RCCL_GIN_RUN_TESTS=1,5`** via **`docker-gin-gda-sdma-test.bash`** or **`docker-gin-gda-sdma-ruby-test.bash`**.
+**Fix options (pick one):**
+
+1. Bake [`extra-rdma-debs/*.deb`](../extra-rdma-debs/) into the image at build time
+2. **`TEST5_HOST_MLX5_LIB_DIR=/path/to/newer/mlx5`** at test run time
+3. For Test#2-style debugging: **`TEST2_BIND_HOST_MLX5_SO=adjacent`**
+
+Do **not** bind-mount all of **`/lib/x86_64-linux-gnu`** (host glibc vs image mismatch).
+
+---
+
+## Performance tuning
+
+1. **`GPU_TARGETS`** — `gfx950` (MI355X), `gfx942` (MI300X); must match node ISA
+2. **`MAX_BYTES`** — `128M` default; use smaller for smoke (`4M`, `1M`)
+3. **`TEST5_NUM_CHANNELS`** / **`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS`** — 1, 2, 4, 8
+4. **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** — default 128 B; `0` = all SDMA, `65536` = all IPC
+5. **`ROCSHMEM_USE_SDMA=1`** at image build (required for Anvil queues)
+
+---
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---------|----------------|
+| Test#5 skipped at start | `TEST5_MLX5_PREFLIGHT=1` and image lacks symbols; set `0` or fix MLX5 |
+| `ginType NONE` with `-D 3` | `NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=5`, `NCCL_DEBUG=INFO` NET lines |
+| `dlvsym` / `mlx5dv_reg_dmabuf_mr` | `extra-rdma-debs`, `TEST5_HOST_MLX5_LIB_DIR`, or `TEST2_BIND_HOST_MLX5_SO` |
+| GPU fault at 128 B (Test#5) | Signal VA not peer-mapped — design doc LSA + IPC table |
+| Hang in AlltoAll | `TEST5_NUM_CHANNELS=1`; SDMA dirty / quiet |
+| Wrong results small sizes | Lower threshold / isolation: `NCCL_GIN_ANVIL_SDMA_THRESHOLD=0` |
+| Wrong results large sizes | IPC table; force IPC: `THRESHOLD=65536` |
+| `gin_anvil_sdma_create failed` | Image built with `USE_SDMA=ON`, xGMI visible, HIP devices |
+| Stale script on node | Rsync `docker-gin-gda-sdma-test.bash`; `docker run` should show `render`, uverbs |
+| Preflight / build fails | `source docker-gin-gda-sdma-preflight.bash`; fix missing or duplicate sources |
+| `#wrong != 0` | `-V 1` is on; check init logs and isolation runs (IPC vs SDMA) |
+
+---
+
+## Quick reference
+
+| Test | `RCCL_GIN_RUN_TESTS` | `NCCL_GIN_ENABLE` | `NCCL_GIN_TYPE` | `-D` | Backend |
+|------|------------------------|-------------------|-----------------|------|---------|
+| #1 | default | 0 | 0 | 0 | Host `ncclAlltoAll` |
+| #2 | opt-in (`2`) | 1 | 2 | 3 | GIN Ib proxy |
+| #4 | opt-in (`4`) | 1 | 4 | 3 | GDA `QueuePair` |
+| #5 | default | 1 | 5 | 3 | **GIN Anvil SDMA** |
+
+```bash
+# Recommended default regression:
+./docker-gin-gda-sdma-test.bash 8 128M
+
+# Log to file:
+./docker-gin-gda-sdma-test.bash 8 128M 2>&1 | tee ddai-gin-perf.log
+```
 
 ---
 

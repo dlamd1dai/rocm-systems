@@ -346,11 +346,11 @@ if _run_test 2; then
     -x NCCL_NET_PLUGIN=none \
     -x NCCL_ENV_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x NCCL_DEBUG=INFO \
+    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=2 \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 2 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   _trace_off
 fi
 
@@ -382,7 +382,7 @@ if _should_run_test5; then
     "${GIN_PLUGIN_X[@]}" \
     -x NCCL_NET_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x NCCL_DEBUG="${NCCL_DEBUG:-INFO}" \
+    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
