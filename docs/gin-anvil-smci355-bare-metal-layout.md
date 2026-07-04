@@ -255,9 +255,11 @@ mpirun -n 8 --allow-run-as-root \
 Recommended workflow on `smci355-ccs-aus-m03-17`:
 
 1. `./gin-anvil-smci355-test.bash all` — docker C1+C2 + host unit suites A–H, G (suite F off).
-2. After code edits: `GIN_ANVIL_SKIP_DOCKER_REBUILD=1 ./gin-anvil-smci355-test.bash unit` — RCCL unit only.
+2. After code edits: `GIN_ANVIL_SKIP_DOCKER_REBUILD=1 ./gin-anvil-smci355-test.bash unit` — RCCL unit only (no `install.sh`; builds under `gin-anvil-bm/build/rccl-unit/`).
 3. Optional host suite F: `GIN_ANVIL_BUILD_SUITE_F=1` after `libopenmpi-dev` install.
-4. Bare-metal integration: `GIN_ANVIL_LAYOUT=bare-metal` (requires host MPI; preflight enforces).
+4. Bare-metal integration: `GIN_ANVIL_LAYOUT=bare-metal` (runs `install.sh` + `alltoall_perf`; preflight requires host MPI).
+
+Host ROCm (e.g. 7.0.2 on smci355) may differ from the docker image (7.13). Default `all` uses docker for integration; host builds only GTest binaries.
 
 ---
 
