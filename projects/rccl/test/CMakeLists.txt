@@ -291,6 +291,7 @@ if(BUILD_TESTS)
       ../src/gin/gin_plugin_anvil_sdma.cc
       ../src/gin/gin_anvil_ipc_table_host.cc
       common/main_fixtures.cpp
+      common/EnvVars.cpp
       common/TestChecks.cpp
       common/ProcessIsolatedTestRunner.cpp
     )
