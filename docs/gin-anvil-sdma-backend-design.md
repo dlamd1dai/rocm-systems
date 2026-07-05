@@ -297,36 +297,28 @@ Verify that the Anvil SDMA GIN backend:
 | **B4** | `objdump -T $(readlink -f /usr/lib/x86_64-linux-gnu/libmlx5.so.1) \| grep mlx5dv_reg_dmabuf_mr` inside image | Symbol present (Test#5 preflight green) |
 | **B5** | `grep -r gin_host_rocshmem_common projects/rccl/src/CMakeLists.txt` + files on disk | CMake hipify list matches filesystem (avoids `ddai-gin-build.log` CMake failure) |
 
-### 4.1 Unit tests (GTest suites A–H)
+### 4.1 Unit tests (GTest suites A–H + G)
 
-Automated **unit tests** complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target **~96% weighted line / ~95% weighted branch** across Anvil SDMA sources. Full per-test mapping and `llvm-cov` recipes: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
+Automated **unit tests** complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target **~96% weighted line / ~95% weighted branch** across Anvil SDMA sources. Full per-test inventory and `llvm-cov` recipes: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
 
-| Suite | Binary / target | CMake flags | Source focus |
-|-------|-----------------|-------------|--------------|
-| **A** | `rccl-UnitTestsFixtures` | `ENABLE_ROCSHMEM_GIN=ON` | `gin_anvil_ipc_table_host.cc` |
-| **B–E** | `rccl-UnitTestsFixtures` | `+ ENABLE_ROCSHMEM=ON` | Device IPC resolve, copy, detail helpers, template IPC paths |
-| **H** | `rccl-UnitTestsFixtures` | same as B–E | SDMA template paths (no-op `sdma/` stubs) |
-| **F** | `rocshmem_unit_tests` | `USE_SDMA=ON`, `BUILD_TESTS=ON` | `gin_anvil_sdma_factory.cpp` |
-| **G** | `rccl-UnitTestsGinAnvilPlugin` | `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+ | `gin_plugin_anvil_sdma.cc` (mock factory) |
+| Suite | Tests | Binary / target | CMake flags | Source focus |
+|-------|------:|-----------------|-------------|--------------|
+| **A** | 9 | `rccl-UnitTestsFixtures` | `ENABLE_ROCSHMEM_GIN=ON` | `gin_anvil_ipc_table_host.cc` |
+| **B–E** | 9 | `rccl-UnitTestsFixtures` | `+ GIN_ANVIL_UNIT_TESTS=ON` (or `ENABLE_ROCSHMEM=ON`) | Device IPC resolve, copy, detail helpers, template IPC |
+| **H** | 12 | `rccl-UnitTestsFixtures` | same as B–E | SDMA template paths (memcpy `sdma/` stubs) |
+| **G** | 19 | `rccl-UnitTestsGinAnvilPlugin` | `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+ | `gin_plugin_anvil_sdma.cc` (mock factory) |
+| **F** | 12 | `rocshmem_unit_tests` | `USE_SDMA=ON`, `BUILD_TESTS=ON` | `gin_anvil_sdma_factory.cpp` |
+
+**MI355 status:** 49/49 default unit tests pass (`./gin-anvil-smci355-test.bash unit` on `smci355-ccs-aus-m03-17`, Jul 2026).
 
 **Quick run:**
 
 ```bash
-# RCCL: suites A–E + H
-cmake -S projects/rccl -B build/rccl \
-  -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
-cmake --build build/rccl --target rccl-UnitTestsFixtures
-./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+./gin-anvil-smci355-test.bash unit
 
-# rocSHMEM: suite F
-cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
-cmake --build build/rocshmem --target rocshmem_unit_tests
-./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
-  --gtest_filter='GinAnvilSdmaFactoryTest.*'
-
-# RCCL: suite G (plugin)
-cmake --build build/rccl --target rccl-UnitTestsGinAnvilPlugin
-./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+# Or manual:
+./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
 ```
 
 **Integration ↔ unit mapping** (unit tests reduce manual coverage of these integration IDs):
@@ -355,7 +347,7 @@ Run with `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET` and `NCCL_GIN_ENABLE=1 NCC
 | **H3** | Wrong `NCCL_GIN_TYPE` (e.g. 4) with Anvil plugin forced | Anvil `init()` returns error; no silent fallback |
 | **H4** | `connect()` rank ↔ GPU mapping | `bootstrapAllGather` of HIP ordinals; queue table `peer * numChannels + ch` |
 | **H5** | `regMrSym()` on symmetric LSA window | IPC table entry via `ncclGinAnvilIpcTableRegisterVmm` |
-| **H6** | `createContext()` + resource window bind | Device context `layoutMagic == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC`; pending contexts cleared after `ncclGinAnvilBindResourceWindowSignals` |
+| **H6** | `createContext()` + resource window bind | Device context `layoutMagic == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC`; pending contexts cleared after `ncclGinAnvilBindResourceWindowSignals` (including early return on invalid slot / LSA miss) |
 | **H7** | Comm destroy | No crash; `gin_anvil_sdma_destroy` frees HIP-owned state (queues remain — by design) |
 | **H8** | Mid-comm `regMrSym()` after first put | IPC table grows; `refreshAllLiveContexts` updates all GPU contexts without stale `ipcTable` |
 
@@ -455,7 +447,7 @@ Anvil should lead intra-node xGMI for mid/large messages vs Test#1; vs GDA depen
 Before merge or image publish:
 
 - [ ] **B1–B5** pass on builder
-- [ ] **Unit suites A–H** pass on at least one GPU node (`GinAnvil*` gtest filters; see §4.1)
+- [ ] **Unit suites A–H + G** pass on at least one GPU node (**49 tests** via `./gin-anvil-smci355-test.bash unit`; optional **+12** suite F with `GIN_ANVIL_BUILD_SUITE_F=1`)
 - [ ] **C1 + C2** pass on at least one MI300/MI355 8-GPU node
 - [ ] **D1–D3** validation clean on Test#5
 - [ ] **P1** no regression vs last green perf log

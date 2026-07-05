@@ -276,7 +276,7 @@ Test plan
 ---------
 
 
-This section is the authoritative test plan for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in `gin-anvil-sdma-backend-tests.md`. GTest unit suites A–H are documented in `gin-anvil-sdma-unit-test-plan.md`.
+This section is the authoritative test plan for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`). Docker harness details and Test#5 wiring live in `gin-anvil-sdma-backend-tests.md`. GTest unit suites A–H + G are documented in `gin-anvil-sdma-unit-test-plan.md`. MI355 orchestration: `gin-anvil-smci355-test.bash`.
 
 
 1. Objectives
@@ -345,38 +345,31 @@ B5       `grep -r gin_host_rocshmem_common projects/rccl/src/CMakeLists.txt` + f
 =======  ===================================================================================  =====================================================================================================  =======================================
 
 
-4.1 Unit tests (GTest suites A–H)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+4.1 Unit tests (GTest suites A–H + G)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 
-Automated unit tests complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target ~96% weighted line / ~95% weighted branch across Anvil SDMA sources. Full per-test mapping: `gin-anvil-sdma-unit-test-plan.md`.
+Automated unit tests complement the integration matrix below. They run on a single GPU (no MPI), use mocks/stubs where noted, and target ~96% weighted line / ~95% weighted branch across Anvil SDMA sources. Full test inventory: `gin-anvil-sdma-unit-test-plan.md`. **MI355:** 49/49 default tests pass via `./gin-anvil-smci355-test.bash unit` (30 fixtures + 19 plugin; suite F opt-in +12).
 
 
-=======  ============================  =====================================================  ==============================
-Suite    Binary / target               CMake flags                                            Source focus
-=======  ============================  =====================================================  ==============================
-A        `rccl-UnitTestsFixtures`      `ENABLE_ROCSHMEM_GIN=ON`                               `gin_anvil_ipc_table_host.cc`
-B–E      `rccl-UnitTestsFixtures`      `+ ENABLE_ROCSHMEM=ON`                                   Device IPC, detail, template IPC
-H        `rccl-UnitTestsFixtures`      same as B–E                                            SDMA templates (no-op stubs)
-F        `rocshmem_unit_tests`         `USE_SDMA=ON`, `BUILD_TESTS=ON`                          `gin_anvil_sdma_factory.cpp`
-G        `rccl-UnitTestsGinAnvilPlugin`  `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+                  `gin_plugin_anvil_sdma.cc`
-=======  ============================  =====================================================  ==============================
+=======  ======  ============================  =====================================================  ==============================
+Suite    Tests   Binary / target               CMake flags                                            Source focus
+=======  ======  ============================  =====================================================  ==============================
+A        9       `rccl-UnitTestsFixtures`      `ENABLE_ROCSHMEM_GIN=ON`                               `gin_anvil_ipc_table_host.cc`
+B–E      9       `rccl-UnitTestsFixtures`      `+ GIN_ANVIL_UNIT_TESTS=ON` (or `ENABLE_ROCSHMEM=ON`)   Device IPC, detail, template IPC
+H        12      `rccl-UnitTestsFixtures`      same as B–E                                            SDMA templates (memcpy stubs)
+G        19      `rccl-UnitTestsGinAnvilPlugin`  `ENABLE_ROCSHMEM_GIN=ON`, ROCm 6.4+                  `gin_plugin_anvil_sdma.cc`
+F        12      `rocshmem_unit_tests`         `USE_SDMA=ON`, `BUILD_TESTS=ON` (opt-in)               `gin_anvil_sdma_factory.cpp`
+=======  ======  ============================  =====================================================  ==============================
 
 
 .. code-block:: bash
 
-   cmake -S projects/rccl -B build/rccl \
-     -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
-   cmake --build build/rccl --target rccl-UnitTestsFixtures
-   ./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+   ./gin-anvil-smci355-test.bash unit
 
-   cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
-   cmake --build build/rocshmem --target rocshmem_unit_tests
-   ./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
-     --gtest_filter='GinAnvilSdmaFactoryTest.*'
-
-   cmake --build build/rccl --target rccl-UnitTestsGinAnvilPlugin
-   ./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+   # Or manual:
+   ./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+   ./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
 
 
 Unit tests do not replace C1–C2 (multi-GPU `alltoall_perf`), D6 (OSS7 fused signal on hardware), or P1–P5 (performance regression). See `gin-anvil-sdma-unit-test-plan.md` for integration ↔ unit ID mapping.

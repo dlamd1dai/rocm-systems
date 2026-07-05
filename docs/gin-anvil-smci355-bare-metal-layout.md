@@ -81,6 +81,7 @@ sudo apt-get install -y openmpi-bin libopenmpi-dev
 ```
 
 Factory / SDMA queue coverage on MI355X is expected from **docker Test#5** (`RCCL_GIN_RUN_TESTS=5`), not host suite F.
+
 | `ROCSHMEM_INSTALL_DIR` | `$GIN_ANVIL_BM_ROOT/install/rocshmem` | rocSHMEM prefix |
 | `RCCL_INSTALL_PREFIX` | `$GIN_ANVIL_BM_ROOT/install/rccl` | RCCL prefix |
 
@@ -179,7 +180,7 @@ cmake -S "${REPO_ROOT}/projects/rccl-tests" -B "${GIN_ANVIL_BM_ROOT}/build/rccl-
   -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_PREFIX}"
 cmake --build "${GIN_ANVIL_BM_ROOT}/build/rccl-tests" -j"$(nproc)"
 
-# 4) GTest unit binaries (suites A–H, G) — match docker librccl profile
+# 4) GTest unit binaries (suites A–H, G) — bare-metal profile
 cmake -S "${REPO_ROOT}/projects/rccl" -B "${GIN_ANVIL_BM_ROOT}/build/rccl-unit" \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_ROCSHMEM_GIN=ON \
@@ -202,7 +203,13 @@ cmake --build "${GIN_ANVIL_BM_ROOT}/build/rccl-unit" \
 
 ### Unit tests (1 GPU)
 
+The orchestrator runs **49 tests** by default (30 fixtures + 19 plugin). Suite F adds **12** factory tests when built.
+
 ```bash
+# Recommended:
+./gin-anvil-smci355-test.bash unit
+
+# Manual:
 export GIN_ANVIL_BM_ROOT=~/rocm-systems/gin-anvil-bm
 export LD_LIBRARY_PATH="${GIN_ANVIL_BM_ROOT}/install/rccl/lib:${GIN_ANVIL_BM_ROOT}/install/rocshmem/lib:${ROCM_PATH}/lib:${LD_LIBRARY_PATH:-}"
 
@@ -210,9 +217,22 @@ export LD_LIBRARY_PATH="${GIN_ANVIL_BM_ROOT}/install/rccl/lib:${GIN_ANVIL_BM_ROO
   --gtest_filter='GinAnvil*'
 "${GIN_ANVIL_BM_ROOT}/build/rccl-unit/test/rccl-UnitTestsGinAnvilPlugin" \
   --gtest_filter='GinAnvilPluginTest.*'
+
+# Optional suite F (requires GIN_ANVIL_BUILD_SUITE_F=1 at rocSHMEM configure):
 "${GIN_ANVIL_BM_ROOT}/build/rocshmem/tests/unit_tests/rocshmem_unit_tests" \
   --gtest_filter='GinAnvilSdmaFactoryTest.*'
 ```
+
+**Bare-metal RCCL unit CMake profile** (matches docker librccl — GIN plugin only, no full rocSHMEM in `librccl`):
+
+| Flag | Value | Purpose |
+|------|-------|---------|
+| `ENABLE_ROCSHMEM_GIN` | `ON` | Anvil GIN plugin + IPC table |
+| `ENABLE_ROCSHMEM` | `OFF` | No rocSHMEM sym kernels in librccl |
+| `GIN_ANVIL_UNIT_TESTS` | `ON` | Suite H stubs + `NCCL_GIN_ANVIL_SDMA_ENABLE` on test targets |
+| `ENABLE_DEVICE_LINKER` | `OFF` | Match docker image |
+
+Plugin tests reset host singleton state each `SetUp()` via `ncclGinAnvilPluginTestResetHostState()` and `ncclGinAnvilIpcTableTestReset()`.
 
 ### Integration (8 GPUs)
 
@@ -257,10 +277,11 @@ mpirun -n 8 --allow-run-as-root \
 
 Recommended workflow on `smci355-ccs-aus-m03-17`:
 
-1. `./gin-anvil-smci355-test.bash all` — docker C1+C2 + host unit suites A–H, G (suite F off).
+1. `./gin-anvil-smci355-test.bash all` — docker C1+C2 + host unit suites (**49 tests**: 30 fixtures + 19 plugin).
 2. After code edits: `GIN_ANVIL_SKIP_DOCKER_REBUILD=1 ./gin-anvil-smci355-test.bash unit` — RCCL unit only (no `install.sh`; builds under `gin-anvil-bm/build/rccl-unit/`).
-3. Optional host suite F: `GIN_ANVIL_BUILD_SUITE_F=1` after `libopenmpi-dev` install.
+3. Optional host suite F: `GIN_ANVIL_BUILD_SUITE_F=1` after `libopenmpi-dev` install (**+12 tests**, 61 total).
 4. Bare-metal integration: `GIN_ANVIL_LAYOUT=bare-metal` (runs `install.sh` + `alltoall_perf`; preflight requires host MPI).
+5. Isolation (D4/D5): `./gin-anvil-smci355-test.bash isolation` — Test#5 with `THRESHOLD=0` and `65536`.
 
 Host ROCm (e.g. 7.0.2 on smci355) may differ from the docker image (7.13). Default `all` uses docker for integration; host builds only GTest binaries.
 

@@ -122,6 +122,9 @@ The **GIN Anvil SDMA** backend (`NCCL_GIN_TYPE=5`, `NCCL_NET_DEVICE_GIN_ANVIL_SD
 |----------|------|
 | [`gin-anvil-sdma-backend-design.md`](./gin-anvil-sdma-backend-design.md) | Design rationale, datapath (IPC vs SDMA), signal/IPC table model, formal test matrix |
 | [`gin-anvil-sdma-backend-tests.md`](./gin-anvil-sdma-backend-tests.md) | Script reference, `NCCL_GIN_TYPE` vs `alltoall_perf -D`, per-test env |
+| [`gin-anvil-sdma-unit-test-plan.md`](./gin-anvil-sdma-unit-test-plan.md) | GTest suites A–H + G (+ opt-in F): inventory, coverage, build/run |
+| [`gin-anvil-smci355-bare-metal-layout.md`](./gin-anvil-smci355-bare-metal-layout.md) | MI355 bare-metal tree, CMake flags, orchestrator |
+| [`../gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash) | MI355 test runner: unit + integration + isolation |
 | [`../extra-rdma-debs/README.md`](../extra-rdma-debs/README.md) | Optional newer `libmlx5` debs when the image lacks `mlx5dv_reg_dmabuf_mr` |
 
 ### Build image
@@ -149,10 +152,20 @@ Optional: `RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1` (strict DMA-BUF symbol chec
 
 ### Run tests
 
+**Integration (multi-GPU, Docker):**
+
 ```bash
 ./docker-gin-gda-sdma-test.bash 8 128M
 # Ruby: ./docker-gin-gda-sdma-ruby-test.bash 8 128M
 ```
+
+**Unit tests (single GPU, MI355 orchestrator):**
+
+```bash
+./gin-anvil-smci355-test.bash unit
+```
+
+Runs **49 GTest cases** by default (`rccl-UnitTestsFixtures` 30 + `rccl-UnitTestsGinAnvilPlugin` 19). Suite F (+12) is opt-in via `GIN_ANVIL_BUILD_SUITE_F=1`. See [`gin-anvil-sdma-unit-test-plan.md`](./gin-anvil-sdma-unit-test-plan.md).
 
 Default **`RCCL_GIN_RUN_TESTS=1,5`** runs only Test#1 (host `-D 0`) and Test#5 (Anvil `NCCL_GIN_TYPE=5`, `-D 3`). Tests **#2** and **#4** are opt-in via `RCCL_GIN_RUN_TESTS=1,2,4,5`.
 
