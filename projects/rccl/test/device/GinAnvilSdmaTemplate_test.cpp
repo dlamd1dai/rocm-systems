@@ -53,7 +53,7 @@ static void uploadHarness(DeviceBuffer<TemplateHarness>* d_h, TemplateHarness* h
   stub.tag = 42;
   d_q->upload(stub);
   gin_anvil::sdma::SdmaQueueDeviceHandle* rowHost[2] = {d_q->ptr, d_q->ptr};
-  d_handleRow->copyFrom(rowHost);
+  d_handleRow->copyFrom(rowHost, 2);
   host->ctx.queueHandles = reinterpret_cast<void**>(d_handleRow->ptr);
 
   host->ipcEntry.local_base = reinterpret_cast<uintptr_t>(d_dst->ptr);
@@ -447,7 +447,7 @@ TEST_F(GinAnvilSdmaTemplateTest, Flush_MultiDirtyBits) {
   stub.tag = 7;
   d_q.upload(stub);
   gin_anvil::sdma::SdmaQueueDeviceHandle* rowHost[4] = {d_q.ptr, d_q.ptr, d_q.ptr, d_q.ptr};
-  d_row.copyFrom(rowHost);
+  d_row.copyFrom(rowHost, 4);
 
   TemplateHarness host{};
   uploadHarness(&d_h, &host, &d_src, &d_dst, &d_entry, &d_q, &d_row, 128);
