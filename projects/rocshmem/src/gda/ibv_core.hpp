@@ -40,6 +40,11 @@
 #include <stdint.h>
 #include <limits>
 
+#include <cerrno>
+#include <cstddef>
+#include <cstdlib>
+#include <pthread.h>
+
 #include <linux/types.h>
 #include <linux/if_ether.h>
 

@@ -38,7 +38,6 @@ if(USE_GDA)
   list(APPEND _rocshmem_info_sources
     ${CMAKE_SOURCE_DIR}/src/gda/topology.cpp
     ${CMAKE_SOURCE_DIR}/src/gda/ibv_wrapper.cpp
-    ${CMAKE_SOURCE_DIR}/src/memory/memory_allocator.cpp
   )
 endif()
 
