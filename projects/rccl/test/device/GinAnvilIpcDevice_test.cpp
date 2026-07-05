@@ -19,6 +19,7 @@
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
 #endif
 
+#include <cstring>
 #include <vector>
 
 namespace RcclUnitTesting
@@ -61,7 +62,8 @@ TEST_F(GinAnvilIpcDeviceTest, ResolvePeerVa_AllCases) {
 
   std::vector<ResolveCase> cases = {
       {reinterpret_cast<void*>(0x50000100ULL), 2, 1, true, 0x60002000ULL + 0x100},
-      {reinterpret_cast<void*>(0x50000FFFULL), 0, 1, false, 0},  // at end → miss
+      {reinterpret_cast<void*>(0x50000FFFULL), 0, 1, true, 0x60000FFFULL},  // last byte in range → hit
+      {reinterpret_cast<void*>(0x50001000ULL), 0, 1, false, 0},  // one past end → miss
       {reinterpret_cast<void*>(0x40000000ULL), 0, 1, false, 0},  // before base
       {reinterpret_cast<void*>(0x50000000ULL), -1, 1, false, 0},
       {reinterpret_cast<void*>(0x50000000ULL), NCCL_GIN_ANVIL_IPC_MAX_RANKS, 1, false, 0},
@@ -214,11 +216,10 @@ TEST_F(GinAnvilIpcDeviceTest, DetailHelpers_ChannelAndDirty) {
   syncAndCheck();
 
   EXPECT_EQ(d_eff.download(), 2);  // (0 + 1*(128/64)) % 4 == 2
-#if SDMA_IS_OSS7
-  EXPECT_TRUE(d_fused.download());
-#else
-  EXPECT_FALSE(d_fused.download());
-#endif
+  hipDeviceProp_t prop{};
+  ASSERT_EQ(hipSuccess, hipGetDeviceProperties(&prop, 0));
+  const bool oss7 = (std::strstr(prop.gcnArchName, "gfx950") != nullptr);
+  EXPECT_EQ(d_fused.download(), oss7);
   EXPECT_NE(d_dirtyRead.download(), 0ULL);
 
   // stride 0 → always channel 0
