@@ -6,7 +6,7 @@ This note documents the **Docker build and test scripts** at the repository root
 
 ## Unit tests (GTest)
 
-Run on **one GPU** before or alongside the Docker harness. These are **not** invoked by `docker-gin-gda-sdma-test.bash`; use `gin-anvil-smci355-test.bash unit` or build manually.
+Run on **one GPU** before or alongside the Docker harness. These are **not** invoked by `docker-gin-gda-sdma-test.bash`; use `gin-anvil-smci355-test.bash unit`, `gin-anvil-ruby-test.bash unit`, or build manually.
 
 | Suite | Class / focus | Tests | Target | Filter |
 |-------|---------------|------:|--------|--------|
@@ -19,8 +19,11 @@ Run on **one GPU** before or alongside the Docker harness. These are **not** inv
 **Default:** 49 tests (30 fixtures + 19 plugin). **With suite F:** 61 tests.
 
 ```bash
-# MI355 orchestrator (recommended):
+# MI355 Conductor orchestrator:
 ./gin-anvil-smci355-test.bash unit
+
+# Ruby MI350X orchestrator:
+./gin-anvil-ruby-test.bash unit
 
 # Manual bare-metal build (see gin-anvil-smci355-bare-metal-layout.md):
 cmake -S projects/rccl -B gin-anvil-bm/build/rccl-unit \
@@ -43,7 +46,8 @@ cmake --build gin-anvil-bm/build/rccl-unit \
 
 | Script | Role |
 |--------|------|
-| [`gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash) | MI355 orchestrator: preflight, build, **unit** (A–H, G, opt-in F), integration, isolation |
+| [`gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash) | MI355 Conductor orchestrator: preflight, build, **unit** (A–H, G, opt-in F), integration, isolation |
+| [`gin-anvil-ruby-test.bash`](../gin-anvil-ruby-test.bash) | Ruby MI350X orchestrator (`sudo docker`, `gin-anvil-bm-ruby/`) |
 | [`docker-gin-gda-sdma-build.bash`](../docker-gin-gda-sdma-build.bash) | Build image (`docker`, repo root) |
 | [`docker-gin-gda-sdma-test.bash`](../docker-gin-gda-sdma-test.bash) | Run harness (`docker`) |
 | [`docker-gin-gda-sdma-ruby-build.bash`](../docker-gin-gda-sdma-ruby-build.bash) | Build on Ruby (`sudo docker`, `--network=host`) |
