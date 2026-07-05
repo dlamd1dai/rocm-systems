@@ -109,7 +109,8 @@ Super-repo guides live under [`docs/`](./docs/). Highlights for **RCCL GPU-Initi
 | [`docs/gin-anvil-sdma-backend-design.md`](./docs/gin-anvil-sdma-backend-design.md) | Design, architecture, and formal test plan (`NCCL_GIN_TYPE=5`) |
 | [`docs/gin-anvil-sdma-backend-tests.md`](./docs/gin-anvil-sdma-backend-tests.md) | Docker build/test harness, `alltoall_perf -D` mapping, env tuning |
 | [`docs/gin-anvil-sdma-unit-test-plan.md`](./docs/gin-anvil-sdma-unit-test-plan.md) | GTest unit suites A–H + G: test inventory, coverage, build/run |
-| [`docs/gin-anvil-smci355-bare-metal-layout.md`](./docs/gin-anvil-smci355-bare-metal-layout.md) | MI355 bare-metal install layout and CMake profile |
+| [`docs/gin-anvil-smci355-bare-metal-layout.md`](./docs/gin-anvil-smci355-bare-metal-layout.md) | MI355 Conductor bare-metal install layout and CMake profile |
+| [`docs/gin-anvil-ruby-bare-metal-layout.md`](./docs/gin-anvil-ruby-bare-metal-layout.md) | Ruby MI350X bare-metal layout (`gin-anvil-bm-ruby/`) |
 | [`docs/continuous-integration.md`](./docs/continuous-integration.md#rccl-gin-anvil-sdma-local-validation) | CI overview and local Docker validation workflow |
 
 **Quick start (single-node MI300/MI355, 8 GPUs):**
@@ -123,7 +124,8 @@ source ./docker-gin-gda-sdma-preflight.bash   # Ruby build does this automatical
 **Unit tests (1 GPU, before integration):**
 
 ```bash
-./gin-anvil-smci355-test.bash unit            # 49 GTest cases on host GPU
+./gin-anvil-smci355-test.bash unit            # MI355 Conductor (49 GTest cases)
+./gin-anvil-ruby-test.bash unit                # Ruby MI350X (same suites, separate tree)
 ```
 
 Default run executes Test#1 (host baseline) and Test#5 (`NCCL_GIN_ENABLE=1`, `NCCL_GIN_TYPE=5`, `alltoall_perf -D 3 -V 1`). See [`docs/gin-anvil-sdma-backend-tests.md`](./docs/gin-anvil-sdma-backend-tests.md) for full harness options.
