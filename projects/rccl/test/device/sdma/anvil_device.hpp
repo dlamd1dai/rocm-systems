@@ -14,20 +14,23 @@ struct SdmaQueueSingleProducerDeviceHandle {
   int tag;
 };
 
+__device__ __forceinline__ void memcpyDevice(void* dst, const void* src, size_t size) {
+  if (dst == nullptr || src == nullptr || size == 0) return;
+  auto* d = static_cast<char*>(dst);
+  const auto* s = static_cast<const char*>(src);
+  for (size_t i = 0; i < size; ++i) d[i] = s[i];
+}
+
 __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, void* src, size_t size) {
   (void)handle;
-  (void)dst;
-  (void)src;
-  (void)size;
+  memcpyDevice(dst, src, size);
 }
 
 __device__ __forceinline__ void putSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src, size_t size,
                                           uint64_t* signal) {
-  (void)handle;
-  (void)dst;
-  (void)src;
-  (void)size;
   (void)signal;
+  (void)handle;
+  memcpyDevice(dst, src, size);
 }
 
 __device__ __forceinline__ void quiet(SdmaQueueDeviceHandle& handle) { (void)handle; }

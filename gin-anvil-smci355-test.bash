@@ -420,22 +420,27 @@ _unit() {
   [[ -x "${fixtures}" ]] || _die "missing ${fixtures}"
   [[ -x "${plugin}" ]] || _die "missing ${plugin}"
 
+  local rc=0
+
   _log "--- Suite A–E + H: rccl-UnitTestsFixtures (GinAnvil*) ---"
-  "${fixtures}" --gtest_filter='GinAnvil*'
+  "${fixtures}" --gtest_filter='GinAnvil*' || rc=$?
 
   _log "--- Suite H only: GinAnvilSdmaTemplateTest.* ---"
-  "${fixtures}" --gtest_filter='GinAnvilSdmaTemplateTest.*'
+  "${fixtures}" --gtest_filter='GinAnvilSdmaTemplateTest.*' || rc=$?
 
   _log "--- Suite G: rccl-UnitTestsGinAnvilPlugin ---"
-  "${plugin}" --gtest_filter='GinAnvilPluginTest.*'
+  "${plugin}" --gtest_filter='GinAnvilPluginTest.*' || rc=$?
 
   if [[ -x "${factory}" ]]; then
     _log "--- Suite F: rocshmem_unit_tests (factory) ---"
-    "${factory}" --gtest_filter='GinAnvilSdmaFactoryTest.*'
+    "${factory}" --gtest_filter='GinAnvilSdmaFactoryTest.*' || rc=$?
   else
     _log "note: suite F skipped (default; factory covered by docker Test#5). Opt in: GIN_ANVIL_BUILD_SUITE_F=1 + libopenmpi-dev"
   fi
 
+  if [[ "${rc}" -ne 0 ]]; then
+    _die "unit tests failed (exit ${rc})"
+  fi
   _log "unit tests passed"
 }
 
