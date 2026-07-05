@@ -54,12 +54,13 @@ void SetLsaSelfAddr(void* addr) { g.lsaSelfAddr = addr; }
 
 int ncclDebugLevel = NCCL_LOG_VERSION;
 uint64_t ncclDebugMask = NCCL_INIT;
+thread_local int ncclDebugNoWarn = 0;
 
-extern "C" void ncclDebugLog(ncclDebugLogLevel level, unsigned flags, const char* file, int line,
-                             const char* fmt, ...) {
+void ncclDebugLog(ncclDebugLogLevel level, unsigned long flags, const char* filefunc, int line,
+                  const char* fmt, ...) {
   (void)level;
   (void)flags;
-  (void)file;
+  (void)filefunc;
   (void)line;
   (void)fmt;
 }
