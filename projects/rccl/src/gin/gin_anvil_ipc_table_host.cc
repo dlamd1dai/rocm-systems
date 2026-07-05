@@ -152,4 +152,15 @@ extern "C" int ncclGinAnvilIpcTableUnregister(void* localBase) {
   return removeEntry(reinterpret_cast<uintptr_t>(localBase));
 }
 
+extern "C" void ncclGinAnvilIpcTableTestReset(void) {
+  while (liveContexts != nullptr) {
+    LiveGpuContext* next = liveContexts->next;
+    delete liveContexts;
+    liveContexts = next;
+  }
+  masterEntryCount = 0;
+  d_ipcTableCount = 0;
+  (void)syncTableToDevice();
+}
+
 #endif  // ENABLE_ROCSHMEM_GIN

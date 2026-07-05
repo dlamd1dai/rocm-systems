@@ -71,7 +71,10 @@ class GinAnvilPluginTest : public ::testing::Test {
   GinAnvilMockComm mockComm_;
 
   void SetUp() override {
+    ncclGinAnvilPluginTestResetHostState();
+    ncclGinAnvilIpcTableTestReset();
     GinAnvilPluginStubs::Reset();
+    mockComm_.reset();
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) == hipSuccess && ndev > 0) {
       ASSERT_EQ(hipSetDevice(0), hipSuccess);

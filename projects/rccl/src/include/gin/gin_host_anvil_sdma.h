@@ -20,4 +20,7 @@ ncclResult_t ncclGinAnvilBindResourceWindowSignals(struct ncclComm* comm, void* 
 
 void ncclGinAnvilSetInitContext(void* initCtx, struct ncclComm* comm);
 
+/** Clears plugin host singleton state (pending signal binds, MR refcounts). For unit tests. */
+void ncclGinAnvilPluginTestResetHostState(void);
+
 #endif

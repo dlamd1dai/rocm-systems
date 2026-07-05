@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace GinAnvilPluginStubs {
 
@@ -94,12 +95,17 @@ extern "C" int gin_anvil_sdma_create(int nRanks, int myRank, int my_device_id,
                                      int (*allgather)(void*, void*, size_t), void* allgather_ctx,
                                      int num_channels, gin_anvil_sdma_handle_t* out_handle,
                                      void** out_gpu_handles, uint64_t** out_sdma_dirty) {
-  (void)myRank;
-  (void)my_device_id;
-  (void)allgather;
-  (void)allgather_ctx;
-  if (!out_handle || !out_gpu_handles || !out_sdma_dirty) return -1;
+  if (!out_handle || !out_gpu_handles || !out_sdma_dirty || !allgather || nRanks < 1 || myRank < 0 ||
+      myRank >= nRanks)
+    return -1;
   if (GinAnvilPluginStubs::g.factoryCreateFail) return -1;
+
+  std::vector<int> devs(static_cast<size_t>(nRanks), -1);
+  devs[static_cast<size_t>(myRank)] = my_device_id;
+  if (allgather(allgather_ctx, devs.data(), sizeof(int)) != 0) return -1;
+  for (int i = 0; i < nRanks; ++i) {
+    if (devs[static_cast<size_t>(i)] < 0) return -1;
+  }
 
   const int numChannels = num_channels < 1 ? 1 : (num_channels > 8 ? 8 : num_channels);
   auto* impl = new GinAnvilPluginStubs::FakeSdmaOpaque{};
