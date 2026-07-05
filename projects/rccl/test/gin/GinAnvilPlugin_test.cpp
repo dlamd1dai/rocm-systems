@@ -88,15 +88,13 @@ class GinAnvilPluginTest : public ::testing::Test {
     ncclGinAnvilSetInitContext(*ictx, mockComm_.get());
   }
 
-  void* connectColl(void* ictx) {
+  void connectColl(void* ictx, void** coll) {
     void* listen = nullptr;
     char handle[NCCL_NET_HANDLE_MAXSIZE] = {};
     ASSERT_EQ(plugin_.listen(ictx, 0, handle, &listen), ncclSuccess);
-    void* coll = nullptr;
     void* handles[1] = {handle};
-    ASSERT_EQ(plugin_.connect(ictx, handles, 1, 0, listen, &coll), ncclSuccess);
+    ASSERT_EQ(plugin_.connect(ictx, handles, 1, 0, listen, coll), ncclSuccess);
     ASSERT_EQ(plugin_.closeListen(listen), ncclSuccess);
-    return coll;
   }
 };
 
@@ -163,7 +161,8 @@ TEST_F(GinAnvilPluginTest, Connect_FactoryFail) {
 TEST_F(GinAnvilPluginTest, Connect_Success) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ASSERT_NE(coll, nullptr);
   EXPECT_EQ(plugin_.closeColl(coll), ncclSuccess);
   EXPECT_EQ(plugin_.finalize(ictx), ncclSuccess);
@@ -174,7 +173,8 @@ TEST_F(GinAnvilPluginTest, RegMrSym_LsaFail) {
   GinAnvilPluginStubs::SetLsaAddrFail(true);
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   void* mhandle = nullptr;
   void* ginHandle = nullptr;
   void* data = reinterpret_cast<void*>(0x1000);
@@ -187,7 +187,8 @@ TEST_F(GinAnvilPluginTest, RegMrSym_LsaFail) {
 TEST_F(GinAnvilPluginTest, RegMrSym_Refcount) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   void* data = reinterpret_cast<void*>(0x2000);
   void* mh1 = nullptr;
   void* gh1 = nullptr;
@@ -206,7 +207,8 @@ TEST_F(GinAnvilPluginTest, RegMrSym_Refcount) {
 TEST_F(GinAnvilPluginTest, RegMrSymDmaBuf) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   void* mhandle = nullptr;
   void* ginHandle = nullptr;
   ASSERT_EQ(plugin_.regMrSymDmaBuf(coll, reinterpret_cast<void*>(0x3000), 1024, 0, 0, -1, 0, &mhandle,
@@ -222,7 +224,8 @@ TEST_F(GinAnvilPluginTest, CreateContext_MissingInfra) {
   GinAnvilPluginStubs::SetFactoryNullHandles(true);
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 0;
   cfg.nCounters = 0;
@@ -239,7 +242,8 @@ TEST_F(GinAnvilPluginTest, CreateContext_EnvAndCounters) {
   ScopedEnv fs("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL", "1");
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 2;
   cfg.nCounters = 1;
@@ -276,7 +280,8 @@ TEST_F(GinAnvilPluginTest, BindSignals_InvalidArgs) {
 TEST_F(GinAnvilPluginTest, BindSignals_SlotOutOfRange) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx1 = nullptr;
@@ -299,7 +304,8 @@ TEST_F(GinAnvilPluginTest, BindSignals_SlotOutOfRange) {
 TEST_F(GinAnvilPluginTest, BindSignals_Success) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 2;
   void* ginCtx = nullptr;
@@ -333,7 +339,8 @@ TEST_F(GinAnvilPluginTest, Connect_EnvNumChannelsClamp) {
   ScopedEnv ch("NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS", "0");
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ASSERT_NE(coll, nullptr);
   plugin_.closeColl(coll);
   plugin_.finalize(ictx);
@@ -343,7 +350,8 @@ TEST_F(GinAnvilPluginTest, Connect_EnvNumChannelsClamp) {
 TEST_F(GinAnvilPluginTest, BindSignals_LsaResolveFail) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx = nullptr;
@@ -363,7 +371,8 @@ TEST_F(GinAnvilPluginTest, BindSignals_LsaResolveFail) {
 TEST_F(GinAnvilPluginTest, BindSignals_IpcTableFull) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx = nullptr;
@@ -393,7 +402,8 @@ TEST_F(GinAnvilPluginTest, BindSignals_IpcTableFull) {
 TEST_F(GinAnvilPluginTest, CloseColl_AfterSignalBind) {
   void* ictx = nullptr;
   initCtx(&ictx);
-  void* coll = connectColl(ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
   ncclGinConfig_v13_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx = nullptr;
