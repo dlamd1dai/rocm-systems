@@ -43,7 +43,7 @@ This keeps your working directory clean and fast, as you won't need to clone the
 ## Directory Structure
 
 - `.github/`: CI workflows, scripts, and configuration files for synchronizing repositories during the migration period.
-- `docs/`: Documentation, including this guide, [continuous integration](./continuous-integration.md), and RCCL [GIN Anvil SDMA](./gin-anvil-sdma-backend-design.md) design/test notes.
+- `docs/`: Documentation, including this guide, [continuous integration](./continuous-integration.md), and RCCL [GIN Anvil SDMA](./gin-anvil-sdma-backend-design.md) design/test notes ([unit test plan](./gin-anvil-sdma-unit-test-plan.md), [harness](./gin-anvil-sdma-backend-tests.md), [MI355 bare-metal](./gin-anvil-smci355-bare-metal-layout.md)).
 - `projects/<name>/`: Each folder corresponds to a ROCm library that was previously maintained in its own GitHub repository and released as distinct packages.
 - `shared/<name>/`: Shared components that existed in their own repository, used as dependencies by multiple libraries, but do not produce distinct packages in previous ROCm releases.
 

@@ -1,30 +1,38 @@
 # GIN Anvil SDMA — Docker build/test harness and `alltoall_perf` command lines
 
-This note documents the **Docker build and test scripts** at the repository root for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`): how tests are selected, what each run executes, and how to tune or debug failures. For backend design and the formal pass/fail matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md). For **GTest unit suites A–H** (single-GPU, no MPI), see [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
+This note documents the **Docker build and test scripts** at the repository root for GIN Anvil SDMA (`NCCL_GIN_TYPE=5`): how tests are selected, what each run executes, and how to tune or debug failures. For backend design and the formal pass/fail matrix, see [`gin-anvil-sdma-backend-design.md`](gin-anvil-sdma-backend-design.md). For **GTest unit suites A–H + G** (single-GPU, no MPI), see [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md). For **MI355 bare-metal orchestration**, see [`gin-anvil-smci355-bare-metal-layout.md`](gin-anvil-smci355-bare-metal-layout.md) and [`../gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash).
 
 ---
 
-## Unit tests (GTest, optional pre-integration)
+## Unit tests (GTest)
 
-Run on **one GPU** before or alongside the Docker harness. These are **not** invoked by `docker-gin-gda-sdma-test.bash`; build RCCL/rocSHMEM tests from the same tree.
+Run on **one GPU** before or alongside the Docker harness. These are **not** invoked by `docker-gin-gda-sdma-test.bash`; use `gin-anvil-smci355-test.bash unit` or build manually.
 
-| Suite | Target | Filter |
-|-------|--------|--------|
-| A–E, H | `rccl-UnitTestsFixtures` | `--gtest_filter='GinAnvil*'` |
-| G | `rccl-UnitTestsGinAnvilPlugin` | `--gtest_filter='GinAnvilPluginTest.*'` |
-| F | `rocshmem_unit_tests` | `--gtest_filter='GinAnvilSdmaFactoryTest.*'` |
+| Suite | Class / focus | Tests | Target | Filter |
+|-------|---------------|------:|--------|--------|
+| A | `GinAnvilIpcTableHostTest` | 9 | `rccl-UnitTestsFixtures` | `GinAnvilIpcTableHostTest.*` |
+| B–E | `GinAnvilIpcDeviceTest` | 9 | `rccl-UnitTestsFixtures` | `GinAnvilIpcDeviceTest.*` |
+| H | `GinAnvilSdmaTemplateTest` | 12 | `rccl-UnitTestsFixtures` | `GinAnvilSdmaTemplateTest.*` |
+| G | `GinAnvilPluginTest` | 19 | `rccl-UnitTestsGinAnvilPlugin` | `GinAnvilPluginTest.*` |
+| F | `GinAnvilSdmaFactoryTest` | 12 | `rocshmem_unit_tests` | `GinAnvilSdmaFactoryTest.*` (opt-in) |
+
+**Default:** 49 tests (30 fixtures + 19 plugin). **With suite F:** 61 tests.
 
 ```bash
-cmake -S projects/rccl -B build/rccl \
-  -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON
-cmake --build build/rccl --target rccl-UnitTestsFixtures rccl-UnitTestsGinAnvilPlugin
-./build/rccl/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
-./build/rccl/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
+# MI355 orchestrator (recommended):
+./gin-anvil-smci355-test.bash unit
 
-cmake -S projects/rocshmem -B build/rocshmem -DUSE_SDMA=ON -DBUILD_TESTS=ON
-cmake --build build/rocshmem --target rocshmem_unit_tests
-./build/rocshmem/tests/unit_tests/rocshmem_unit_tests \
-  --gtest_filter='GinAnvilSdmaFactoryTest.*'
+# Manual bare-metal build (see gin-anvil-smci355-bare-metal-layout.md):
+cmake -S projects/rccl -B gin-anvil-bm/build/rccl-unit \
+  -DENABLE_ROCSHMEM_GIN=ON -DENABLE_ROCSHMEM=OFF -DGIN_ANVIL_UNIT_TESTS=ON \
+  -DENABLE_DEVICE_LINKER=OFF -DBUILD_TESTS=ON -DGPU_TARGETS=gfx950 \
+  -DROCSHMEM_INSTALL_DIR=gin-anvil-bm/install/rocshmem \
+  -DROCSHMEM_SOURCE_DIR=projects/rocshmem \
+  -DROCSHMEM_BUILD_DIR=gin-anvil-bm/build/rocshmem/include/rocshmem
+cmake --build gin-anvil-bm/build/rccl-unit \
+  --target rccl-UnitTestsFixtures rccl-UnitTestsGinAnvilPlugin
+./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsFixtures --gtest_filter='GinAnvil*'
+./gin-anvil-bm/build/rccl-unit/test/rccl-UnitTestsGinAnvilPlugin --gtest_filter='GinAnvilPluginTest.*'
 ```
 
 **Coverage (estimated):** ~96% weighted line / ~95% weighted branch across Anvil SDMA sources. Per-suite tables and `llvm-cov` commands: [`gin-anvil-sdma-unit-test-plan.md`](gin-anvil-sdma-unit-test-plan.md).
@@ -35,6 +43,7 @@ cmake --build build/rocshmem --target rocshmem_unit_tests
 
 | Script | Role |
 |--------|------|
+| [`gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash) | MI355 orchestrator: preflight, build, **unit** (A–H, G, opt-in F), integration, isolation |
 | [`docker-gin-gda-sdma-build.bash`](../docker-gin-gda-sdma-build.bash) | Build image (`docker`, repo root) |
 | [`docker-gin-gda-sdma-test.bash`](../docker-gin-gda-sdma-test.bash) | Run harness (`docker`) |
 | [`docker-gin-gda-sdma-ruby-build.bash`](../docker-gin-gda-sdma-ruby-build.bash) | Build on Ruby (`sudo docker`, `--network=host`) |
@@ -82,6 +91,34 @@ NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RCCL_GIN_RUN_TESTS=5 ./docker-gin-gda-sdma-test.
 ```
 
 Legacy alias: **`RUN_TESTS`** is accepted if **`RCCL_GIN_RUN_TESTS`** is unset.
+
+---
+
+## Functional and integration tests (multi-GPU)
+
+These tests require **8 GPUs** (default `NP=8`), **MPI**, and a built `alltoall_perf` (docker image or bare-metal `gin-anvil-bm/build/rccl-tests/`). Formal IDs and pass criteria: [design doc §6–8](gin-anvil-sdma-backend-design.md#test-plan).
+
+| ID | Harness | What it validates | Unit-test overlap |
+|----|---------|-------------------|-------------------|
+| **C1** | Test#1, `-D 0` | Host `ncclAlltoAll` baseline, `#wrong==0` | — |
+| **C2** | Test#5, `-D 3`, `NCCL_GIN_TYPE=5` | Full Anvil GIN AlltoAll sweep 128 B–128 MiB | Suites B–H, G (device + plugin paths) |
+| **C3–C4** | Test#5, `NP=1,2,4,8` | Scale correctness | Partial (factory F11 multi-rank) |
+| **D1–D3** | Test#5, default threshold | IPC small + SDMA bulk paths | C, E3, H3–H4 |
+| **D4** | `THRESHOLD=0` (isolation phase) | Force all SDMA | H3, H6–H7, H11 |
+| **D5** | `THRESHOLD=65536` (isolation phase) | Force all IPC | C, E3, H5 |
+| **D6** | `NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL=1` | OSS7 fused copy+signal on HW | H6, `DetailHelpers` (gfx950) |
+| **D7** | `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS` | Multi-queue per peer | G16, factory F7 |
+| **D8** | implicit in `-D 3` kernel | Flush / quiet / dirty bitmask | H8, H12 |
+| **P1–P5** | C1 vs C2 logs | Performance regression tracking | — |
+
+**Isolation runs** (design doc D4/D5):
+
+```bash
+./gin-anvil-smci355-test.bash isolation
+# Or manually:
+NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RCCL_GIN_RUN_TESTS=5 ./docker-gin-gda-sdma-test.bash 8
+NCCL_GIN_ANVIL_SDMA_THRESHOLD=65536 RCCL_GIN_RUN_TESTS=5 ./docker-gin-gda-sdma-test.bash 8
+```
 
 ---
 
