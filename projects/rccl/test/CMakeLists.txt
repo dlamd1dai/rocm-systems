@@ -456,12 +456,13 @@ if(BUILD_TESTS)
 
   # Suite H: shadow rocSHMEM sdma headers with no-op test stubs (higher-priority include path).
   if(ENABLE_ROCSHMEM_GIN AND (ENABLE_ROCSHMEM OR GIN_ANVIL_UNIT_TESTS))
-    target_include_directories(rccl-UnitTestsFixtures PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device)
     if(ROCSHMEM_SOURCE_DIR)
       target_include_directories(rccl-UnitTestsFixtures PRIVATE ${ROCSHMEM_SOURCE_DIR}/src)
     else()
       target_include_directories(rccl-UnitTestsFixtures PRIVATE ${CMAKE_SOURCE_DIR}/../rocshmem/src)
     endif()
+    target_include_directories(rccl-UnitTestsFixtures BEFORE PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/device)
   endif()
 
   # Create install-time test file for distribution
