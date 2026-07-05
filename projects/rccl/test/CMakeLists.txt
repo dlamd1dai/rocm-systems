@@ -265,6 +265,23 @@ if(BUILD_TESTS)
     target_compile_definitions(rccl-UnitTestsFixtures PRIVATE ENABLE_ROCSHMEM)
   endif()
 
+  if(ENABLE_ROCSHMEM_GIN OR GIN_ANVIL_UNIT_TESTS)
+    if(ROCSHMEM_INCLUDE_DIR)
+      target_include_directories(rccl-UnitTestsFixtures PRIVATE ${ROCSHMEM_INCLUDE_DIR})
+    elseif(ROCSHMEM_INSTALL_DIR)
+      target_include_directories(rccl-UnitTestsFixtures PRIVATE
+        "${ROCSHMEM_INSTALL_DIR}/include")
+    endif()
+    if(ROCSHMEM_SOURCE_DIR)
+      target_include_directories(rccl-UnitTestsFixtures PRIVATE
+        "${ROCSHMEM_SOURCE_DIR}/src"
+        "${ROCSHMEM_SOURCE_DIR}/include")
+    endif()
+    if(ROCSHMEM_BUILD_DIR)
+      target_include_directories(rccl-UnitTestsFixtures PRIVATE ${ROCSHMEM_BUILD_DIR})
+    endif()
+  endif()
+
   if(ENABLE_ROCSHMEM_GIN AND ROCM_VERSION VERSION_GREATER_EQUAL "60400")
     list(APPEND RCCL_TEST_EXECUTABLES rccl-UnitTestsGinAnvilPlugin)
 
