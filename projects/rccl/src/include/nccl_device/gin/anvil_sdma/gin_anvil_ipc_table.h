@@ -35,6 +35,7 @@ void ncclGinAnvilIpcTableGetDevice(const ncclGinAnvilIpcBufEntry** outTable, int
 void ncclGinAnvilIpcTableTrackContext(struct ncclGinAnvilSdmaGPUContext* hostCtx,
                                       struct ncclGinAnvilSdmaGPUContext* devCtx);
 void ncclGinAnvilIpcTableUntrackContext(struct ncclGinAnvilSdmaGPUContext* hostCtx);
+void ncclGinAnvilIpcTableTestReset(void);
 
 #ifdef __cplusplus
 }

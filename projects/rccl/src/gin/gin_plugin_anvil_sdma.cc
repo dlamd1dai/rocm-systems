@@ -113,6 +113,14 @@ void ncclGinAnvilSetInitContext(void* initCtx, struct ncclComm* comm) {
   static_cast<ginAnvilInitCtx*>(initCtx)->comm = comm;
 }
 
+void ncclGinAnvilPluginTestResetHostState(void) {
+  while (!g_pendingByComm.empty()) {
+    ginAnvilPendingClear(g_pendingByComm.begin()->first);
+  }
+  g_nextSignalSlot.clear();
+  bufferRegRefcount.clear();
+}
+
 static ncclResult_t ginAnvilInit(void** ctx, uint64_t commId, ncclDebugLogger_t logFunction) {
   const char* gin_type = getenv("NCCL_GIN_TYPE");
   if (gin_type && atoi(gin_type) != NCCL_NET_DEVICE_GIN_ANVIL_SDMA) return ncclInternalError;
@@ -336,6 +344,7 @@ ncclResult_t ncclGinAnvilBindResourceWindowSignals(struct ncclComm* comm, void* 
     if (ctx->nSignals <= 0) continue;
     if (ctx->signalSlot < 0 || ctx->signalSlot >= nContexts) {
       WARN("GIN anvil-sdma: signal slot %d out of range (nContexts=%d)", ctx->signalSlot, nContexts);
+      ginAnvilPendingClear(comm);
       return ncclInvalidArgument;
     }
 
@@ -345,6 +354,7 @@ ncclResult_t ncclGinAnvilBindResourceWindowSignals(struct ncclComm* comm, void* 
     NCCLCHECK(ncclDevrGetLsaSelfAddr(&comm->devrState, localPtr, &lsaSelf));
     if (lsaSelf == nullptr) {
       WARN("GIN anvil-sdma: could not resolve LSA flat addr for resource-window signals at %p", localPtr);
+      ginAnvilPendingClear(comm);
       return ncclSystemError;
     }
 
