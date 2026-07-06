@@ -84,7 +84,6 @@ MPI_BASE=(
   -x RCCL_ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD}"
   -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}"
   -x NCCL_DEBUG_SUBSYS=INIT,NET
-  -x NCCL_CUMEM_ENABLE=1
   -x RCCL_ENABLE_INTRANET=1
   -x NCCL_DMABUF_ENABLE=1
   -x NCCL_MSCCL_ENABLE=0
@@ -329,10 +328,11 @@ if _run_test 1; then
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
+    -x NCCL_CUMEM_ENABLE=0 \
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1
   _trace_off
 fi
 
@@ -343,6 +343,7 @@ if _run_test 2; then
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
     -x NCCL_NET_PLUGIN=none \
     -x NCCL_ENV_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
@@ -361,6 +362,7 @@ if _should_run_test4; then
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
     -x NCCL_NET_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=1 \
     -x NCCL_GIN_ENABLE=1 \
@@ -380,6 +382,7 @@ if _should_run_test5; then
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
     -x NCCL_NET_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
