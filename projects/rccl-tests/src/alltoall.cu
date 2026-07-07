@@ -66,7 +66,8 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
         return testInternalError;
       }
       reqs->barrierCount = deviceCtaCount;
-      reqs->ginSignalCount = deviceCtaCount;
+      reqs->ginContextCount = deviceCtaCount;
+      reqs->ginSignalCount = 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -105,7 +106,8 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: // GinAlltoAllKernel: all CTAs, one barrier per CTA
       reqs->barrierCount = deviceCtaCount;
-      reqs->ginSignalCount = deviceCtaCount;
+      reqs->ginContextCount = deviceCtaCount;
+      reqs->ginSignalCount = 1;
       return true;
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
       reqs->barrierCount = 1;
@@ -233,27 +235,31 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  int ginContext = 0;
-  unsigned int signalIndex = 0;
+  const int nCtas = gridDim.x;
+  const int cta = blockIdx.x;
+  const int ginContext = cta % devComm.ginContextCount;
+  constexpr unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
-  uint64_t signalValue = gin.readSignal(signalIndex);
+  const bool waitIncoming = (cta == (devComm.rank % nCtas));
+  uint64_t signalValue = waitIncoming ? gin.readSignal(signalIndex) : 0;
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int nthreads = blockDim.x * gridDim.x;
-
-  /* send to all peers via GIN */
+  /* Each CTA owns a disjoint peer subset: cta, cta+nCtas, ... */
   const size_t size = count * sizeof(T);
-  for (int r=tid; r<devComm.nRanks; r+=nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
-        recvwin, recvoffset + devComm.rank * size,
-        sendwin, sendoffset + r * size,
-        size, ncclGin_SignalInc{signalIndex});
+  if (threadIdx.x == 0) {
+    for (int r = cta; r < devComm.nRanks; r += nCtas) {
+      gin.put(ncclTeamWorld(devComm), r,
+          recvwin, recvoffset + devComm.rank * size,
+          sendwin, sendoffset + r * size,
+          size, ncclGin_SignalInc{signalIndex});
+    }
   }
 
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
+  if (waitIncoming) {
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
+  }
   gin.flush(ncclCoopCta());
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);

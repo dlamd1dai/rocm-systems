@@ -147,6 +147,24 @@ int memory_report = 0;
 
 int deviceCtaCount = 16; // Default number of CTAs for device implementation
 
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+// GinAlltoAllKernel (-D 3) maps one GIN context per CTA; sharing contexts deadlocks.
+static testResult_t validateDeviceCtaGinContexts(
+    struct ncclDevComm const* devComm, struct ncclDevCommRequirements const* reqs) {
+  if (reqs->ginContextCount != deviceCtaCount || reqs->barrierCount != deviceCtaCount) {
+    return testSuccess;
+  }
+  const int nContexts = (int)devComm->ginContextCount;
+  if (nContexts <= 0 || deviceCtaCount <= nContexts) return testSuccess;
+  fprintf(stderr,
+    "Error: -V %d exceeds available GIN contexts (%d). "
+    "GinAlltoAllKernel (-D 3) requires one GIN context per CTA; "
+    "sharing contexts can deadlock. Use -V <= %d or set NCCL_GIN_NCONTEXTS >= %d.\n",
+    deviceCtaCount, nContexts, nContexts, deviceCtaCount);
+  return testInvalidUsage;
+}
+#endif
+
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
 static int average = 1;
 static int numDevices = 1;
@@ -1402,6 +1420,7 @@ testResult_t threadInit(struct threadArgs* args) {
       NCCLCHECK(ncclDevCommCreate(args->comms[i], &reqs, args->devComms+i));
     }
     NCCLCHECK(ncclGroupEnd());
+    TESTCHECK(validateDeviceCtaGinContexts(args->devComms, &reqs));
   }
   // Capture memory used by test buffers
   int64_t deviceCommMaxMem = 0;
@@ -2177,6 +2196,7 @@ testResult_t run() {
          NCCLCHECK(ncclDevCommCreate(comms[i], &reqs, devComms.data()+i));
        }
        NCCLCHECK(ncclGroupEnd());
+       TESTCHECK(validateDeviceCtaGinContexts(devComms.data(), &reqs));
      }
      int64_t deviceCommMaxMem = 0;
      for (int g = 0; g < nGpus; ++g) {
@@ -2205,10 +2225,10 @@ testResult_t run() {
   }
 
   fflush(stdout);
-  
+
   // RCCL: Call NCCL's refactored header function with RCCL-specific parameters
   writeResultHeader(report_cputime, report_timestamps, enable_out_of_place, enable_in_place, output_algo_proto_channels);
-  
+
   // RCCL: Initialize Reporter for file output (-Z flag)
   Reporter reporter(rccl_output_file, rccl_output_format);
 
