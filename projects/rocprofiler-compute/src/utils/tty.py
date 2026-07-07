@@ -25,7 +25,7 @@ from utils.utils_analysis import (
     get_bw_scale_and_unit,
     simplify_kernel_name,
 )
-from utils.utils_common import convert_filter_blocks_to_panel_ids, is_gfx115x
+from utils.utils_common import convert_filter_blocks_to_panel_ids
 
 
 def _tty_view_is_table(args: argparse.Namespace) -> bool:
@@ -44,7 +44,7 @@ def wrap_kernel_name(name: str) -> str:
 def scale_bw_columns(
     df: pd.DataFrame, value_columns: list[str], decimal: int = 2
 ) -> pd.DataFrame:
-    """Scale Bytes/s rows to human-readable units; recalculate Percent of Peak."""
+    """Scale Bytes/s rows to human-readable units; recalculate Pct of Peak."""
     if "Unit" not in df.columns:
         return df
 
@@ -54,7 +54,7 @@ def scale_bw_columns(
     if not bw_rows.any():
         return df_copy
 
-    pct_cols = ["Percent of Peak"]
+    pct_cols = ["Pct of Peak", "PoP"]
     value_col = "Value" if "Value" in df_copy.columns else "Avg"
     peak_col = "Peak (Empirical)" if "Peak (Empirical)" in df_copy.columns else "Peak"
 
@@ -299,23 +299,18 @@ def is_roofline_shown(
     return True
 
 
-def list_ml_operators(
+def list_torch_operators(
     workload_path: str,
     call_trees: dict[str, CallTreeNode],
-    framework_label: str = "PyTorch",
 ) -> None:
-    """Display operators as a unified call tree grouped by source location.
-
-    ``framework_label`` sets the heading text (for example "PyTorch" or
-    "Triton").
-    """
+    """Display PyTorch operators as a unified call tree grouped by source location."""
     if not call_trees:
-        print(f"\n{framework_label} Operators in: {workload_path}")
+        print(f"\nPyTorch Operators in: {workload_path}")
         print("Total: 0 operators")
         return
 
     print(f"\n{'=' * 80}")
-    print(f"{framework_label} Operator Call Tree: {workload_path}")
+    print(f"PyTorch Operator Call Tree: {workload_path}")
     print("Grouped by source location, sorted by total GPU kernel duration.")
     print(f"{'=' * 80}")
     show_call_tree(call_trees)
@@ -659,9 +654,6 @@ def process_table_data(
                 if args.time_unit and has_time_data(base_df):
                     cur_df = convert_time_columns(cur_df, args.time_unit)
 
-                if header not in cur_df.columns:
-                    continue
-
                 if (table_type == "raw_csv_table") or (
                     table_type == "metric_table" and header not in hidden_cols
                 ):
@@ -792,8 +784,9 @@ def format_table_output(
     # For single run and gfx115x, format BW metrics (Bytes/s) to human-readable
     # For multiple runs (baseline comparison), keep Bytes for accurate comparison
     is_single_run = len(runs) == 1
+    is_gfx115x = gpu_arch and gpu_arch.startswith("gfx115")
 
-    if is_single_run and is_gfx115x(gpu_arch) and "Unit" in df.columns:
+    if is_single_run and is_gfx115x and "Unit" in df.columns:
         # Identify value columns to format
         value_cols = ["Value", "Avg", "Min", "Max", "Peak", "Peak (Empirical)"]
         df = scale_bw_columns(df, value_cols, args.decimal)
@@ -819,7 +812,7 @@ def format_table_output(
                 .to_dict()["Value"]
             )
 
-        if is_gfx115x(gpu_arch):
+        if gpu_arch and gpu_arch.startswith("gfx115"):
             content += (
                 mem_chart_gfx11.plot_mem_chart(
                     args.normal_unit,
@@ -985,8 +978,9 @@ def show_all(
                 is_mem_chart = table_config.get(
                     "cli_style"
                 ) == "mem_chart" and not _tty_view_is_table(args)
+                is_gfx115x = gpu_arch and gpu_arch.startswith("gfx115")
 
-                if is_mem_chart and is_gfx115x(gpu_arch) and len(runs) == 1:
+                if is_mem_chart and is_gfx115x and len(runs) == 1:
                     has_cols = (
                         "Metric" in processed_df.columns
                         and "Value" in processed_df.columns

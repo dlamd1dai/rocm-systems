@@ -489,7 +489,7 @@ ncclResult_t rcclGetProtocolName(int protocol, const char** protocolName) {
 bool rcclUseAlltoAllGda(struct ncclComm* comm) {
 
 #ifdef ENABLE_ROCSHMEM
-  if (comm->enableRocshmem && comm->nNodes > 1 && (comm->nRanks/comm->nNodes == 8) && comm->rocshmemThreshold <= 1048576) {
+  if (comm->enableRocshmem) {
       INFO(NCCL_INIT, "Enabling GDA alltoall for RCCL");
       return true;
   }

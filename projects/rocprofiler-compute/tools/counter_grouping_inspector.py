@@ -178,6 +178,7 @@ def run_soc_detect_and_coalesce(
         membw_analysis=False,
         set_selected=None,
         roof_only=False,
+        spatial_multiplexing=None,
         no_roof=True,
         device=0,
     )

@@ -7,7 +7,6 @@ import shlex
 from rocprof_compute_profile.profiler_base import RocProfCompute_Base
 from rocprof_compute_soc.soc_base import OmniSoC_Base
 from utils.logger import console_error, console_log, demarcate
-from utils.utils_profile import pc_sampling_unit
 
 
 class rocprof_v3_profiler(RocProfCompute_Base):
@@ -19,18 +18,9 @@ class rocprof_v3_profiler(RocProfCompute_Base):
     ) -> None:
         super().__init__(profiling_args, profiler_mode, soc)
 
-    def _live_attach_options(self) -> list[str]:
-        args = self.get_args()
-        options = ["--pid", args.attach_pid, "--attach-sync-output"]
-        if args.attach_duration_msec:
-            options += ["--attach-duration-msec", args.attach_duration_msec]
-        return options
-
-    def _app_cmd_options(self) -> list[str]:
-        return ["--", *shlex.split(self.get_args().remaining)]
-
     def get_profiler_options(self) -> list[str]:
         args = self.get_args()
+        app_cmd = shlex.split(args.remaining)
         if args.kokkos_trace:
             trace_option = "--kokkos-trace"
             # NOTE: --kokkos-trace feature is incomplete and is disabled for now.
@@ -39,7 +29,7 @@ class rocprof_v3_profiler(RocProfCompute_Base):
                 "version of rocprof-compute. This functionality is planned for a "
                 "future release. Please adjust your profiling options accordingly."
             )
-        elif getattr(self, "_selected_frameworks", set()):
+        elif getattr(args, "torch_trace", False):
             trace_option = "--marker-trace"
         else:
             trace_option = "--kernel-trace"
@@ -53,7 +43,12 @@ class rocprof_v3_profiler(RocProfCompute_Base):
         ]
 
         if args.attach_pid:
-            profiling_options += self._live_attach_options()
+            profiling_options.append("--pid")
+            profiling_options.append(args.attach_pid)
+
+            if args.attach_duration_msec:
+                profiling_options.append("--attach-duration-msec")
+                profiling_options.append(args.attach_duration_msec)
 
         # Kernel filtering
         if args.kernel:
@@ -78,34 +73,8 @@ class rocprof_v3_profiler(RocProfCompute_Base):
             ])
 
         if not args.attach_pid:
-            profiling_options += self._app_cmd_options()
-        return profiling_options
-
-    def get_pc_sampling_profiler_options(self) -> list[str]:
-        args = self.get_args()
-        method = args.pc_sampling_method
-
-        profiling_options = [
-            "--kernel-trace",
-            "--pc-sampling-beta-enabled",
-            "--pc-sampling-method",
-            method,
-            "--pc-sampling-unit",
-            pc_sampling_unit(method),
-            "--output-format",
-            "json",
-            "--pc-sampling-interval",
-            str(args.pc_sampling_interval),
-            "-d",
-            args.output_directory,
-            "-o",
-            "ps_file",  # TODO: sync up with the name from source in 2100_.yaml
-        ]
-
-        if args.attach_pid:
-            profiling_options += self._live_attach_options()
-        else:
-            profiling_options += self._app_cmd_options()
+            profiling_options.append("--")
+            profiling_options.extend(app_cmd)
         return profiling_options
 
     # -----------------------

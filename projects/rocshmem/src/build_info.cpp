@@ -23,12 +23,12 @@
  *****************************************************************************/
 
 #include "build_info.hpp"
-#include "rocshmem/rocshmem.hpp"
 #include "rocshmem_config_embedded.hpp"
-#include "util.hpp"
 
+#include <hip/hip_runtime.h>
 #include <rocm-core/rocm_version.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <set>
@@ -36,6 +36,16 @@
 #include <string>
 
 namespace rocshmem {
+
+#define CHECK_HIP(instr)                                                       \
+  do {                                                                         \
+    hipError_t error = (instr);                                                \
+    if (error != hipSuccess) {                                                 \
+      std::cerr << #instr ": " << hipGetErrorString(error) << " (" << error   \
+                << ")\n";                                                      \
+      std::exit(1);                                                            \
+    }                                                                          \
+  } while (0)
 
 static constexpr int NAME_COL = 28;
 static constexpr int INFO_COL = 47;
@@ -156,7 +166,7 @@ void print_build_info(std::ostream& os) {
   os << "#                                rocSHMEM Info                                 #\n";
   os << "################################################################################\n";
 
-  print_entry(os, "Version", rocshmem::VERSION);
+  print_entry(os, "Version", ROCSHMEM_VERSION);
   print_entry(os, "Vendor String", ROCSHMEM_VENDOR_STRING);
   print_entry(os, "Git Hash", ROCSHMEM_GIT_HASH);
   print_entry(os, "Build Type", ROCSHMEM_BUILD_TYPE);

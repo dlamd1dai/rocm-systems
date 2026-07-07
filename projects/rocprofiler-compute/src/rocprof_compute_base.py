@@ -171,7 +171,7 @@ class RocProfCompute:
                         "Block 30 (Memory Bandwidth Analysis) is an experimental "
                         "feature.\n"
                         f'To use "-b {block_input}", you must also specify: '
-                        "--experimental --membw-analysis"
+                        "--membw-analysis --experimental"
                     )
             # Block 21 (PC sampling) is profile-only; analyze auto-detects it
             # from the profiling config yaml.
@@ -180,7 +180,7 @@ class RocProfCompute:
                     console_error(
                         "Block 21 (PC Sampling) is an experimental feature.\n"
                         f'To use "-b {block_input}", you must also specify: '
-                        "--experimental --pc-sampling"
+                        "--pc-sampling --experimental"
                     )
 
         # When --pc-sampling is set, inject "21" into filter_blocks so the
@@ -346,55 +346,73 @@ class RocProfCompute:
     def handle_analyze_args(self) -> None:
         """Handle analyze-specific argument processing"""
         args = self.__args
-        operator_filter = (
-            args.torch_operator is not None or args.triton_operator is not None
-        )
-        operator_listing = args.list_torch_operators or args.list_triton_operators
+        torch_operator = args.torch_operator
+        list_torch_operators = args.list_torch_operators
 
-        if operator_filter or operator_listing:
+        if torch_operator is not None or list_torch_operators:
             if args.gui is not None:
                 console_error(
-                    "ml api trace",
-                    "Operator flags (--torch-operator, --triton-operator, "
-                    "--list-torch-operators, --list-triton-operators) are not "
+                    "torch trace",
+                    "--torch-operator and --list-torch-operators are not "
                     "supported in --gui mode. Please remove --gui or run "
-                    "without the operator flags.",
+                    "without the torch-operator flags.",
                 )
             if args.tui:
                 console_error(
-                    "ml api trace",
-                    "Operator flags (--torch-operator, --triton-operator, "
-                    "--list-torch-operators, --list-triton-operators) are not "
+                    "torch trace",
+                    "--torch-operator and --list-torch-operators are not "
                     "supported in --tui mode. Please remove --tui or run "
-                    "without the operator flags.",
+                    "without the torch-operator flags.",
+                )
+            if args.spatial_multiplexing:
+                console_error(
+                    "torch trace",
+                    "--torch-operator and --list-torch-operators do not yet "
+                    "support multi-node analysis via --spatial-multiplexing. "
+                    "Please remove one of these options.",
                 )
             if args.output_format != "stdout":
                 console_error(
-                    "ml api trace",
-                    "Operator flags (--torch-operator, --triton-operator, "
-                    "--list-torch-operators, --list-triton-operators) are only "
+                    "torch trace",
+                    "--torch-operator and --list-torch-operators are only "
                     "supported with --output-format stdout (the default). "
                     "The matched operator call tree is printed directly to "
                     "stdout and is not captured in txt, csv, or db output. "
-                    "Remove the --output-format option or drop the operator flags.",
+                    "Remove the --output-format option or drop the "
+                    "torch-operator flags.",
                 )
 
-            if operator_filter:
+            if torch_operator is not None:
                 if args.list_stats:
                     console_warning(
-                        "ml api trace",
-                        "Operator filters are ignored by --list-stats; the "
+                        "torch trace",
+                        "--torch-operator is ignored by --list-stats; the "
                         "full kernel stats table will be shown regardless "
                         "of the operator filter.",
                     )
-                if operator_listing:
+                if args.list_nodes:
                     console_warning(
-                        "ml api trace",
-                        "Operator filters are ignored when a --list-*-operators "
-                        "flag is used; the full operator tree will be shown. "
-                        "Drop the listing flag to apply the operator filter, or "
-                        "drop the filter to list all operators.",
+                        "torch trace",
+                        "--torch-operator is ignored by --list-nodes; the "
+                        "node enumeration does not respect the operator "
+                        "filter.",
                     )
+                if list_torch_operators:
+                    console_warning(
+                        "torch trace",
+                        "--torch-operator is ignored when "
+                        "--list-torch-operators is used; the full operator "
+                        "tree will be shown. Drop --list-torch-operators to "
+                        "apply the operator filter to the analysis, or drop "
+                        "--torch-operator to list all operators.",
+                    )
+
+        # Block all filters during spatial-multiplexing
+        if self.__args.spatial_multiplexing:
+            self.__args.gpu_id = None
+            self.__args.gpu_kernel = None
+            self.__args.gpu_dispatch_id = None
+            self.__args.nodes = None
 
     @demarcate
     def handle_list_args(self) -> None:
@@ -534,28 +552,6 @@ class RocProfCompute:
             self.__soc[self.__mspec.gpu_arch],
         )
 
-    @staticmethod
-    def prepare_workload_directory(output_dir: Path, overwrite: bool) -> None:
-        """Error if the output directory is non-empty unless overwrite is set,
-        in which case its contents are removed before profiling.
-        """
-        if output_dir.is_dir() and any(output_dir.iterdir()):
-            if not overwrite:
-                console_error(
-                    f"Existing workload directory {output_dir} is not empty, "
-                    "please use --overwrite"
-                )
-            console_warning(
-                f"Clearing existing directory {output_dir} due to --overwrite"
-            )
-            for child in output_dir.iterdir():
-                if child.is_dir() and not child.is_symlink():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-
     @demarcate
     def run_profiler(self) -> None:
         self.print_graphic()
@@ -575,10 +571,13 @@ class RocProfCompute:
         except WorkloadCommandError as e:
             console_error(str(e))
 
-        # Validate and prepare the workload directory before profiling.
-        self.prepare_workload_directory(
-            Path(self.__args.output_directory), self.__args.overwrite
-        )
+        # Create workload directory if it does not exist
+        p = Path(self.__args.output_directory)
+        if not p.exists():
+            try:
+                p.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                console_error("Directory already exists.")
 
         # enable file-based logging
         setup_file_handler(self.__args.loglevel, self.__args.output_directory)
@@ -697,11 +696,6 @@ class RocProfCompute:
 
         roofline_csv = output_dir / "roofline.csv"
         existing_roofline = roofline_csv.is_file()
-        if existing_roofline and not getattr(self.__args, "overwrite", False):
-            console_error(
-                f"{roofline_csv} already exists, please use --overwrite to "
-                "regenerate it"
-            )
         console_log(
             "roofline",
             f"Running roofline microbenchmark on device {self.__args.device}",
@@ -736,9 +730,11 @@ class RocProfCompute:
 
     @demarcate
     def run_analysis(self) -> None:
-        # Lazy import pandas since it is only used in analysis mode.
-        # This keeps analysis deps out of the profile path.
+        # Lazy import pandas and file_io since they are only used in analysis
+        # mode. This keeps analysis deps out of the profile path.
         import pandas as pd
+
+        from utils import file_io
 
         self.print_graphic()
         console_log(f"Analysis mode = {self.__analyze_mode}")
@@ -772,7 +768,16 @@ class RocProfCompute:
         for path_list in analyzer.get_args().path:
             base_path = path_list[0] if isinstance(path_list, list) else path_list
 
-            sys_info = pd.read_csv(f"{base_path}/sysinfo.csv")
+            # Determine sysinfo path
+            if (
+                analyzer.get_args().nodes is None
+                and not analyzer.get_args().spatial_multiplexing
+            ):
+                sysinfo_path = base_path
+            else:
+                sysinfo_path = file_io.find_1st_sub_dir(base_path)
+
+            sys_info = pd.read_csv(f"{sysinfo_path}/sysinfo.csv")
             sys_info_dict = {
                 key: value[0] for key, value in sys_info.to_dict("list").items()
             }

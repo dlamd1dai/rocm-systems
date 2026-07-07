@@ -48,7 +48,6 @@
 #include <cassert>
 #include <algorithm>
 #include <sstream>
-#include <vector>
 #ifdef _WIN32
 #include <Windows.h>
 #include <io.h>
@@ -941,6 +940,7 @@ bool ReadFileIntoBuffer(const std::string& filename, std::vector<char>& buffer)
 }
 
 #ifndef _WIN32
+#define _tempnam tempnam
 #define _close close
 #define _getpid getpid
 #define _open open
@@ -949,41 +949,32 @@ bool ReadFileIntoBuffer(const std::string& filename, std::vector<char>& buffer)
 int OpenTempFile(const char* prefix)
 {
   unsigned c = 0;
+  std::string tname = prefix;
+  tname += "_";
+  tname += std::to_string(_getpid());
+  tname += "_";
   while (c++ < 20) { // Loop because several threads can generate same filename.
 #ifdef _WIN32
-    char dir[MAX_PATH + 1];
-    char name[MAX_PATH + 1];
+    char dir[MAX_PATH+1];
     if (!GetTempPath(sizeof(dir), dir)) { return -1; }
-    char short_prefix[4] = {0};
-    strncpy(short_prefix, prefix, 3);
-    if (GetTempFileName(dir, short_prefix, 0, name) == 0) { continue; }
+    char *name = _tempnam(dir, tname.c_str());
+    if (!name) { return -1; }
     HANDLE h = CreateFile(
       name,
       GENERIC_READ | GENERIC_WRITE,
       0, // No sharing
       NULL,
-      OPEN_EXISTING,
+      CREATE_NEW,
       FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
       NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-      DeleteFile(name);
-      continue;
-    }
+    free(name);
+    if (h == INVALID_HANDLE_VALUE) { continue; }
     return _open_osfhandle((intptr_t)h, 0);
 #else // _WIN32
-    const char* tmpdir = getenv("TMPDIR");
-    if (tmpdir == nullptr || tmpdir[0] == '\0') { tmpdir = "/tmp"; }
-    std::string tname = tmpdir;
-    tname += '/';
-    tname += prefix;
-    tname += '_';
-    tname += std::to_string(_getpid());
-    tname += "_XXXXXX";
-    std::vector<char> path(tname.begin(), tname.end());
-    path.push_back('\0');
-    int d = mkstemp(path.data());
+    tname += "XXXXXX";
+    int d = mkstemp((char*)tname.c_str());
     if (d < 0) { continue; }
-    if (unlink(path.data()) < 0) { _close(d); return -1; }
+    if (unlink(tname.c_str()) < 0) { _close(d); return -1; }
     return d;
 #endif // _WIN32
   }

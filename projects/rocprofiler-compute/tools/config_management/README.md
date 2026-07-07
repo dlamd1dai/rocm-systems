@@ -42,6 +42,7 @@ rocprofiler-compute/
 ```
 
 ## Core Concepts
+
 ### Panel YAMLs
 
 - Live under:

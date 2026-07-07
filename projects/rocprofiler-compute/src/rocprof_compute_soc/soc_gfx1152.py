@@ -31,9 +31,11 @@ class gfx1152_soc(OmniSoC_Base):
                 "GRBM": 2,
             })
 
-        self._mspec.l2_banks = 8
-        self._mspec.lds_banks_per_cu = 32
-        self._mspec.pipes_per_gpu = 2
+        # Set arch specific specs for RDNA3.5
+        # These values may need adjustment based on actual hardware
+        self._mspec.l2_banks = 8  # Typical for APU
+        self._mspec.lds_banks_per_cu = 32  # Standard RDNA3.5 LDS config
+        self._mspec.pipes_per_gpu = 2  # APU typically has fewer pipes
 
     # -----------------------
     # Required child methods

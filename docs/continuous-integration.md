@@ -18,6 +18,7 @@ This document is to detail the various continuous integration (CI) systems that 
     1. [Overview](#win-overview)
 4. [TheRock CI](#therock-ci)
     1. [Overview](#rock-overview)
+5. [RCCL GIN Anvil SDMA (local validation)](#rccl-gin-anvil-sdma-local-validation)
 
 ## Azure Pipelines
 
@@ -110,3 +111,98 @@ graph TD;
 ## TheRock CI
 
 ### Overview <a id="rock-overview"></a>
+
+## RCCL GIN Anvil SDMA (local validation) <a id="rccl-gin-anvil-sdma-local-validation"></a>
+
+The **GIN Anvil SDMA** backend (`NCCL_GIN_TYPE=5`, `NCCL_NET_DEVICE_GIN_ANVIL_SDMA`) is validated on **single-node, multi-GPU xGMI** hosts through **repo-root Docker scripts**, not through Azure Pipelines or the default TheRock RCCL workflows today. Use this harness when changing RCCL GIN plugins, rocSHMEM Anvil SDMA factory code, or related device templates.
+
+### Documentation
+
+| Document | Role |
+|----------|------|
+| [`gin-anvil-sdma-backend-design.md`](./gin-anvil-sdma-backend-design.md) | Design rationale, datapath (IPC vs SDMA), signal/IPC table model, formal test matrix |
+| [`gin-anvil-sdma-backend-tests.md`](./gin-anvil-sdma-backend-tests.md) | Script reference, `NCCL_GIN_TYPE` vs `alltoall_perf -D`, per-test env |
+| [`gin-anvil-sdma-unit-test-plan.md`](./gin-anvil-sdma-unit-test-plan.md) | GTest suites A–H + G (+ opt-in F): inventory, coverage, build/run |
+| [`gin-anvil-smci355-bare-metal-layout.md`](./gin-anvil-smci355-bare-metal-layout.md) | MI355 bare-metal tree, CMake flags, orchestrator |
+| [`../gin-anvil-smci355-test.bash`](../gin-anvil-smci355-test.bash) | MI355 Conductor test runner: unit + integration + isolation |
+| [`gin-anvil-ruby-bare-metal-layout.md`](./gin-anvil-ruby-bare-metal-layout.md) | Ruby MI350X bare-metal tree (`gin-anvil-bm-ruby/`) |
+| [`../gin-anvil-ruby-test.bash`](../gin-anvil-ruby-test.bash) | Ruby MI350X test runner (`sudo docker`) |
+| [`../extra-rdma-debs/README.md`](../extra-rdma-debs/README.md) | Optional newer `libmlx5` debs when the image lacks `mlx5dv_reg_dmabuf_mr` |
+
+### Build image
+
+From the repository root (MI355X default `gfx950`; use `GPU_TARGETS=gfx942` on MI300X):
+
+```bash
+# MI355 — always full rebuild (--no-cache); run preflight first:
+source ./docker-gin-gda-sdma-preflight.bash
+./docker-gin-gda-sdma-build.bash
+
+# Ruby — preflight sourced automatically, BuildKit --network=host:
+./docker-gin-gda-sdma-ruby-build.bash
+```
+
+See [`gin-anvil-sdma-backend-tests.md`](./gin-anvil-sdma-backend-tests.md) for build-args, `extra-rdma-debs/`, and image verification.
+
+**Build requirements:**
+
+- `ROCSHMEM_USE_SDMA=1` (default build-arg) — rocSHMEM `USE_SDMA=ON` for Anvil queues
+- RCCL built with **`ENABLE_ROCSHMEM_GIN=ON`** in the image
+- Image tag: **`rccl-gin-gda-sdma-713`**
+
+Optional: `RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1` (strict DMA-BUF symbol check at image build).
+
+### Run tests
+
+**Integration (multi-GPU, Docker):**
+
+```bash
+./docker-gin-gda-sdma-test.bash 8 128M
+# Ruby: ./docker-gin-gda-sdma-ruby-test.bash 8 128M
+```
+
+**Unit tests (single GPU, MI355 orchestrator):**
+
+```bash
+./gin-anvil-smci355-test.bash unit
+# Ruby MI350X:
+./gin-anvil-ruby-test.bash unit
+```
+
+Runs **49 GTest cases** by default (`rccl-UnitTestsFixtures` 30 + `rccl-UnitTestsGinAnvilPlugin` 19). Suite F (+12) is opt-in via `GIN_ANVIL_BUILD_SUITE_F=1`. See [`gin-anvil-sdma-unit-test-plan.md`](./gin-anvil-sdma-unit-test-plan.md).
+
+Default **`RCCL_GIN_RUN_TESTS=1,5`** runs only Test#1 (host `-D 0`) and Test#5 (Anvil `NCCL_GIN_TYPE=5`, `-D 3`). Tests **#2** and **#4** are opt-in via `RCCL_GIN_RUN_TESTS=1,2,4,5`.
+
+All harness tests use **`alltoall_perf -V 1`** (validation); `#wrong` must be **0**.
+
+Anvil-only:
+
+```bash
+RCCL_GIN_RUN_TESTS=5 ./docker-gin-gda-sdma-test.bash 8 128M
+```
+
+### Harness test map
+
+| Harness | `NCCL_GIN_TYPE` | `alltoall_perf -D` | Backend |
+|---------|-----------------|--------------------|---------|
+| Test#1 | 0 | 0 | Host `ncclAlltoAll` (baseline) |
+| Test#2 | 2 | 3 | GIN Ib host proxy |
+| Test#4 | 4 | 3 | GIN rocSHMEM GDA (`QueuePair`) |
+| Test#5 | **5** | 3 | **GIN Anvil SDMA** (primary) |
+
+### Preflight and common failures
+
+- **`docker-gin-gda-sdma-preflight.bash`** — run manually before MI355 build (`source ./docker-gin-gda-sdma-preflight.bash`); Ruby build sources it automatically. See harness doc for checks.
+- **Test#5 skipped** — `TEST5_MLX5_PREFLIGHT=1` and image lacks DMA-BUF symbols; default is `0` (run anyway). Fix with [`extra-rdma-debs`](../extra-rdma-debs/) or `TEST5_HOST_MLX5_LIB_DIR`.
+- **GPU fault at 128 B** — signal VA not peer-mapped; verify LSA resource-window bind and IPC table (design doc **N7**).
+- **Hang in AlltoAll** — try `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1` or `TEST5_NUM_CHANNELS=1`.
+
+### Relation to other CI
+
+| System | GIN Anvil SDMA coverage |
+|--------|-------------------------|
+| Azure Pipelines | Not in default super-repo RCCL GIN matrix (see [Build and Test Coverage](#az-coverage)) |
+| TheRock RCCL CI | Standard RCCL/TheRock tests; does not run this Docker GIN harness by default |
+| Local Docker harness | **Authoritative** correctness/perf gate for `NCCL_GIN_TYPE=5` before merge |
+
+For full objectives, environment matrix (E1–E4), and release checklist, see the [test plan](./gin-anvil-sdma-backend-design.md#test-plan) in the design doc.

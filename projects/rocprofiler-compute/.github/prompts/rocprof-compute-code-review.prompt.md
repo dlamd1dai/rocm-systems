@@ -1,5 +1,5 @@
 ---
-agent: 'agent'
+mode: agent
 description: Review the current PR branch against project guidelines.
 ---
 

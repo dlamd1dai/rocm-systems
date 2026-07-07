@@ -21,8 +21,12 @@
 #include "gin/gin_host_win_stub.h"
 #else
 #include "gin/gin_host.h"
+#ifdef ENABLE_ROCSHMEM_GIN
+#include "gin/gin_host_anvil_sdma.h"
+#endif
 #endif
 #include "argcheck.h"
+#include "bitops.h"
 #include <mutex>
 
 NCCL_PARAM(WinStride, "WIN_STRIDE", -1);
@@ -152,17 +156,11 @@ ncclResult_t ncclDevrInitOnce(struct ncclComm* comm) {
   // a consecutive set of ranks.
   int lsaSize = computeLsaSize(comm);
   devr->lsaSize = lsaSize;
-  devr->nLsaTeams = comm->nRanks / devr->lsaSize;
   devr->lsaSelf = comm->rank % lsaSize;
   devr->lsaRankList = (int*)malloc(devr->lsaSize*sizeof(int));
   for (int i=0; i < devr->lsaSize; i++) {
     devr->lsaRankList[i] = comm->rank + (i - devr->lsaSelf);
   }
-
-  // RCCL: shadow pool is used by both sym VMM and IPC backings (rmaTaskAppend
-  // decodes peer windows via ncclShadowPoolToHost). Construct unconditionally;
-  // it's just a small zero-init for the hash table head, see allocator.cc.
-  ncclShadowPoolConstruct(&devr->shadows);
 
   if (comm->symmetricSupport) {
     CUmemAllocationProp memProp = {};
@@ -187,27 +185,9 @@ ncclResult_t ncclDevrInitOnce(struct ncclComm* comm) {
     INFO(NCCL_INIT, "Symmetric VA size=%ldGB", (long)devr->bigSize>>30);
 
     ncclSpaceConstruct(&devr->bigSpace);
+    ncclShadowPoolConstruct(&devr->shadows);
   } else {
     devr->bigSize = 1; // proxy-only: marks devrState as initialized
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    // RCCL: the non-sym (host API) path routes co-located peers through CE/IPC
-    // over the full node-local team, which the gcd-based consecutive LSA
-    // team above cannot represent. Reuse the lsa* fields for this team
-    free(devr->lsaRankList);
-    devr->lsaSize = comm->localRanks;
-    devr->lsaSelf = comm->localRank;
-    devr->nLsaTeams = comm->nRanks / devr->lsaSize;
-
-    devr->lsaRankList = (int*)malloc(devr->lsaSize * sizeof(int));
-    if (devr->lsaRankList == nullptr) {
-      ret = ncclSystemError;
-      goto fail_lsaRankList;
-    }
-
-    for (int i = 0; i < devr->lsaSize; i++) {
-      devr->lsaRankList[i] = comm->localRankToRank[i];
-    }
-#endif
   }
   return ncclSuccess;
 
@@ -218,10 +198,6 @@ fail_lsaRankList:
 
 static void symTeamDestroyAll(struct ncclComm* comm); // Further down
 static void symMemoryDropRef(struct ncclComm* comm, struct ncclDevrMemory* mem); // Further down
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-static ncclResult_t windowDeregisterNonSym(struct ncclComm* comm,
-                                           struct ncclWindow_vidmem* winDev); // Further down
-#endif
 
 ncclResult_t ncclDevrFinalize(struct ncclComm* comm) {
   struct ncclDevrState* devr = &comm->devrState;
@@ -237,31 +213,13 @@ ncclResult_t ncclDevrFinalize(struct ncclComm* comm) {
   // During abort or any other cases, users might not call deregister API for
   // symmetric window objects, we need to destroy all remaining window objects
   // that are not deregistered by user to avoid memory leaks here.
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  // RCCL: non-sym windows aren't backed by the symmetric VMM machinery, so drain
-  // them through the matching non-sym deregister instead of symWindowDestroy.
-  if (!comm->symmetricSupport) {
-    while (devr->winSortedCount > 0) {
-      int before = devr->winSortedCount;
-      struct ncclDevrWindow* win = devr->winSorted[0].win;
-      NCCLCHECKIGNORE(windowDeregisterNonSym(comm, win->vidmem), ret);
-      // windowDeregisterNonSym only removes the entry on success; drop it on
-      // failure too so abort-time finalize always makes progress.
-      if (devr->winSortedCount >= before) {
-        listRemove(devr->winSorted, &devr->winSortedCount, 0);
-      }
-    }
-  } else
-#endif
-  {
-    CUDACHECKIGNORE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    while (devr->winSortedCount > 0) {
-      struct ncclDevrWindow* win = devr->winSorted[0].win;
-      NCCLCHECKIGNORE(symWindowDestroy(comm, win->vidmem, stream), ret);
-    }
-    CUDACHECKIGNORE(cudaStreamSynchronize(stream));
-    CUDACHECKIGNORE(cudaStreamDestroy(stream));
+  CUDACHECKIGNORE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  while (devr->winSortedCount > 0) {
+    struct ncclDevrWindow* win = devr->winSorted[0].win;
+    NCCLCHECKIGNORE(symWindowDestroy(comm, win->vidmem, stream), ret);
   }
+  CUDACHECKIGNORE(cudaStreamSynchronize(stream));
+  CUDACHECKIGNORE(cudaStreamDestroy(stream));
 
 
   if (comm->symmetricSupport) {
@@ -304,13 +262,9 @@ ncclResult_t ncclDevrFinalize(struct ncclComm* comm) {
       CUdeviceptr flatAddr = reinterpret_cast<CUdeviceptr>(devr->lsaFlatBase);
       CUCHECK(cuMemAddressFree(flatAddr, devr->lsaSize*devr->bigSize));
     }
+    ncclShadowPoolDestruct(&devr->shadows);
     ncclSpaceDestruct(&devr->bigSpace);
   }
-
-  // RCCL: shadows is constructed unconditionally in ncclDevrInitOnce; destruct
-  // is safe whether or not it ever held pages (hbits==0 shortcuts the cleanup).
-  ncclShadowPoolDestruct(&devr->shadows);
-
   free(devr->lsaRankList);
   free(devr->winSorted);
   return ncclSuccess;
@@ -784,8 +738,12 @@ static ncclResult_t symMemoryObtain(
     NCCLCHECKGOTO(symBindTeamMemory(comm, t, mem), ret, fail_mem_space_teams);
   }
 
+  // Link before GIN registration: plugins resolve LSA layout via memHead walk.
+  mem->next = devr->memHead;
+  devr->memHead = mem;
+
   if (devr->ginEnabled) {
-    NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, fail_mem_space_teams);
+    NCCLCHECKGOTO(symMemoryRegisterGin(comm, mem), ret, fail_mem_space_teams_gin);
   } else {
     // Default to single segment when GIN is not yet enabled.
     // This will be recomputed in ncclDevrCommCreateInternal when GIN is activated.
@@ -796,19 +754,31 @@ static ncclResult_t symMemoryObtain(
   // so we introduce rmaProxyEnabled to track if RMA proxy is enabled
   devr->rmaProxyEnabled = devr->nLsaTeams > 1 && comm->config.numRmaCtx > 0 && comm->globalRmaProxySupport;
   if (devr->rmaProxyEnabled && mem->maxGlobalNumSegments == 1) {
-    NCCLCHECKGOTO(symMemoryRegisterRma(comm, mem), ret, fail_mem_space_teams);
+    NCCLCHECKGOTO(symMemoryRegisterRma(comm, mem), ret, fail_mem_space_teams_gin);
   }
 
-  // Add to list of mems.
-  mem->next = devr->memHead;
-  devr->memHead = mem;
-
-leave:
   mem->refCount += 1;
   *outMem = mem;
   free(globalSegmentInfo);
   return ret;
 
+leave:
+  mem->refCount += 1;
+  *outMem = mem;
+  free(globalSegmentInfo);
+  return ncclSuccess;
+
+fail_mem_space_teams_gin:
+  if (devr->memHead == mem) {
+    devr->memHead = mem->next;
+  } else {
+    for (struct ncclDevrMemory** pp = &devr->memHead; *pp != nullptr; pp = &(*pp)->next) {
+      if (*pp == mem) {
+        *pp = mem->next;
+        break;
+      }
+    }
+  }
 fail_mem_space_teams:
   for (struct ncclDevrTeam* t = devr->teamHead; t != nullptr; t = t->next) {
     symUnbindTeamMemory(comm, t, mem);
@@ -1057,255 +1027,6 @@ fail:
   return ret;
 }
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-static void windowCloseIpcPeers(struct ncclComm* comm,
-                                struct ncclDevrWindow* win) {
-  if (win->ipcPeerPtrsAllocBase == nullptr) return;
-  int teamSelf = comm->devrState.lsaSelf;
-  for (int r = 0; r < win->ipcPeerCount; r++) {
-    if (r == teamSelf) continue;
-    void* peerAllocBase = win->ipcPeerPtrsAllocBase[r];
-    if (peerAllocBase == nullptr) continue;
-    CUDACHECKIGNORE(cudaIpcCloseMemHandle(peerAllocBase));
-  }
-}
-
-// RCCL: register a non-sym window. Mirrors upstream sym's two-stage shape:
-//   (1) intra-node mapping via cudaIpcOpenMemHandle peer pointers, when
-//       lsaSize > 1.
-//   (2) inter-node MR via ncclRmaProxyRegister, when hostRmaSupport. Same
-//       call upstream issues from symMemoryRegisterRma.
-static ncclResult_t windowRegisterNonSym(struct ncclComm* comm, void* userPtr,
-                                         size_t userSize, int winFlags,
-                                         void* localRegHandle,
-                                         ncclWindow_t* outWinDev) {
-  struct ExchangeEntry {
-    cudaIpcMemHandle_t handle;
-    uint64_t hostHash;
-    uint64_t pidHash;
-    size_t userOffset; // userPtr - allocBase
-    size_t userSize;
-  };
-
-  // Intra-node barrier tag for the non-sym window mapping handshake.
-  static constexpr int kNonSymWindowBarrierTag = 0xbeed;
-
-  struct ncclDevrState* devr = &comm->devrState;
-  int teamSize = devr->lsaSize;
-  int teamSelf = devr->lsaSelf;
-  int* teamRankList = devr->lsaRankList;
-
-  bool doIpc = teamSize > 1;
-  bool doRma = comm->hostRmaSupport && (teamSize < comm->nRanks);
-
-  struct ncclDevrWindow* win = nullptr;
-  cudaStream_t stream = nullptr;
-  struct ncclWindow_vidmem* winDev = nullptr;
-  struct ncclWindow_vidmem* winDevHost = nullptr;
-  ExchangeEntry* peers = nullptr;
-  int openedCount = 0;
-
-  win = (struct ncclDevrWindow*)malloc(sizeof(struct ncclDevrWindow));
-  if (win == nullptr) goto fail;
-
-  memset(win, 0, sizeof(*win));
-  win->memory = nullptr;
-  win->userPtr = userPtr;
-  win->size = userSize;
-  win->winFlags = winFlags;
-  win->localRegHandle = localRegHandle;
-
-  // Stage 1: intra-node mapping (analog of symMemoryMapLsaTeam).
-  if (doIpc) {
-    CUdeviceptr allocBase = 0;
-    size_t allocSize = 0;
-    CUdeviceptr userPtrCu = reinterpret_cast<CUdeviceptr>(userPtr);
-
-    if (CUDA_SUCCESS !=
-        cuMemGetAddressRange(&allocBase, &allocSize, userPtrCu)) {
-      WARN("windowRegisterNonSym: cuMemGetAddressRange failed for userPtr=%p",
-           userPtr);
-      goto fail;
-    }
-    size_t userOffset = reinterpret_cast<uintptr_t>(userPtr) -
-                        reinterpret_cast<uintptr_t>(allocBase);
-
-    peers = (ExchangeEntry*)calloc(teamSize, sizeof(ExchangeEntry));
-    if (peers == nullptr) goto fail;
-
-    ExchangeEntry* mine = &peers[teamSelf];
-    cudaError_t cerr =
-      cudaIpcGetMemHandle(&mine->handle, reinterpret_cast<void*>(allocBase));
-    if (cerr != cudaSuccess) {
-      WARN("windowRegisterNonSym: cudaIpcGetMemHandle failed: %s",
-           cudaGetErrorString(cerr));
-      goto fail;
-    }
-
-    mine->hostHash = comm->peerInfo[comm->rank].hostHash;
-    mine->pidHash = comm->peerInfo[comm->rank].pidHash;
-    mine->userOffset = userOffset;
-    mine->userSize = userSize;
-
-    if (ncclSuccess !=
-        bootstrapIntraNodeAllGather(comm->bootstrap, teamRankList, teamSelf,
-                                    teamSize, peers, sizeof(ExchangeEntry))) {
-      WARN("windowRegisterNonSym: bootstrapIntraNodeAllGather failed");
-      goto fail;
-    }
-
-    win->ipcPeerPtrs = (void**)calloc(teamSize, sizeof(void*));
-    win->ipcPeerPtrsAllocBase = (void**)calloc(teamSize, sizeof(void*));
-    if (win->ipcPeerPtrs == nullptr || win->ipcPeerPtrsAllocBase == nullptr) {
-      goto fail;
-    }
-    win->ipcPeerCount = teamSize;
-
-    for (int r = 0; r < teamSize; r++) {
-      bool sameProc = (peers[r].hostHash == peers[teamSelf].hostHash) &&
-                      (peers[r].pidHash == peers[teamSelf].pidHash);
-      if (r == teamSelf || sameProc) {
-        // Same address space: self reuses userPtr; same-PID cross-thread
-        // peers stay nullptr (MVP: no cross-thread peer mapping).
-        if (r == teamSelf) {
-          win->ipcPeerPtrsAllocBase[r] = reinterpret_cast<void*>(allocBase);
-          win->ipcPeerPtrs[r] = userPtr;
-        } else {
-          win->ipcPeerPtrsAllocBase[r] = nullptr;
-          win->ipcPeerPtrs[r] = nullptr;
-        }
-      } else {
-        void* peerBase = nullptr;
-        cudaError_t orErr =
-          cudaIpcOpenMemHandle(&peerBase, peers[r].handle,
-                               cudaIpcMemLazyEnablePeerAccess);
-        if (orErr != cudaSuccess) {
-          WARN("windowRegisterNonSym: cudaIpcOpenMemHandle for "
-               "teamRank=%d failed: %s",
-               r, cudaGetErrorString(orErr));
-          goto fail;
-        }
-        win->ipcPeerPtrsAllocBase[r] = peerBase;
-        win->ipcPeerPtrs[r] = (char*)peerBase + peers[r].userOffset;
-        openedCount += 1;
-      }
-    }
-  }
-
-  // Stage 2: inter-node MR (analog of symMemoryRegisterRma).
-  if (doRma) {
-    if (ncclSuccess != ncclRmaProxyConnectOnce(comm)) {
-      WARN("windowRegisterNonSym: ncclRmaProxyConnectOnce failed");
-      goto fail;
-    }
-    if (ncclSuccess != ncclRmaProxyRegister(comm, userPtr, userSize,
-                                            win->rmaHostWins,
-                                            win->rmaDevWins)) {
-      WARN("windowRegisterNonSym: ncclRmaProxyRegister failed");
-      goto fail;
-    }
-  }
-
-  // Stage 3: encode the device-side handle as a shadow pool entry so the
-  // kernel/CE resolves winHost via ncclShadowPoolToHost
-  if (cudaSuccess !=
-      cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking)) {
-    WARN("windowRegisterNonSym: cudaStreamCreateWithFlags failed");
-    goto fail;
-  }
-
-  if (ncclSuccess !=
-      ncclShadowPoolAlloc(&devr->shadows, &winDev, &winDevHost, stream)) {
-    WARN("windowRegisterNonSym: ncclShadowPoolAlloc failed");
-    goto fail;
-  }
-
-  win->vidmem = winDev;
-  memset(winDevHost, 0, sizeof(*winDevHost));
-  winDevHost->lsaRank = teamSelf;
-  winDevHost->worldRank = comm->rank;
-  winDevHost->winHost = (void*)win;
-
-  if (cudaSuccess != cudaMemcpyAsync(winDev, winDevHost, sizeof(*winDevHost),
-                                     cudaMemcpyHostToDevice, stream)) {
-    WARN("windowRegisterNonSym: cudaMemcpyAsync (window header) failed");
-    goto fail;
-  }
-
-  {
-    uintptr_t userAddr = reinterpret_cast<uintptr_t>(userPtr);
-    int idx =
-      listFindSortedLub(&ncclDevrWindowSorted::userAddr, devr->winSorted,
-                        devr->winSortedCount, userAddr);
-    struct ncclDevrWindowSorted winSort;
-    winSort.userAddr = userAddr;
-    winSort.size = userSize;
-    winSort.win = win;
-    listInsert(&devr->winSorted, &devr->winSortedCapacity,
-               &devr->winSortedCount, idx, winSort);
-  }
-
-  CUDACHECKIGNORE(cudaStreamSynchronize(stream));
-  CUDACHECKIGNORE(cudaStreamDestroy(stream));
-  stream = nullptr;
-
-  if (doIpc) {
-    // Intra-node sync; sym path uses bootstrapBarrier post-mapping.
-    if (ncclSuccess != bootstrapIntraNodeBarrier(comm->bootstrap, teamRankList,
-                                                 teamSelf, teamSize,
-                                                 kNonSymWindowBarrierTag)) {
-      WARN("windowRegisterNonSym: bootstrapIntraNodeBarrier failed");
-      // Revert listInsert before falling into shared cleanup.
-      int i = listFindSortedLub(&ncclDevrWindowSorted::userAddr,
-                                devr->winSorted, devr->winSortedCount,
-                                reinterpret_cast<uintptr_t>(userPtr));
-      i -= 1;
-      if (i >= 0) listRemove(devr->winSorted, &devr->winSortedCount, i);
-      goto fail;
-    }
-  }
-
-  INFO(NCCL_INIT,
-       "windowRegisterNonSym: backing=%s teamSize=%d nRanks=%d "
-       "userPtr=%p size=%zu opened=%d hostRma=%d",
-       doIpc ? "IPC" : (doRma ? "PROXY" : "LOCAL"), teamSize, comm->nRanks,
-       userPtr, userSize, openedCount, (int)doRma);
-
-  free(peers);
-  *outWinDev = winDev;
-  return ncclSuccess;
-
-fail:
-  if (win != nullptr) {
-    // Undo proxy MR (rmaHostWins[0] is non-null only after register).
-    if (win->rmaHostWins[0] != nullptr) {
-      (void)ncclRmaProxyDeregister(comm, win->rmaHostWins);
-    }
-
-    windowCloseIpcPeers(comm, win);
-
-    // Free the shadow-pool entry if it was allocated 
-    if (win->vidmem != nullptr) {
-      if (stream == nullptr) {
-        CUDACHECKIGNORE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-      }
-      (void)ncclShadowPoolFree(&devr->shadows, win->vidmem, stream);
-    }
-    free(win->ipcPeerPtrs);
-    free(win->ipcPeerPtrsAllocBase);
-    free(win);
-  }
-  if (stream != nullptr) {
-    CUDACHECKIGNORE(cudaStreamSynchronize(stream));
-    CUDACHECKIGNORE(cudaStreamDestroy(stream));
-  }
-  free(peers);
-  // localRegHandle is owned by caller's failure cleanup path.
-  *outWinDev = nullptr;
-  return ncclSystemError;
-}
-#endif
-
 ncclResult_t ncclDevrWindowRegisterInGroup(
     struct ncclComm* comm,
     void* userPtr, size_t userSize, int winFlags, ncclWindow_t* outWinDev
@@ -1325,17 +1046,41 @@ ncclResult_t ncclDevrWindowRegisterInGroup(
 
   NCCLCHECKGOTO(ncclCommRegister(comm, userPtr, userSize, &localRegHandle), ret, fail);
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  // RCCL: when sym VMM is unavailable (no cuMem), route through the non-sym
-  // helper which lays out IPC for intra-node and proxy/GIN MR for inter-node
   if (!comm->symmetricSupport) {
-    NCCLCHECKGOTO(windowRegisterNonSym(comm, userPtr, userSize, winFlags,
-                                       localRegHandle, outWinDev),
-                  ret, fail_locReg);
-    return ncclSuccess;
+    if (comm->hostRmaSupport) {
+      INFO(NCCL_INIT, "ncclDevrWindowRegisterInGroup: proxy path userPtr=%p size=%zu", userPtr, userSize);
+      struct ncclDevrWindow* win = (struct ncclDevrWindow*)malloc(sizeof(struct ncclDevrWindow));
+      if (win == nullptr) { ret = ncclSystemError; goto fail_locReg; }
+      memset(win, 0, sizeof(*win));
+      win->memory = nullptr;
+      win->userPtr = userPtr;
+      win->size = userSize;
+      win->winFlags = winFlags;
+      win->localRegHandle = localRegHandle;
+      ncclResult_t connRet = ncclRmaProxyConnectOnce(comm);
+      INFO(NCCL_INIT, "ncclDevrWindowRegisterInGroup: ncclRmaProxyConnectOnce ret=%d", (int)connRet);
+      NCCLCHECKGOTO(connRet, ret, fail_locReg_proxywin);
+      INFO(NCCL_INIT, "ncclDevrWindowRegisterInGroup: proxy connected, registering MR");
+      NCCLCHECKGOTO(ncclRmaProxyRegister(comm, userPtr, userSize, win->rmaHostWins, win->rmaDevWins), ret, fail_locReg_proxywin);
+      INFO(NCCL_INIT, "ncclDevrWindowRegisterInGroup: MR registered, win=%p", (void*)win);
+      {
+        struct ncclDevrState* devr = &comm->devrState;
+        uintptr_t userAddr = reinterpret_cast<uintptr_t>(userPtr);
+        int idx = listFindSortedLub(&ncclDevrWindowSorted::userAddr, devr->winSorted, devr->winSortedCount, userAddr);
+        struct ncclDevrWindowSorted winSort;
+        winSort.userAddr = userAddr; winSort.size = userSize; winSort.win = win;
+        listInsert(&devr->winSorted, &devr->winSortedCapacity, &devr->winSortedCount, idx, winSort);
+      }
+      *outWinDev = reinterpret_cast<struct ncclWindow_vidmem*>(win);
+      return ncclSuccess;
+    fail_locReg_proxywin:
+      free(win);
+      goto fail_locReg;
+    } else {
+      *outWinDev = reinterpret_cast<struct ncclWindow_vidmem*>(localRegHandle);
+      return ncclSuccess;
+    }
   }
-#endif
-
   if (winFlags & NCCL_WIN_COLL_SYMMETRIC) {
     // Defer symmetric kernel init until at least one window with that flag exists.
     NCCLCHECKGOTO(ncclSymkInitOnce(comm), ret, fail);
@@ -1588,6 +1333,8 @@ ncclResult_t ncclDevrCommCreateInternal(
   struct ncclDevrWindow* win = nullptr;
   struct ncclWindow_vidmem* winHost = nullptr;
   size_t ginSignalShadowsOffset = 0;
+  size_t ginAnvilNetSignalsOffset = 0;
+  int nGinContextsTotal = 0;
   void* outDevCommPreserve = nullptr;
   struct ncclDevComm outDevCommTmp;
 
@@ -1706,13 +1453,16 @@ ncclResult_t ncclDevrCommCreateInternal(
     bufSizeTotal= alignUp(bufSizeTotal, 128);
     ginSignalShadowsOffset = bufSizeTotal;
     bufSizeTotal += nGinContexts * ginSignalTotal * sizeof(uint64_t); // include signal shadows
+    ginAnvilNetSignalsOffset = bufSizeTotal;
+    if (devr->ginEnabled && ginSignalTotal > 0) {
+      int ginCommCount = comm->sharedRes->ginState.ginCommCount;
+      if (ginCommCount < 1) ginCommCount = 1;
+      nGinContextsTotal = ROUNDUP(nGinContexts, ginCommCount);
+      bufSizeTotal += (size_t)nGinContextsTotal * ginSignalTotal * sizeof(uint64_t);
+    } else {
+      nGinContextsTotal = nGinContexts;
+    }
     bufSizeTotal = alignUp(bufSizeTotal, devr->granularity);
-  }
-
-  if (devr->ginEnabled) {
-    reqs->ginSignalCount = ginSignalTotal;
-    reqs->ginCounterCount = ginCounterTotal;
-    NCCLCHECK(ncclGinDevCommSetup(comm, reqs, outDevComm));
   }
 
   CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, fail);
@@ -1783,6 +1533,19 @@ ncclResult_t ncclDevrCommCreateInternal(
     CUDACHECKGOTO(cudaMemsetAsync(win->userPtr, 0, bufSizeTotal, stream), ret, fail_stream_mem_win);
   }
 
+  if (devr->ginEnabled) {
+    reqs->ginSignalCount = ginSignalTotal;
+    reqs->ginCounterCount = ginCounterTotal;
+    NCCLCHECKGOTO(ncclGinDevCommSetup(comm, reqs, outDevComm), ret, fail_stream_mem_win);
+#ifdef ENABLE_ROCSHMEM_GIN
+    if (ginSignalTotal > 0 && win != nullptr) {
+      NCCLCHECKGOTO(ncclGinAnvilBindResourceWindowSignals(comm, win->userPtr, ginAnvilNetSignalsOffset,
+                                                          nGinContextsTotal, ginSignalTotal),
+                    ret, fail_stream_mem_win);
+    }
+#endif
+  }
+
   CUDACHECKGOTO(cudaStreamSynchronize(stream), ret, fail_stream_mem_win);
 
   NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0xbeef), ret, fail_stream_mem_win);
@@ -1833,20 +1596,6 @@ ncclResult_t ncclCommWindowRegister_impl(
   ncclIntruQueueEnqueue(&comm->devrState.regTaskQueue, task);
   ncclGroupCommJoin(comm, ncclGroupTaskTypeSymRegister);
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  // RCCL: Enqueue RMA CE init on the first window register. Matches the
-  // lazy enqueue in rmaTaskAppend, which fires on the first ncclPutSignal/
-  // Signal/WaitSignal. ncclRmaCeInit is collective (signals window + bootstrap
-  // barrier), so we cannot call it from the non-collective Host API entry point.
-  if (!comm->rmaState.rmaCeState.initialized &&
-      ncclIntruQueueEmpty(&comm->rmaCeInitTaskQueue)) {
-    struct ncclRmaCeInitTask* ceTask;
-    NCCLCHECKGOTO(ncclCalloc(&ceTask, 1), ret, fail);
-    ceTask->comm = comm;
-    ncclIntruQueueEnqueue(&comm->rmaCeInitTaskQueue, ceTask);
-  }
-#endif
-
 exit:
   ncclGroupErrCheck(ret);
   NCCLCHECK(ncclGroupEndInternal());
@@ -1856,77 +1605,7 @@ fail:
   goto exit;
 }
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-// RCCL: deregister mirror of windowRegisterNonSym
-static ncclResult_t windowDeregisterNonSym(struct ncclComm* comm,
-                                           struct ncclWindow_vidmem* winDev) {
-  ncclResult_t ret = ncclSuccess;
-  struct ncclDevrState* devr = &comm->devrState;
-  cudaStream_t stream = nullptr;
-  struct ncclDevrWindow* win = nullptr;
-  int winIdx = -1;
-
-  // Decode win from winDev via the shadow pool
-  struct ncclWindow_vidmem* winDevHost = nullptr;
-  NCCLCHECKGOTO(ncclShadowPoolToHost(&devr->shadows, winDev, &winDevHost),
-                ret, fail);
-  win = (struct ncclDevrWindow*)winDevHost->winHost;
-
-  // Locate this window's registration. A stale handle (e.g. a second
-  // deregister of an already-freed window) is no longer in winSorted
-  for (int i = 0; i < devr->winSortedCount; i++) {
-    if (devr->winSorted[i].win == win) {
-      winIdx = i;
-      break;
-    }
-  }
-  if (winIdx < 0) {
-    WARN("ncclCommWindowDeregister: window %p is not registered (already "
-         "deregistered?)",
-         (void*)winDev);
-    ret = ncclInvalidArgument;
-    goto fail;
-  }
-
-  // Undo stage 2: inter-node proxy MR. rmaHostWins[0] is a reliable witness
-  // because ncclRmaProxyRegister fills NCCL_GIN_MAX_CONNECTIONS handles.
-  if (win->rmaHostWins[0] != nullptr) {
-    NCCLCHECKGOTO(ncclRmaProxyDeregister(comm, win->rmaHostWins), ret, fail);
-  }
-
-  // Undo stage 1: intra-node IPC peer mappings.
-  windowCloseIpcPeers(comm, win);
-  free(win->ipcPeerPtrs);
-  free(win->ipcPeerPtrsAllocBase);
-  win->ipcPeerPtrs = nullptr;
-  win->ipcPeerPtrsAllocBase = nullptr;
-
-  // Undo stage 3: shadow pool entry.
-  CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-                ret, fail);
-  NCCLCHECKGOTO(ncclShadowPoolFree(&devr->shadows, winDev, stream), ret,
-                fail_stream);
-  CUDACHECKIGNORE(cudaStreamSynchronize(stream));
-  CUDACHECKIGNORE(cudaStreamDestroy(stream));
-  stream = nullptr;
-
-  NCCLCHECKGOTO(ncclCommDeregister(comm, win->localRegHandle), ret, fail);
-  listRemove(devr->winSorted, &devr->winSortedCount, winIdx);
-  free(win);
-  return ncclSuccess;
-
-fail_stream:
-  if (stream != nullptr) {
-    CUDACHECKIGNORE(cudaStreamSynchronize(stream));
-    CUDACHECKIGNORE(cudaStreamDestroy(stream));
-  }
-fail:
-  return ret;
-}
-#endif
-
 NCCL_API(ncclResult_t, ncclCommWindowDeregister, ncclComm_t comm, ncclWindow_t win);
-
 ncclResult_t ncclCommWindowDeregister_impl(struct ncclComm* comm, struct ncclWindow_vidmem* winDev) {
   ncclResult_t ret = ncclSuccess;
   int saveDev;
@@ -1934,12 +1613,31 @@ ncclResult_t ncclCommWindowDeregister_impl(struct ncclComm* comm, struct ncclWin
 
   if (winDev == nullptr) goto exit;
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
   if (!comm->symmetricSupport) {
-    NCCLCHECKGOTO(windowDeregisterNonSym(comm, winDev), ret, fail);
+    if (comm->hostRmaSupport) {
+      struct ncclDevrWindow* win = reinterpret_cast<struct ncclDevrWindow*>(winDev);
+      struct ncclDevrState* devr = &comm->devrState;
+      int winIdx = -1;
+      for (int i = 0; i < devr->winSortedCount; i++) {
+        if (devr->winSorted[i].win == win) {
+          winIdx = i;
+          break;
+        }
+      }
+      if (winIdx < 0) {
+        WARN("ncclCommWindowDeregister: window %p is not registered (already deregistered?)", (void*)winDev);
+        ret = ncclInvalidArgument;
+        goto exit;
+      }
+      NCCLCHECKGOTO(ncclRmaProxyDeregister(comm, win->rmaHostWins), ret, fail);
+      NCCLCHECKGOTO(ncclCommDeregister(comm, win->localRegHandle), ret, fail);
+      listRemove(devr->winSorted, &devr->winSortedCount, winIdx);
+      free(win);
+    } else {
+      NCCLCHECKGOTO(ncclCommDeregister(comm, winDev), ret, fail);
+    }
     goto exit;
   }
-#endif
   CUDACHECKGOTO(cudaGetDevice(&saveDev), ret, fail);
   CUDACHECKGOTO(cudaSetDevice(comm->cudaDev), ret, fail);
   CUDACHECKGOTO(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), ret, fail_dev);
@@ -2172,20 +1870,62 @@ ncclResult_t ncclWinGetUserPtr(struct ncclComm* comm, struct ncclWindow_vidmem* 
   return ncclSuccess;
 }
 
-ncclResult_t ncclDevrWorldToLsaRank(struct ncclComm* comm, int peerWorldRank, int* peerLsaRank) {
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  if (!comm->symmetricSupport) {
-    struct ncclDevrState* devr = &comm->devrState;
-    for (int i = 0; i < devr->lsaSize; i++) {
-      if (devr->lsaRankList[i] == peerWorldRank) {
-        *peerLsaRank = i;
-        return ncclSuccess;
-      }
-    }
-    WARN("ncclDevrWorldToLsaRank: world rank %d is not a member of the CE team", peerWorldRank);
-    return ncclInternalError;
+// Get the LSA flat VA for self rank corresponding to a primary (ncclMemAlloc) address.
+ncclResult_t ncclDevrGetLsaSelfAddr(struct ncclDevrState* devr, void* addr, void** outAddr) {
+  uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t flatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase);
+  uintptr_t flatEnd  = flatBase + (uintptr_t)devr->lsaSize * devr->bigSize;
+
+  // Already in the LSA flat range (resource window case)
+  if (a >= flatBase && a < flatEnd) {
+    *outAddr = addr;
+    return ncclSuccess;
   }
-#endif
+
+  // Search memHead for a memory whose primaryAddr matches (ncclMemAlloc case)
+  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+    uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
+    if (a >= mbase && a < mbase + mem->size) {
+      size_t off = a - mbase;
+      *outAddr = (char*)devr->lsaFlatBase + devr->lsaSelf * devr->bigSize + mem->bigOffset + off;
+      return ncclSuccess;
+    }
+  }
+
+  *outAddr = nullptr;
+  return ncclSuccess;
+}
+
+ncclResult_t ncclDevrGetGinAnvilMemLayout(struct ncclDevrState* devr, void* addr,
+                                          uintptr_t* outLsaFlatBase, uint32_t* outStride4G) {
+  if (!devr || !addr || !outLsaFlatBase || !outStride4G) return ncclInvalidArgument;
+  if (devr->lsaFlatBase == nullptr || devr->bigSize == 0) return ncclInvalidArgument;
+
+  uintptr_t a = reinterpret_cast<uintptr_t>(addr);
+  uintptr_t flatBase = reinterpret_cast<uintptr_t>(devr->lsaFlatBase);
+
+  // Device resolveLsaPeerVa expects window base at rank-0 slot (ncclWindow::lsaFlatBase),
+  // not the registering rank's local flat VA. Offsets are applied separately on device.
+  for (struct ncclDevrMemory* mem = devr->memHead; mem != nullptr; mem = mem->next) {
+    uintptr_t mbase = reinterpret_cast<uintptr_t>(mem->primaryAddr);
+    if (mbase != 0 && a >= mbase && a < mbase + mem->size) {
+      // Matches ncclWindow::lsaFlatBase for windows on this mem (rank-0 slot).
+      *outLsaFlatBase = flatBase + mem->bigOffset;
+      *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+      return ncclSuccess;
+    }
+    uintptr_t localFlat = flatBase + devr->lsaSelf * devr->bigSize + mem->bigOffset;
+    if (a >= localFlat && a < localFlat + mem->size) {
+      *outLsaFlatBase = flatBase + mem->bigOffset;
+      *outStride4G = static_cast<uint32_t>(devr->bigSize >> 32);
+      return ncclSuccess;
+    }
+  }
+
+  return ncclInvalidArgument;
+}
+
+ncclResult_t ncclDevrWorldToLsaRank(struct ncclComm* comm, int peerWorldRank, int* peerLsaRank) {
   ncclTeam_t worldTeam = ncclTeamWorld(comm);
   ncclTeam_t lsaTeam = ncclTeamLsa(comm);
   if (!ncclTeamRankIsMember(lsaTeam, worldTeam, peerWorldRank)) {
@@ -2203,37 +1943,13 @@ ncclResult_t ncclDevrGetLsaRankPtr(struct ncclComm* comm, struct ncclDevrWindow*
 
   struct ncclDevrState* devr = &comm->devrState;
 
-  if (offset >= winHost->size) {
+  // Validate lsaRank is within bounds
+  if (lsaRank < 0 || lsaRank >= devr->lsaSize) {
     return ncclInvalidArgument;
   }
 
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-  // RCCL non-sym: a self-targeted op resolves to the local window base directly.
-  if (!comm->symmetricSupport && lsaRank == devr->lsaSelf) {
-    *outPtr = (void*)((uintptr_t)winHost->userPtr + offset);
-    return ncclSuccess;
-  }
-
-  // RCCL: IPC-backed window has per-peer pointer table (cudaIpcOpenMemHandle
-  // cannot map into a chosen VA, so flat-VA arithmetic does not apply).
-  if (winHost->ipcPeerPtrs != nullptr) {
-    if (lsaRank < 0 || lsaRank >= winHost->ipcPeerCount) {
-      return ncclInvalidArgument;
-    }
-    void* peerBase = winHost->ipcPeerPtrs[lsaRank];
-    if (peerBase == nullptr) {
-      WARN("ncclDevrGetLsaRankPtr: no IPC mapping for lsaRank=%d (same-proc "
-           "cross-thread peer?)",
-           lsaRank);
-      return ncclInternalError;
-    }
-    *outPtr = (void*)((uintptr_t)peerBase + offset);
-    return ncclSuccess;
-  }
-#endif
-
-  // Validate lsaRank is within bounds
-  if (lsaRank < 0 || lsaRank >= devr->lsaSize) {
+  // Validate offset is within bounds
+  if (offset < 0 || offset >= winHost->size) {
     return ncclInvalidArgument;
   }
 

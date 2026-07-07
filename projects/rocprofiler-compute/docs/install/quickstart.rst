@@ -63,26 +63,9 @@ Ensure ROCm is installed and follow the steps:
 
    .. code-block:: shell-session
 
-      python3 --version
+      python3 --version   # Requires Python 3.8+
 
-   The required Python version depends on which mode you use:
-
-   .. list-table:: Python version support
-      :header-rows: 1
-      :widths: 40 60
-
-      * - Component
-        - Python requirement
-      * - Profile mode (standard library only)
-        - 3.8 or newer
-      * - Analyze mode (numpy, pandas, dash, textual)
-        - 3.9 or newer
-
-   Analyze mode aborts with a clear message if launched on Python older
-   than 3.9.
-
-3. Check the installation dependencies. These are required for analyze mode
-   only; profile mode uses the standard library and needs no extra packages.
+3. Check the installation dependencies.
 
    .. code-block:: shell-session
 

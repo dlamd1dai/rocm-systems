@@ -122,15 +122,16 @@ def create_sol_charts(display_df: pd.DataFrame, table_id: int) -> list[px.bar]:
             )
 
     elif table_id == 1101:
-        display_df["Percent of Peak"] = display_df["Percent of Peak"].apply(
+        # Special formatting reference 'Pct of Peak' value
+        display_df["Pct of Peak"] = display_df["Pct of Peak"].apply(
             lambda x: float(x) if x != "N/A" else 0.0
         )
         charts.append(
             px.bar(
                 display_df,
-                x="Percent of Peak",
+                x="Pct of Peak",
                 y="Metric",
-                color="Percent of Peak",
+                color="Pct of Peak",
                 range_color=[0, 100],
                 labels={"Avg": "%"},
                 height=400,
@@ -238,7 +239,7 @@ def build_table_chart(
     formatted_columns = []
     for col in display_df.columns:
         col_lower = str(col).lower()
-        if col_lower in {"pct", "percent", "percent of peak"}:
+        if col_lower in {"pct", "pop", "percent"}:
             formatted_columns.append({
                 "id": col,
                 "name": col,

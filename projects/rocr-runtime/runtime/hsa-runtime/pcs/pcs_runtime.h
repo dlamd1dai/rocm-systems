@@ -115,16 +115,13 @@ class PcsRuntime {
     };
     struct client_session_data_t csd;
 
-    // Buffer info for DataCopyCallback. Made public so thread_local can access it.
-   public:
     struct data_ready_info_t {
       uint8_t* buf1;
       size_t buf1_sz;
       uint8_t* buf2;
       size_t buf2_sz;
     };
-
-   private:
+    struct data_ready_info_t data_rdy;
   };  // class PcSamplingSession
 
   hsa_status_t PcSamplingIterateConfig(

@@ -40,7 +40,8 @@ struct StackEntry
     std::string context;
 };
 
-// Records what start_cb pushed so end_cb can unwind exactly that.
+// Records what start_cb committed so end_cb can unwind exactly that.
+// A null context from start_cb signals end_cb to do nothing.
 struct RoctxObsCtx : public at::ObserverContext
 {
     bool        pushed_roctx_range     = false;
@@ -112,9 +113,6 @@ std::mutex               g_capture_mu;
 std::vector<std::string> g_captured;
 constexpr std::size_t    CAPTURE_CAP = 4096;
 
-// The RecordFunction tier instruments PyTorch ATen operators.
-constexpr const char* kRecordFnBackend = "torch";
-
 void maybe_capture(const std::string& s)
 {
     if (!g_capturing.load(std::memory_order_relaxed))
@@ -126,31 +124,7 @@ void maybe_capture(const std::string& s)
     }
 }
 
-// Percent-encoding of the two characters that would otherwise collide with the
-// marker-path grammar. The inverse decode lives with the Python readers
-// (utils/inject_roctx/core.py decode_marker_name, utils/utils_analysis.py); the
-// C++ round-trip test reuses these same constants so the escape table has a
-// single definition.
-constexpr const char* kEncodedPercent = "%25";
-constexpr const char* kEncodedSlash   = "%2F";
-
-// Appends name to out with '%' and '/' percent-encoded so an embedded '/' is
-// not read as the frame separator in build_marker_string.
-void encode_marker_segment(const std::string& name, std::string& out)
-{
-    for (char c : name)
-    {
-        if (c == '%')
-            out += kEncodedPercent;
-        else if (c == '/')
-            out += kEncodedSlash;
-        else
-            out += c;
-    }
-}
-
-// Renders the stack as "marker1/.../markerN:context1/.../contextN". Marker names
-// are percent-encoded so an embedded '/' is not read as the frame separator.
+// Renders the stack as "marker1/.../markerN:context1/.../contextN".
 std::string build_marker_string(const std::vector<StackEntry>& stack)
 {
     std::size_t marker_len = 0;
@@ -158,10 +132,6 @@ std::string build_marker_string(const std::vector<StackEntry>& stack)
     for (const auto& e : stack)
     {
         marker_len += e.marker.size() + 1;
-        // Each '%' or '/' expands from one char to three when encoded.
-        for (char c : e.marker)
-            if (c == '%' || c == '/')
-                marker_len += 2;
         ctx_len += e.context.size() + 1;
     }
     std::string out;
@@ -172,7 +142,7 @@ std::string build_marker_string(const std::vector<StackEntry>& stack)
     {
         if (!first)
             out += '/';
-        encode_marker_segment(e.marker, out);
+        out += e.marker;
         first = false;
     }
     out += ':';
@@ -344,10 +314,8 @@ std::unique_ptr<at::ObserverContext> start_cb(const at::RecordFunction& fn)
             save_snapshot(seq, g_stack);
         }
 
-        // Emit the ROCTX range last. RecordFunction ops are torch-backed.
-        std::string full = build_marker_string(g_stack);
-        full += '|';
-        full += kRecordFnBackend;
+        // Emit ROCTX last so a prior failure rolls back without an unmatched pop.
+        const std::string full = build_marker_string(g_stack);
         roctxRangePushA(full.c_str());
         ctx->pushed_roctx_range = true;
         maybe_capture(full);
@@ -412,9 +380,9 @@ void end_cb(const at::RecordFunction& /*fn*/, at::ObserverContext* obs_ctx)
     }
 }
 
-// Main-thread USER_SCOPE push. On partial failure it rolls back and
-// rethrows. When non-empty, backend is appended to the range as "|<backend>".
-void push_user_scope(const std::string& marker, const std::string& context, const std::string& backend)
+// Pushes a USER_SCOPE frame on the calling thread. All-or-nothing:
+// partial failures roll back and rethrow.
+void push_user_scope(const std::string& marker, const std::string& context)
 {
     bool pushed_to_stack  = false;
     bool pushed_to_guards = false;
@@ -441,12 +409,7 @@ void push_user_scope(const std::string& marker, const std::string& context, cons
         g_dbg_guards.push_back(std::move(guard));
         pushed_to_guards = true;
 
-        std::string full = build_marker_string(g_stack);
-        if (!backend.empty())
-        {
-            full += '|';
-            full += backend;
-        }
+        const std::string full = build_marker_string(g_stack);
         roctxRangePushA(full.c_str());
         pushed_roctx = true;
 
@@ -586,10 +549,9 @@ PYBIND11_MODULE(roctx_recordfn, m)
           &push_user_scope,
           pybind11::arg("marker"),
           pybind11::arg("context"),
-          pybind11::arg("backend") = std::string(""),
-          "Push a USER_SCOPE frame, emit a ROCTX range, publish chain into TLS DebugInfo.");
-    m.def("pop_user_scope", &pop_user_scope, "Pop the most recent push_user_scope() frame on this thread.");
-    m.def("dump_stats", &dump_stats, "Internal counters for tests/debugging.");
-    m.def("start_capture", &start_capture, "Begin recording wire strings (test hook).");
-    m.def("stop_capture", &stop_capture, "Stop and return captured wire strings.");
+          "Push a USER_SCOPE frame on the calling thread.");
+    m.def("pop_user_scope", &pop_user_scope, "Pop the most recent USER_SCOPE frame on the calling thread.");
+    m.def("dump_stats", &dump_stats, "Return internal counters.");
+    m.def("start_capture", &start_capture, "Begin recording emitted marker strings.");
+    m.def("stop_capture", &stop_capture, "Stop recording and return the captured marker strings.");
 }

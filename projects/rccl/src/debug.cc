@@ -447,11 +447,6 @@ void ncclResetDebugInitInternal() {
 #ifdef pncclResetDebugInit
 #undef pncclResetDebugInit
 #endif
-#if defined(NCCL_OS_LINUX)
-__attribute__ ((visibility("default")))
-__attribute__ ((alias("ncclResetDebugInit")))
-#endif
-void pncclResetDebugInit();
 extern "C"
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__ ((visibility("default")))
@@ -466,6 +461,13 @@ extern "C" void ncclResetDebugInit() {
   // exported symbol.
   ncclResetDebugInitInternal();
 }
+
+// pncclResetDebugInit is a host export alias.  HIP/clang device compilation passes
+// cannot emit alias("ncclResetDebugInit") before the target is defined for that pass.
+#if defined(NCCL_OS_LINUX) && !(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__)
+extern "C" __attribute__ ((visibility("default")))
+void pncclResetDebugInit() __attribute__ ((alias("ncclResetDebugInit")));
+#endif
 
 
 NCCL_PARAM(SetThreadName, "SET_THREAD_NAME", 0);
