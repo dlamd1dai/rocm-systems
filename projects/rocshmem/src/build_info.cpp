@@ -23,6 +23,7 @@
  *****************************************************************************/
 
 #include "build_info.hpp"
+#include "rocshmem/rocshmem_config.h"  // NOLINT(build/include_subdir)
 #include "rocshmem_config_embedded.hpp"
 
 #include <hip/hip_runtime.h>
