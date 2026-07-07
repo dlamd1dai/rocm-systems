@@ -31,6 +31,7 @@
 set(_rocshmem_info_sources
   ${CMAKE_SOURCE_DIR}/src/build_info.cpp
   ${CMAKE_SOURCE_DIR}/src/envvar.cpp
+  ${CMAKE_SOURCE_DIR}/src/memory/memory_allocator.cpp
   ${CMAKE_SOURCE_DIR}/tools/rocshmem_info_alloc_stub.cpp
 )
 
