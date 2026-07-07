@@ -57,6 +57,7 @@ struct ginAnvilGinCtx {
   uint64_t* sdma_dirty_d;
   int numChannels;
   int sdmaChannelStride;
+  uintptr_t* signal_remote_addrs_dev;
 };
 
 struct GinAnvilPendingEntry {
@@ -99,6 +100,7 @@ struct ginAnvilMemHandle {
   void* addr;
   void* lsaSelfAddr;
   size_t size;
+  uintptr_t* remote_vas_dev;
 };
 
 struct ginAnvilListenCtx {
@@ -274,14 +276,39 @@ static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, in
   mh->addr = data;
   mh->lsaSelfAddr = lsaSelfAddr;
   mh->size = size;
+  mh->remote_vas_dev = nullptr;
 
   if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
     free(mh);
     return ncclSystemError;
   }
 
+  const ptrdiff_t stride = (ptrdiff_t)devr->bigSize;
+  uintptr_t* remote_vas_host =
+      (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
+  if (!remote_vas_host) {
+    (void)hipFree(mh->devHandle);
+    free(mh);
+    return ncclSystemError;
+  }
+  for (int pe = 0; pe < cctx->nranks; pe++) {
+    remote_vas_host[pe] =
+        (uintptr_t)lsaSelfAddr + static_cast<ptrdiff_t>(pe - devr->lsaSelf) * stride;
+  }
+  if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess ||
+      hipMemcpy(mh->remote_vas_dev, remote_vas_host, sizeof(uintptr_t) * (size_t)cctx->nranks,
+                hipMemcpyHostToDevice) != hipSuccess) {
+    free(remote_vas_host);
+    (void)hipFree(mh->devHandle);
+    free(mh);
+    return ncclSystemError;
+  }
+  free(remote_vas_host);
+
   ncclGinAnvilSdmaMemHandle hostMh;
   hostMh.baseAddr = (uintptr_t)lsaSelfAddr;
+  hostMh.remote_vas = mh->remote_vas_dev;
+  hostMh.vmmStride = stride;
   (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
 
   *mhandle = mh;
@@ -309,6 +336,7 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
     }
   }
   if (mh->devHandle) (void)hipFree(mh->devHandle);
+  if (mh->remote_vas_dev) (void)hipFree(mh->remote_vas_dev);
   free(mh);
   return ncclSuccess;
 }
@@ -322,6 +350,23 @@ static ncclResult_t ginAnvilRegisterLsaSignals(ginAnvilGinCtx* ctx, void* lsaSel
     return ncclSystemError;
   }
   ctx->gpuCtxHost.signals = (uint64_t*)lsaSelf;
+
+  const ptrdiff_t stride = (ptrdiff_t)devr->bigSize;
+  uintptr_t* hostAddrs = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)ctx->nRanks);
+  if (!hostAddrs) return ncclSystemError;
+  for (int pe = 0; pe < ctx->nRanks; pe++) {
+    hostAddrs[pe] = (uintptr_t)lsaSelf + static_cast<ptrdiff_t>(pe - devr->lsaSelf) * stride;
+  }
+  if (ctx->signal_remote_addrs_dev) (void)hipFree(ctx->signal_remote_addrs_dev);
+  if (hipMalloc(&ctx->signal_remote_addrs_dev, sizeof(uintptr_t) * (size_t)ctx->nRanks) != hipSuccess ||
+      hipMemcpy(ctx->signal_remote_addrs_dev, hostAddrs, sizeof(uintptr_t) * (size_t)ctx->nRanks,
+                hipMemcpyHostToDevice) != hipSuccess) {
+    free(hostAddrs);
+    return ncclSystemError;
+  }
+  free(hostAddrs);
+  ctx->gpuCtxHost.signal_remote_addrs = ctx->signal_remote_addrs_dev;
+
   ctx->signalsBound = true;
   if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
                 hipMemcpyHostToDevice) != hipSuccess) {
@@ -416,6 +461,8 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
   ctx->gpuCtxHost.signals = nullptr;
+  ctx->gpuCtxHost.signal_remote_addrs = nullptr;
+  ctx->signal_remote_addrs_dev = nullptr;
 
   if (config->nCounters > 0) {
     if (hipExtMallocWithFlags((void**)&ctx->gpuCtxHost.counters, sizeof(uint64_t) * config->nCounters,
@@ -462,6 +509,7 @@ fail:
     if (ctx->signalsBound && ctx->gpuCtxHost.signals) {
       (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
     }
+    if (ctx->signal_remote_addrs_dev) (void)hipFree(ctx->signal_remote_addrs_dev);
     if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
     if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
     free(ctx->devHandle);
@@ -478,6 +526,7 @@ static ncclResult_t ginAnvilDestroyContext(void* ginCtx) {
   if (ctx->signalsBound && ctx->gpuCtxHost.signals) {
     (void)ncclGinAnvilIpcTableUnregister(ctx->gpuCtxHost.signals);
   }
+  if (ctx->signal_remote_addrs_dev) (void)hipFree(ctx->signal_remote_addrs_dev);
   if (ctx->gpuCtxHost.counters) (void)hipFree(ctx->gpuCtxHost.counters);
   if (ctx->gpuCtxDev) (void)hipFree(ctx->gpuCtxDev);
   free(ctx->devHandle);

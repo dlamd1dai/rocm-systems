@@ -38,6 +38,17 @@ NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* r
 
 NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaGPUContext* rsCtx, ncclGinAnvilSdmaMemHandle* mh,
                                              int peer, size_t off) {
+  ptrdiff_t stride = loadConst(&mh->vmmStride);
+  if (stride != 0) {
+    int rank = loadConst(&rsCtx->rank);
+    uintptr_t base = loadConst(&mh->baseAddr);
+    return reinterpret_cast<void*>(base + static_cast<ptrdiff_t>(peer - rank) * stride + off);
+  }
+  uintptr_t* remoteVas = loadConst(&mh->remote_vas);
+  if (remoteVas != nullptr) {
+    uintptr_t remote = loadConst(&remoteVas[peer]);
+    if (remote != 0) return reinterpret_cast<void*>(remote + off);
+  }
   void* sym = reinterpret_cast<void*>(loadConst(&mh->baseAddr) + off);
   const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
   int count = loadConst(&rsCtx->ipcTableCount);
@@ -46,6 +57,13 @@ NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaGPUContext* rsCtx, 
 
 NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                               ncclGinSignal_t signalId) {
+  uintptr_t* signalRemoteAddrs = loadConst(&rsCtx->signal_remote_addrs);
+  if (signalRemoteAddrs != nullptr) {
+    uintptr_t base = loadConst(&signalRemoteAddrs[peer]);
+    if (base != 0) {
+      return reinterpret_cast<uint64_t*>(base + static_cast<size_t>(signalId) * sizeof(uint64_t));
+    }
+  }
   uint64_t* signals = loadConst(&rsCtx->signals);
   if (signals == nullptr) return nullptr;
   const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
@@ -112,7 +130,9 @@ NCCL_DEVICE_INLINE void fenceBeforeSignal(bool sdmaDataPath,
   } else if (sdmaDataPath) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else {
-    __threadfence_system();
+    // IPC small-message path: agent-scope release; collective flush/waitSignal provides
+    // system ordering (GDA atomic_add fence=false pattern).
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   }
 }
 
