@@ -29,7 +29,8 @@ else
   D_MEMLOCK=()
 fi
 
-DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
+# DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
+DOCKER_GPU_COMMON="--shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
 
 GDA_UVERBS_ADDED=0
 _rccl_uverbs_seen=""
@@ -78,14 +79,8 @@ MPI_BASE=(
   -x OMPI_ALLOW_RUN_AS_ROOT=1
   -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
   -x RCCL_ROCSHMEM_ENABLE=0
-  -x ROCSHMEM_BACKEND=ipc
-  -x ROCSHMEM_DISABLE_MIXED_IPC=1
-  -x ROCSHMEM_DEBUG_LEVEL=info:noversion
-  -x RCCL_ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD}"
   -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}"
   -x NCCL_DEBUG_SUBSYS=INIT,NET
-  -x NCCL_CUMEM_ENABLE=1
-  -x RCCL_ENABLE_INTRANET=1
   -x NCCL_DMABUF_ENABLE=1
   -x NCCL_MSCCL_ENABLE=0
   -x HSA_NO_SCRATCH_RECLAIM=1
@@ -329,20 +324,23 @@ if _run_test 1; then
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
+    -x NCCL_CUMEM_ENABLE=0 \
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1
   _trace_off
 fi
 
 if _run_test 2; then
   _trace_on
   echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (NCCL_GIN_TYPE=2) ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${D_MEMLOCK[*]} ${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x RCCL_ENABLE_INTRANET=1 \
     -x NCCL_NET_PLUGIN=none \
     -x NCCL_ENV_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
@@ -357,11 +355,17 @@ fi
 if _should_run_test4; then
   _trace_on
   echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
-  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${D_MEMLOCK[*]} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x RCCL_ENABLE_INTRANET=1 \
     -x NCCL_NET_PLUGIN=none \
+    -x ROCSHMEM_BACKEND=ipc \
+    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
+    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
+    -x RCCL_ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD}" \
     -x ROCSHMEM_SDMA_ENABLED=1 \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=4 \
@@ -376,11 +380,17 @@ if _should_run_test5; then
   if [[ -n "${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}")
   fi
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
+  ${DOCKER_CMD} run ${DOCKER_GPU} ${D_MEMLOCK[*]} ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
     "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x RCCL_ENABLE_INTRANET=1 \
     -x NCCL_NET_PLUGIN=none \
+    -x ROCSHMEM_BACKEND=ipc \
+    -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
+    -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
+    -x RCCL_ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD}" \
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
     -x NCCL_GIN_ENABLE=1 \
