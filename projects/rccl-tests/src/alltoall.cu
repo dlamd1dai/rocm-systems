@@ -250,17 +250,17 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // Above this, traffic goes through GIN so Anvil can use SDMA for bulk copies.
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
+constexpr int kGinContextIndex = 0;
+constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
 template <typename T>
 __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
     size_t recvoffset, size_t chunkBytes, int peerBegin, int peerEnd, struct ncclDevComm devComm,
-    int barrierIndex) {
-  constexpr int ginContext = 0;
-  constexpr unsigned int signalIndex = 0;
-  ncclGin gin { devComm, ginContext };
+    uint32_t barrierIndex) {
+  ncclGin gin { devComm, kGinContextIndex };
   ncclTeam world = ncclTeamWorld(devComm);
-  const int signalCount = peerEnd - peerBegin;
-  uint64_t signalValue = gin.readSignal(signalIndex);
+  const uint64_t expectedSignals = static_cast<uint64_t>(peerEnd - peerBegin);
+  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
 
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
@@ -272,10 +272,10 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   gin.flush(ncclCoopCta());
   for (int r = tid + peerBegin; r < peerEnd; r += nthreads) {
-    gin.signal(world, r, ncclGin_SignalInc{signalIndex}, ncclCoopCta());
+    gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
   }
 
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + signalCount);
+  gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(ncclCoopCta());
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, barrierIndex };
@@ -326,7 +326,7 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   if (blockIdx.x != 0) {
     if (!useLsa) return;
 
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x - 1 };
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, static_cast<uint32_t>(blockIdx.x - 1) };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     int tid = threadIdx.x + (blockIdx.x - 1) * blockDim.x;
@@ -349,13 +349,12 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   if (!useLsa) {
     // Large messages: all peers via GIN/SDMA (including intra-node locals).
     GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
-        0, world.nRanks, devComm, 0);
+        0, world.nRanks, devComm, 0u);
   } else if (numRemotePeers > 0) {
     // Small messages on multi-node: remote peers only via GIN.
-    constexpr int ginContext = 0;
-    constexpr unsigned int signalIndex = 0;
-    ncclGin gin { devComm, ginContext };
-    uint64_t signalValue = gin.readSignal(signalIndex);
+    ncclGin gin { devComm, kGinContextIndex };
+    const uint64_t expectedSignals = static_cast<uint64_t>(numRemotePeers);
+    uint64_t signalValue = gin.readSignal(kGinSignalIndex);
 
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
@@ -373,21 +372,21 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     }
     gin.flush(ncclCoopCta());
     for (int r = tid; r < startLsa; r += nthreads) {
-      gin.signal(world, r, ncclGin_SignalInc{signalIndex}, ncclCoopCta());
+      gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
     }
     for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-      gin.signal(world, r, ncclGin_SignalInc{signalIndex}, ncclCoopCta());
+      gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
     }
 
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + numRemotePeers);
+    gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + expectedSignals);
     gin.flush(ncclCoopCta());
 
-    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, 0 };
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, 0u };
     bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
   }
 
   if (useLsa && singleCta) {
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, 0 };
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, 0u };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     int tid = threadIdx.x;
