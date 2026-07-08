@@ -135,12 +135,15 @@ NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, boo
   }
 }
 
-// Wave-cooperative SDMA put for one remote peer (all lanes in the wavefront must call).
+// Wave-cooperative SDMA put for one remote peer (all lanes in wavefront 0 must call).
+// When hasSignal is false the caller batches signalPeer after gin.flush().
 NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId,
                                         ncclGinAnvilSdmaMemHandle* dstMh, size_t dstOff,
                                         ncclGinAnvilSdmaMemHandle* srcMh, size_t srcOff,
                                         size_t bytes, ncclGinSignal_t signalId, bool hasSignal) {
   using nccl::utility::loadConst;
+  if (!anvilCtxValid(rsCtx)) return;
+
   size_t threshold = loadConst(&rsCtx->sdmaThreshold);
   if (bytes <= threshold) return;
 

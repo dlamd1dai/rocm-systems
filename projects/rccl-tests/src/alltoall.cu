@@ -259,8 +259,8 @@ constexpr int kGinAnvilSdmaWaveSize = 64;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA submitPacket uses wave_barrier; launch a full block and map one remote peer
-// per wavefront (see GinBatchedAlltoAllExchange).
+// SDMA submitPacket uses wave_barrier: wavefront 0 issues peer puts serially with all
+// 64 lanes participating per put; blockDim 512 keeps parallel LSA self-copy.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -308,33 +308,29 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA puts: one remote peer per wavefront (parallel queues); all lanes in
-  // the wave must enter sdmaPutPeerWave for submitPacket wave_barrier.
+  // GIN/SDMA puts: wavefront 0 issues all peer puts serially with wave-cooperative
+  // submitPacket (all 64 lanes participate per put). Other wavefronts wait at coop.sync.
+  // Parallel one-peer-per-wave mapped 7 doorbells concurrently and hung on MI355X.
   ncclGinAnvilSdmaGPUContext* rsCtx =
       (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
   const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
   const int waveId = tid / kGinAnvilSdmaWaveSize;
   auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
   auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
-  const bool fusedSignals = nccl::gin::anvil::detail::anvilCtxValid(rsCtx) &&
-      nccl::gin::anvil::detail::useSdmaFusedSignal(rsCtx, /*sdmaDataPath=*/true,
-          /*hasSignal=*/true, /*hasCounter=*/false, ncclGinSignalInc);
 
-  int remoteWaveIdx = 0;
-  for (int r = peerBegin; r < peerEnd; ++r) {
-    if (r == rank) continue;
-    if (remoteWaveIdx == waveId) {
+  if (waveId == 0) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
       nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
           recvoffset + devComm.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-          chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+          chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
     }
-    remoteWaveIdx++;
   }
   coop.sync();
 
   gin.flush(coop);
 
-  if (!fusedSignals && tid == 0) {
+  if (tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
       nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
@@ -430,30 +426,24 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
     auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
     auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
-    const bool fusedSignals = nccl::gin::anvil::detail::anvilCtxValid(rsCtx) &&
-        nccl::gin::anvil::detail::useSdmaFusedSignal(rsCtx, /*sdmaDataPath=*/true,
-            /*hasSignal=*/true, /*hasCounter=*/false, ncclGinSignalInc);
 
-    int remoteWaveIdx = 0;
-    for (int r = 0; r < startLsa; ++r, ++remoteWaveIdx) {
-      if (remoteWaveIdx == waveId) {
+    if (waveId == 0) {
+      for (int r = 0; r < startLsa; ++r) {
         nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
             recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-            chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+            chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
       }
-    }
-    for (int r = startLsa + lsaSize; r < world.nRanks; ++r, ++remoteWaveIdx) {
-      if (remoteWaveIdx == waveId) {
+      for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
         nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
             recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-            chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+            chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
       }
     }
     coop.sync();
 
     gin.flush(coop);
 
-    if (!fusedSignals && tid == 0) {
+    if (tid == 0) {
       for (int r = 0; r < startLsa; ++r) {
         nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
       }
