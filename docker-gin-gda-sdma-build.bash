@@ -38,7 +38,7 @@ ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
     --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
     --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS} \
-    --build-arg RCCL_CACHE_BUST=${RCCL_CACHE_BUST} \
-    --build-arg ROCSHMEM_CACHE_BUST=${ROCSHMEM_CACHE_BUST} \
+    --build-arg RCCL_CACHE_BUST=$((RCCL_CACHE_BUST++)) \
+    --build-arg ROCSHMEM_CACHE_BUST=$((ROCSHMEM_CACHE_BUST++)) \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null

@@ -10,6 +10,7 @@ set -euo pipefail
 # Optional: export RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 for strict MLX5 DMA-BUF symbol check at docker build.
 # DOCKER_BUILD_NETWORK=host. Override: DOCKER_BUILD_NETWORK=default
 
+DOCKER_NO_CACHE=${1:-0}
 DOCKER_CMD="${DOCKER_CMD:-sudo docker}"
 DOCKERFILE="Dockerfile-rccl-gin-gda-sdma-ruby"
 DOCKER_IMAGE="rccl-gin-gda-sdma-713"
@@ -17,29 +18,31 @@ TARGET_GPU_ARCH="${GPU_TARGETS:-gfx950}"
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
-ROCSHMEM_CACHE_BUST="${ROCSHMEM_CACHE_BUST:-1}"
-RCCL_CACHE_BUST="${RCCL_CACHE_BUST:-1}"
-BUILD_LOG="${BUILD_LOG:-ddai-gin-rudy-build.log}"
 
-N=1
 DOCKER_BUILD_NETWORK="${DOCKER_BUILD_NETWORK:-host}"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
-# shellcheck source=docker-gin-gda-sdma-preflight.bash
-source "${SCRIPT_DIR}/docker-gin-gda-sdma-preflight.bash"
 
 # Dockerfile COPY extra-rdma-debs/ requires the directory in build context (optional .deb install).
 mkdir -p extra-rdma-debs
 
-N=1
+if [ "$DOCKER_NO_CACHE" -eq 1 ]; then
+  DOCKER_CACHE_OPT="--no-cache"
+  RCCL_CACHE_BUST=1
+  ROCSHMEM_CACHE_BUST=1
+else
+  DOCKER_CACHE_OPT=""
+fi
+
+export RCCL_CACHE_BUST=${RCCL_CACHE_BUST:-1}
+export ROCSHMEM_CACHE_BUST=${ROCSHMEM_CACHE_BUST:-1}
+
 ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
+    ${DOCKER_CACHE_OPT} \
     --network="${DOCKER_BUILD_NETWORK}" \
-    --no-cache \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
     --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
     --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS} \
-    --build-arg ROCSHMEM_CACHE_BUST=$((N++)) \
+    --build-arg RCCL_CACHE_BUST=$((RCCL_CACHE_BUST++)) \
+    --build-arg ROCSHMEM_CACHE_BUST=$((ROCSHMEM_CACHE_BUST++)) \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
