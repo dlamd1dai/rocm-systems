@@ -375,7 +375,7 @@ fi
 
 if _should_run_test5; then
   _trace_on
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5) ==="
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5); -D 3 requires -V 1 ==="
   TEST5_MPI_EXTRA=()
   if [[ -n "${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}")

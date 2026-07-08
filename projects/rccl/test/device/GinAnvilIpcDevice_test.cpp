@@ -279,7 +279,9 @@ TEST_F(GinAnvilIpcDeviceTest, AnvilCtxValid_AndSignalPtr) {
 
 __global__ void kernelFencePaths(bool sdmaPath, bool hasCounter) {
   if (threadIdx.x != 0) return;
-  fenceBeforeSignal(sdmaPath, nullptr, hasCounter);
+  ncclGinAnvilSdmaGPUContext ctx{};
+  ctx.layoutMagic = NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC;
+  fenceBeforeSignal(&ctx, sdmaPath, nullptr, hasCounter);
 }
 
 TEST_F(GinAnvilIpcDeviceTest, FenceBeforeSignal_CompilesAllPaths) {

@@ -19,7 +19,7 @@ struct ncclGinAnvilIpcBufEntry;
 
 /** Default SDMA threshold (bytes). Transfers of at most this size use inlined IPC flat stores;
  *  larger transfers use direct Anvil SDMA. */
-#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 256u
+#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
 /** Default off: fused OSS7 copy+signal needs remote GPU signal VA; opt-in via env on MI355. */
 #define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
@@ -42,6 +42,7 @@ struct ncclGinAnvilSdmaGPUContext {
   const ncclGinAnvilIpcBufEntry* ipcTable;  // device pointer; fallback peer VA lookup
   int ipcTableCount;
   uintptr_t* signal_remote_addrs;  // [nRanks] peer signal region bases (GDA signal_raddrs pattern)
+  uint32_t ipcAgentFence;  // 0=__threadfence_system on IPC (default), 1=agent-scope release
 };
 
 struct ncclGinAnvilSdmaMemHandle {

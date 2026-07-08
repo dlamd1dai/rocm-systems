@@ -60,13 +60,20 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
     case 2: // NvlAlltoAllKernelOptimized
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
-    case 3: // GinAlltoAllKernel: all CTAs participate, one world barrier per CTA
+    case 3: // GinAlltoAllKernel: single CTA, one world GIN barrier
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      reqs->barrierCount = deviceCtaCount;
-      reqs->worldGinBarrierCount = deviceCtaCount;
+      if (deviceCtaCount != 1) {
+        fprintf(stderr,
+          "GinAlltoAllKernel (-D 3) supports -V 1 only (got -V %d). "
+          "Multi-CTA GIN AlltoAll is not supported.\n",
+          deviceCtaCount);
+        return testInvalidUsage;
+      }
+      reqs->barrierCount = 1;
+      reqs->worldGinBarrierCount = 1;
       reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
@@ -105,9 +112,10 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
       reqs->lsaBarrierCount = deviceCtaCount;
       return true;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-    case 3: // GinAlltoAllKernel: all CTAs, one world barrier per CTA
-      reqs->barrierCount = deviceCtaCount;
-      reqs->worldGinBarrierCount = deviceCtaCount;
+    case 3: // GinAlltoAllKernel: single CTA, one world GIN barrier
+      if (deviceCtaCount != 1) return false;
+      reqs->barrierCount = 1;
+      reqs->worldGinBarrierCount = 1;
       reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
       return true;
@@ -237,33 +245,26 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  const int nCtas = gridDim.x;
-  const int cta = blockIdx.x;
-  // One GIN context per connection (Anvil today). CTAs partition peers; CTA 0 alone
-  // waitSignal/flush to avoid shared SDMA dirty-queue races.
   constexpr int ginContext = 0;
   constexpr unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
-  uint64_t signalValue = 0;
-  if (cta == 0) signalValue = gin.readSignal(signalIndex);
+  uint64_t signalValue = gin.readSignal(signalIndex);
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int nthreads = blockDim.x * gridDim.x;
   const size_t size = count * sizeof(T);
-  if (threadIdx.x == 0) {
-    for (int r = cta; r < devComm.nRanks; r += nCtas) {
-      gin.put(ncclTeamWorld(devComm), r,
-          recvwin, recvoffset + devComm.rank * size,
-          sendwin, sendoffset + r * size,
-          size, ncclGin_SignalInc{signalIndex});
-    }
+  for (int r = tid; r < devComm.nRanks; r += nthreads) {
+    gin.put(ncclTeamWorld(devComm), r,
+        recvwin, recvoffset + devComm.rank * size,
+        sendwin, sendoffset + r * size,
+        size, ncclGin_SignalInc{signalIndex});
   }
 
-  if (cta == 0) {
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
-    gin.flush(ncclCoopCta());
-  }
+  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
+  gin.flush(ncclCoopCta());
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }

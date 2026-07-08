@@ -118,7 +118,7 @@ NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
   ipcFlatAtomicAddSys64(remoteSig, value);
 }
 
-NCCL_DEVICE_INLINE void fenceBeforeSignal(bool sdmaDataPath,
+NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                           gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
   if (hasCounter) {
@@ -129,10 +129,10 @@ NCCL_DEVICE_INLINE void fenceBeforeSignal(bool sdmaDataPath,
     }
   } else if (sdmaDataPath) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  } else {
-    // IPC small-message path: agent-scope release; collective flush/waitSignal provides
-    // system ordering (GDA atomic_add fence=false pattern).
+  } else if (rsCtx != nullptr && loadConst(&rsCtx->ipcAgentFence) != 0) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  } else {
+    __threadfence_system();
   }
 }
 
@@ -224,7 +224,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if ((hasSignal || hasCounter) && !sdmaFusedSignal) {
-      fenceBeforeSignal(sdmaDataPath, handle, hasCounter);
+      fenceBeforeSignal(rsCtx, sdmaDataPath, handle, hasCounter);
 
       if (hasSignal) {
         if (signalOp == ncclGinSignalInc) signalOpArg = 1;
@@ -314,7 +314,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if (hasSignal && !sdmaFusedSignal) {
-      fenceBeforeSignal(sdmaDataPath, handle, /*hasCounter=*/false);
+      fenceBeforeSignal(rsCtx, sdmaDataPath, handle, /*hasCounter=*/false);
       if (signalOp == ncclGinSignalInc) signalOpArg = 1;
       signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }

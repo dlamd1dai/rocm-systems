@@ -183,6 +183,13 @@ static uint32_t ginAnvilFusedSignalFromEnv() {
   return atoi(e) != 0 ? 1u : 0u;
 }
 
+static uint32_t ginAnvilIpcAgentFenceFromEnv() {
+  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_IPC_AGENT_FENCE");
+  if (!e || !e[0]) return 0;
+  if (e[0] == '0' && e[1] == '\0') return 0;
+  return atoi(e) != 0 ? 1u : 0u;
+}
+
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,
                                     void** collComm) {
   auto* ictx = (ginAnvilInitCtx*)ctx;
@@ -460,6 +467,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
+  ctx->gpuCtxHost.ipcAgentFence = ginAnvilIpcAgentFenceFromEnv();
   ctx->gpuCtxHost.signals = nullptr;
   ctx->gpuCtxHost.signal_remote_addrs = nullptr;
   ctx->signal_remote_addrs_dev = nullptr;
