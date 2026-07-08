@@ -250,8 +250,29 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // Above this, traffic goes through GIN so Anvil can use SDMA for bulk copies.
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
+constexpr int kGinAlltoAllLsaBlockThreads = 512;
+constexpr int kGinAlltoAllSdmaBlockThreads = 1;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
+
+// SDMA submitPacket uses wave_barrier; only one lane may submit per wavefront.
+// Launch a single thread when the GIN/SDMA path is active (chunkBytes > kAlltoAllLsaMaxBytes).
+template <typename F>
+testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
+    size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
+    cudaStream_t stream) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  const size_t chunkBytes = count * wordSize(type);
+  const int blockThreads = (chunkBytes > kAlltoAllLsaMaxBytes)
+      ? kGinAlltoAllSdmaBlockThreads
+      : kGinAlltoAllLsaBlockThreads;
+  kernel<<<deviceCtaCount, blockThreads, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count,
+      root, *devComm);
+  return testSuccess;
+}
 
 template <typename T>
 __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
@@ -467,7 +488,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+        TESTCHECK(testLaunchGinAlltoAllKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
       case 4:
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
