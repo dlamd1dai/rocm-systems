@@ -103,12 +103,11 @@ NCCL_DEVICE_INLINE int effectiveChannel(ncclGinAnvilSdmaGPUContext* rsCtx, int b
   return stride ? (baseCh + stride * (blockId / 64)) % numCh : baseCh;
 }
 
-NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* queueHandle(
+NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
     ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId) {
   int numCh = loadConst(&rsCtx->numChannels);
   int effCh = effectiveChannel(rsCtx, blockId);
-  auto** handles =
-      (gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle**)loadConst(&rsCtx->queueHandles);
+  auto** handles = (gin_anvil::sdma::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
   return loadConst(handles + peer * numCh + effCh);
 }
 
@@ -120,7 +119,7 @@ NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
 }
 
 NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
-                                          gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle,
+                                          gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
   (void)hasCounter;
   // Drain the submitting queue before signalPeer (SignalInc or counter), not only for counters.
@@ -163,7 +162,7 @@ NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int p
   size_t threshold = loadConst(&rsCtx->sdmaThreshold);
   if (bytes <= threshold) return;
 
-  gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = queueHandle(rsCtx, peer, blockId);
+  gin_anvil::sdma::SdmaQueueDeviceHandle* handle = queueHandle(rsCtx, peer, blockId);
   if (handle == nullptr) return;
 
   auto* dstMh = (ncclGinAnvilSdmaMemHandle*)dstGinWin;
@@ -244,7 +243,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     bool useIpcPut = hasWins && bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (hasWins && !useIpcPut) {
       handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
@@ -342,7 +341,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
     bool useIpcPut = bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (!useIpcPut) {
       handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
