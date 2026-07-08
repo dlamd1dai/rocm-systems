@@ -9,6 +9,7 @@
 #include "common.h"
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
 #include "rccl_vector_types.h"
 #endif
 
@@ -255,8 +256,8 @@ constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: one remote peer per warp, wave-cooperative gin.put + SignalInc (Fix A);
-// coop.sync() after puts before waitSignal (Fix B1 — CTA barrier deadlock fix).
+// SDMA path: warp-parallel data puts, flush + batch signalPeer (B2), LSA end barrier
+// intra-node (B3); coop.sync() between phases (B1).
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -288,6 +289,10 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  const bool intraNode = (lsa.nRanks == world.nRanks);
 
   ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -305,7 +310,7 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: one peer per warp, wave-cooperative put + SignalInc (SP queue API).
+  // GIN/SDMA: one peer per warp, wave-cooperative data-only puts (no per-put quiet).
   const int warpId = threadIdx.x / WARP_SIZE;
   const int nWarps = blockDim.x / WARP_SIZE;
   for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
@@ -314,17 +319,31 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
         recvwin, recvoffset + rank * chunkBytes,
         sendwin, sendoffset + r * chunkBytes,
         chunkBytes,
-        ncclGin_SignalInc{kGinSignalIndex},
+        ncclGin_None{},
         ncclGin_None{},
         ncclCoopWarp{});
   }
   coop.sync();
 
-  gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(coop);
 
-  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  if (threadIdx.x == 0) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
+      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+    }
+  }
+  coop.sync();
+
+  gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+
+  if (intraNode) {
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
+    lsaBar.sync(coop, cuda::memory_order_release);
+  } else {
+    ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  }
 }
 
 template <typename T>
@@ -400,6 +419,8 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     ncclGin gin { devComm, kGinContextIndex };
     const uint64_t expectedSignals = static_cast<uint64_t>(numRemotePeers);
     uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+    ncclGinAnvilSdmaGPUContext* rsCtx =
+        (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
 
     ncclCoopCta coop = ncclCoopCta();
     const int warpId = threadIdx.x / WARP_SIZE;
@@ -410,7 +431,7 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
           chunkBytes,
-          ncclGin_SignalInc{kGinSignalIndex},
+          ncclGin_None{},
           ncclGin_None{},
           ncclCoopWarp{});
     }
@@ -419,15 +440,26 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
           chunkBytes,
-          ncclGin_SignalInc{kGinSignalIndex},
+          ncclGin_None{},
           ncclGin_None{},
           ncclCoopWarp{});
     }
 
     coop.sync();
 
-    gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
     gin.flush(coop);
+
+    if (threadIdx.x == 0) {
+      for (int r = 0; r < startLsa; ++r) {
+        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+      }
+      for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
+        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+      }
+    }
+    coop.sync();
+
+    gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
 
     ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, 0u };
     bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
