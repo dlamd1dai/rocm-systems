@@ -255,8 +255,8 @@ constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: parallel gin.put + SignalInc (one peer per thread, separate queues);
-// blockDim 512 matches LSA self-copy; MP put API on SP factory handles.
+// SDMA path: one remote peer per warp, wave-cooperative gin.put + SignalInc (Fix A);
+// blockDim 512 for LSA self-copy; SP queue handles via gin_anvil_sdma.h.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -305,14 +305,18 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: parallel put + SignalInc per remote peer (rvt2/snapshot pattern).
-  // Each thread uses ncclCoopThread inside gin.put — no CTA coop.sync in the put loop.
-  for (int r = peerBegin + tid; r < peerEnd; r += nthreads) {
+  // GIN/SDMA: one peer per warp, wave-cooperative put + SignalInc (SP queue API).
+  const int warpId = threadIdx.x / WARP_SIZE;
+  const int nWarps = blockDim.x / WARP_SIZE;
+  for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
     if (r == rank) continue;
     gin.put(world, r,
         recvwin, recvoffset + rank * chunkBytes,
         sendwin, sendoffset + r * chunkBytes,
-        chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+        chunkBytes,
+        ncclGin_SignalInc{kGinSignalIndex},
+        ncclGin_None{},
+        ncclCoopWarp{});
   }
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
@@ -397,20 +401,26 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     uint64_t signalValue = gin.readSignal(kGinSignalIndex);
 
     ncclCoopCta coop = ncclCoopCta();
-    const int tid = threadIdx.x;
-    const int nthreads = blockDim.x;
+    const int warpId = threadIdx.x / WARP_SIZE;
+    const int nWarps = blockDim.x / WARP_SIZE;
 
-    for (int r = tid; r < startLsa; r += nthreads) {
+    for (int r = warpId; r < startLsa; r += nWarps) {
       gin.put(world, r,
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+          chunkBytes,
+          ncclGin_SignalInc{kGinSignalIndex},
+          ncclGin_None{},
+          ncclCoopWarp{});
     }
-    for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
+    for (int r = startLsa + lsaSize + warpId; r < world.nRanks; r += nWarps) {
       gin.put(world, r,
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+          chunkBytes,
+          ncclGin_SignalInc{kGinSignalIndex},
+          ncclGin_None{},
+          ncclCoopWarp{});
     }
 
     gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
