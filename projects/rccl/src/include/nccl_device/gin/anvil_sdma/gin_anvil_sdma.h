@@ -135,14 +135,29 @@ NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, boo
   }
 }
 
+NCCL_DEVICE_INLINE ncclGinWindow_t ginWindowForConnection(ncclWindow_t win, int connectionId) {
+  return nccl::utility::loadConst(&win->ginWins[connectionId]);
+}
+
+NCCL_DEVICE_INLINE size_t ginWindowByteOffset(ncclWindow_t win, size_t offset) {
+  return 4096 * size_t(nccl::utility::loadConst(&win->ginOffset4K)) + offset;
+}
+
 // Wave-cooperative SDMA put for one remote peer (all lanes in wavefront 0 must call).
-// When hasSignal is false the caller batches signalPeer after gin.flush().
+// ncclWindow_t must be resolved to ginWins[connectionId] (same as ncclGin::put).
 NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId,
-                                        ncclGinAnvilSdmaMemHandle* dstMh, size_t dstOff,
-                                        ncclGinAnvilSdmaMemHandle* srcMh, size_t srcOff,
-                                        size_t bytes, ncclGinSignal_t signalId, bool hasSignal) {
+                                        ncclWindow_t dstWin, size_t dstOff, ncclWindow_t srcWin,
+                                        size_t srcOff, int connectionId, size_t bytes,
+                                        ncclGinSignal_t signalId, bool hasSignal) {
   using nccl::utility::loadConst;
   if (!anvilCtxValid(rsCtx)) return;
+
+  ncclGinWindow_t dstGinWin = ginWindowForConnection(dstWin, connectionId);
+  ncclGinWindow_t srcGinWin = ginWindowForConnection(srcWin, connectionId);
+  if (dstGinWin == nullptr || srcGinWin == nullptr) return;
+
+  const size_t dstGinOff = ginWindowByteOffset(dstWin, dstOff);
+  const size_t srcGinOff = ginWindowByteOffset(srcWin, srcOff);
 
   size_t threshold = loadConst(&rsCtx->sdmaThreshold);
   if (bytes <= threshold) return;
@@ -150,9 +165,11 @@ NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int p
   gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = queueHandle(rsCtx, peer, blockId);
   if (handle == nullptr) return;
 
-  void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
-  void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcOff);
-  void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
+  auto* dstMh = (ncclGinAnvilSdmaMemHandle*)dstGinWin;
+  auto* srcMh = (ncclGinAnvilSdmaMemHandle*)srcGinWin;
+  void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstGinOff);
+  void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcGinOff);
+  void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstGinOff);
   if (dstAddr == nullptr || srcAddr == nullptr) {
     const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
     int ipcCount = loadConst(&rsCtx->ipcTableCount);

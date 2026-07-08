@@ -310,20 +310,18 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
 
   // GIN/SDMA puts: wavefront 0 issues all peer puts serially with wave-cooperative
   // submitPacket (all 64 lanes participate per put). Other wavefronts wait at coop.sync.
-  // Parallel one-peer-per-wave mapped 7 doorbells concurrently and hung on MI355X.
-  ncclGinAnvilSdmaGPUContext* rsCtx =
-      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+  ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)gin._ginHandle;
   const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
   const int waveId = tid / kGinAnvilSdmaWaveSize;
-  auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
-  auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
+  const int connId = gin.connectionId;
 
   if (waveId == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
-      nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
-          recvoffset + devComm.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-          chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
+      nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
+          recvwin, recvoffset + devComm.rank * chunkBytes,
+          sendwin, sendoffset + r * chunkBytes,
+          connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
     }
   }
   coop.sync();
@@ -421,22 +419,22 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     ncclCoopCta coop = ncclCoopCta();
     const int tid = threadIdx.x;
     const int waveId = tid / kGinAnvilSdmaWaveSize;
-    ncclGinAnvilSdmaGPUContext* rsCtx =
-        (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+    ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)gin._ginHandle;
     const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
-    auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
-    auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
+    const int connId = gin.connectionId;
 
     if (waveId == 0) {
       for (int r = 0; r < startLsa; ++r) {
-        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
-            recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-            chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
+        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
       }
       for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
-        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
-            recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
-            chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
+        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
       }
     }
     coop.sync();
