@@ -21,12 +21,12 @@ struct ncclGinAnvilIpcBufEntry;
  *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default off in device kernels that batch signalPeer after flush; opt-in via env. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
+/** Default on (OSS7): fuse SignalInc into SDMA copy packet when peer signal VA is known. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
 
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
-  void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueSingleProducerDeviceHandle*
+  void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
   uint64_t* sdmaDirty;   // GIN-owned dirty bitmask
   uint64_t* signals;
   uint64_t* counters;

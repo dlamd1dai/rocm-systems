@@ -10,9 +10,6 @@
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "rccl_vector_types.h"
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
-#endif
 #endif
 
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -254,13 +251,11 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 512;
-constexpr int kGinAnvilSdmaWaveSize = 64;
+constexpr int kGinAlltoAllSdmaBlockThreads = 1;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA submitPacket uses wave_barrier: wavefront 0 issues peer puts serially with all
-// 64 lanes participating per put; blockDim 512 keeps parallel LSA self-copy.
+// SDMA path: single-lane gin.put per peer (MP queue); blockDim 1 serializes flush/quiet.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -283,6 +278,7 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     size_t recvoffset, size_t chunkBytes, int peerBegin, int peerEnd, struct ncclDevComm devComm,
     uint32_t barrierIndex) {
   ncclGin gin { devComm, kGinContextIndex };
+  ncclTeam world = ncclTeamWorld(devComm);
   const int rank = devComm.rank;
 
   int remotePeerCount = 0;
@@ -308,35 +304,20 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA puts: wavefront 0 issues all peer puts serially with wave-cooperative
-  // submitPacket (all 64 lanes participate per put). Other wavefronts wait at coop.sync.
-  ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)gin._ginHandle;
-  const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
-  const int waveId = tid / kGinAnvilSdmaWaveSize;
-  const int connId = gin.connectionId;
-
-  if (waveId == 0) {
-    for (int r = peerBegin; r < peerEnd; ++r) {
-      if (r == rank) continue;
-      nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
-          recvwin, recvoffset + devComm.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
-    }
-  }
-  coop.sync();
-
-  gin.flush(coop);
-
+  // GIN/SDMA: serial gin.put + SignalInc per remote peer (snapshot fast path).
   if (tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
-      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+      gin.put(world, r,
+          recvwin, recvoffset + rank * chunkBytes,
+          sendwin, sendoffset + r * chunkBytes,
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
     }
   }
   coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+  gin.flush(coop);
 
   ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
   bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
@@ -418,40 +399,25 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
 
     ncclCoopCta coop = ncclCoopCta();
     const int tid = threadIdx.x;
-    const int waveId = tid / kGinAnvilSdmaWaveSize;
-    ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)gin._ginHandle;
-    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
-    const int connId = gin.connectionId;
-
-    if (waveId == 0) {
-      for (int r = 0; r < startLsa; ++r) {
-        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
-            recvwin, recvoffset + world.rank * chunkBytes,
-            sendwin, sendoffset + r * chunkBytes,
-            connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
-      }
-      for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
-        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId,
-            recvwin, recvoffset + world.rank * chunkBytes,
-            sendwin, sendoffset + r * chunkBytes,
-            connId, chunkBytes, kGinSignalIndex, /*hasSignal=*/false);
-      }
-    }
-    coop.sync();
-
-    gin.flush(coop);
 
     if (tid == 0) {
       for (int r = 0; r < startLsa; ++r) {
-        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
       }
       for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
-        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
       }
     }
     coop.sync();
 
     gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+    gin.flush(coop);
 
     ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, 0u };
     bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
