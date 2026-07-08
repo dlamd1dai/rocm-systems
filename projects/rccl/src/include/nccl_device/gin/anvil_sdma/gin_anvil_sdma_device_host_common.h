@@ -21,8 +21,9 @@ struct ncclGinAnvilIpcBufEntry;
  *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default on (OSS7): fuse SignalInc into SDMA copy packet when peer signal VA is known. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
+/** Default off: fused COPY_LINEAR_WAIT_SIGNAL_MI4 needs peer signal VAs valid for SDMA
+ *  atomic stores; use decoupled put + signalPeer until fusion is validated at scale. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
 
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC

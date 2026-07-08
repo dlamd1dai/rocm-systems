@@ -269,11 +269,12 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
             ipcPut(fallbackDst, srcAddr, bytes);
           }
           sdmaDataPath = false;
-        } else if (srcAddr != nullptr) {
+        } else if (srcAddr != nullptr && dstAddr != nullptr) {
           uint64_t* remoteSig = nullptr;
-          if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
+          if (hasSignal &&
+              useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
             remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
-            if (remoteSig != nullptr) sdmaFusedSignal = true;
+            if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
           }
           __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
           if (sdmaFusedSignal) {
@@ -361,11 +362,12 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
           ipcPutScalar(fallbackDst, &srcVal, bytes);
         }
         sdmaDataPath = false;
-      } else {
+      } else if (dstAddr != nullptr) {
         uint64_t* remoteSig = nullptr;
-        if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, /*hasCounter=*/false, signalOp)) {
+        if (hasSignal &&
+            useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, /*hasCounter=*/false, signalOp)) {
           remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
-          if (remoteSig != nullptr) sdmaFusedSignal = true;
+          if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
         }
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         if (sdmaFusedSignal) {
