@@ -148,20 +148,86 @@ int memory_report = 0;
 int deviceCtaCount = 16; // Default number of CTAs for device implementation
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-// GinAlltoAllKernel (-D 3) maps one GIN context per CTA; sharing contexts deadlocks.
+static bool isGinAlltoAllDevCommReqs(struct ncclDevCommRequirements const* reqs) {
+  if (reqs->barrierCount != deviceCtaCount) return false;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  return reqs->worldGinBarrierCount == deviceCtaCount;
+#else
+  return reqs->ginContextCount == 1;
+#endif
+}
+
+static bool isAnvilGinBackend(struct ncclDevComm const* devComm,
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+    ncclCommProperties_t const* commProperties
+#else
+    void const* commProperties
+#endif
+) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  if (commProperties != nullptr &&
+      commProperties->ginType == (ncclGinType_t)NCCL_NET_DEVICE_GIN_ANVIL_SDMA) {
+    return true;
+  }
+#endif
+  (void)commProperties;
+  if (devComm->ginConnectionCount > 0) {
+    return devComm->ginNetDeviceTypes[0] == NCCL_NET_DEVICE_GIN_ANVIL_SDMA;
+  }
+  return false;
+}
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+static testResult_t validateDeviceCtaGinContexts(
+    struct ncclDevComm const* devComm, struct ncclDevCommRequirements const* reqs,
+    ncclCommProperties_t const* commProperties) {
+#else
 static testResult_t validateDeviceCtaGinContexts(
     struct ncclDevComm const* devComm, struct ncclDevCommRequirements const* reqs) {
-  if (reqs->ginContextCount != deviceCtaCount || reqs->barrierCount != deviceCtaCount) {
+  ncclCommProperties_t const* commProperties = nullptr;
+#endif
+  if (!isGinAlltoAllDevCommReqs(reqs)) return testSuccess;
+
+  const int nContexts = (int)devComm->ginContextCount;
+
+  // Per-CTA GIN context mode (future / proxy): each CTA needs its own context.
+  if (reqs->ginContextCount == deviceCtaCount && deviceCtaCount > 1) {
+    if (nContexts <= 0 || deviceCtaCount > nContexts) {
+      fprintf(stderr,
+        "Error: -V %d exceeds available GIN contexts (%d). "
+        "GinAlltoAllKernel (-D 3) in multi-context mode requires one GIN context per CTA. "
+        "Use -V <= %d or set NCCL_GIN_NCONTEXTS >= %d.\n",
+        deviceCtaCount, nContexts, nContexts, deviceCtaCount);
+      return testInvalidUsage;
+    }
     return testSuccess;
   }
-  const int nContexts = (int)devComm->ginContextCount;
-  if (nContexts <= 0 || deviceCtaCount <= nContexts) return testSuccess;
-  fprintf(stderr,
-    "Error: -V %d exceeds available GIN contexts (%d). "
-    "GinAlltoAllKernel (-D 3) requires one GIN context per CTA; "
-    "sharing contexts can deadlock. Use -V <= %d or set NCCL_GIN_NCONTEXTS >= %d.\n",
-    deviceCtaCount, nContexts, nContexts, deviceCtaCount);
-  return testInvalidUsage;
+
+  if (nContexts < 1) {
+    fprintf(stderr, "Error: GinAlltoAllKernel (-D 3) requires at least one GIN context, got %d.\n",
+        nContexts);
+    return testInvalidUsage;
+  }
+
+  if (deviceCtaCount > 1 && isAnvilGinBackend(devComm, commProperties)) {
+    if (reqs->ginContextCount != 1) {
+      fprintf(stderr,
+        "Error: GinAlltoAllKernel (-D 3) with GIN Anvil (NCCL_GIN_TYPE=5) and -V %d requires "
+        "single-GIN-context mode (ginContextCount=1, shared context + peer partition). "
+        "Requested ginContextCount=%d; multi-context Anvil is not supported yet.\n",
+        deviceCtaCount, reqs->ginContextCount);
+      return testInvalidUsage;
+    }
+    if (getenv("RCCL_GIN_ALLTOALL_SINGLE_CTX_NOTICE") == nullptr) {
+      fprintf(stderr,
+        "Notice: -V %d with GIN Anvil uses single-context multi-CTA mode "
+        "(peer partition across CTAs; waitSignal/flush on CTA 0 only). "
+        "Set RCCL_GIN_ALLTOALL_SINGLE_CTX_NOTICE=1 to suppress.\n",
+        deviceCtaCount);
+    }
+  }
+
+  return testSuccess;
 }
 #endif
 
@@ -1420,7 +1486,11 @@ testResult_t threadInit(struct threadArgs* args) {
       NCCLCHECK(ncclDevCommCreate(args->comms[i], &reqs, args->devComms+i));
     }
     NCCLCHECK(ncclGroupEnd());
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+    TESTCHECK(validateDeviceCtaGinContexts(args->devComms, &reqs, &commProperties));
+#else
     TESTCHECK(validateDeviceCtaGinContexts(args->devComms, &reqs));
+#endif
   }
   // Capture memory used by test buffers
   int64_t deviceCommMaxMem = 0;
@@ -2196,7 +2266,11 @@ testResult_t run() {
          NCCLCHECK(ncclDevCommCreate(comms[i], &reqs, devComms.data()+i));
        }
        NCCLCHECK(ncclGroupEnd());
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+       TESTCHECK(validateDeviceCtaGinContexts(devComms.data(), &reqs, &commProperties));
+#else
        TESTCHECK(validateDeviceCtaGinContexts(devComms.data(), &reqs));
+#endif
      }
      int64_t deviceCommMaxMem = 0;
      for (int g = 0; g < nGpus; ++g) {

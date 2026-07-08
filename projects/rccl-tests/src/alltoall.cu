@@ -60,13 +60,14 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
     case 2: // NvlAlltoAllKernelOptimized
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
-    case 3: // GinAlltoAllKernel: all CTAs participate, one barrier per CTA
+    case 3: // GinAlltoAllKernel: all CTAs participate, one world barrier per CTA
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
       reqs->barrierCount = deviceCtaCount;
-      reqs->ginContextCount = deviceCtaCount;
+      reqs->worldGinBarrierCount = deviceCtaCount;
+      reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -104,9 +105,10 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
       reqs->lsaBarrierCount = deviceCtaCount;
       return true;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-    case 3: // GinAlltoAllKernel: all CTAs, one barrier per CTA
+    case 3: // GinAlltoAllKernel: all CTAs, one world barrier per CTA
       reqs->barrierCount = deviceCtaCount;
-      reqs->ginContextCount = deviceCtaCount;
+      reqs->worldGinBarrierCount = deviceCtaCount;
+      reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
       return true;
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
@@ -237,16 +239,17 @@ template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   const int nCtas = gridDim.x;
   const int cta = blockIdx.x;
-  const int ginContext = cta % devComm.ginContextCount;
+  // One GIN context per connection (Anvil today). CTAs partition peers; CTA 0 alone
+  // waitSignal/flush to avoid shared SDMA dirty-queue races.
+  constexpr int ginContext = 0;
   constexpr unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
-  const bool waitIncoming = (cta == (devComm.rank % nCtas));
-  uint64_t signalValue = waitIncoming ? gin.readSignal(signalIndex) : 0;
+  uint64_t signalValue = 0;
+  if (cta == 0) signalValue = gin.readSignal(signalIndex);
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
-  /* Each CTA owns a disjoint peer subset: cta, cta+nCtas, ... */
   const size_t size = count * sizeof(T);
   if (threadIdx.x == 0) {
     for (int r = cta; r < devComm.nRanks; r += nCtas) {
@@ -257,10 +260,10 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
     }
   }
 
-  if (waitIncoming) {
+  if (cta == 0) {
     gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
+    gin.flush(ncclCoopCta());
   }
-  gin.flush(ncclCoopCta());
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
