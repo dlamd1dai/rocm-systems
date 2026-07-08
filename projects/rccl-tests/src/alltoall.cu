@@ -10,6 +10,9 @@
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "rccl_vector_types.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
+#endif
 #endif
 
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -251,12 +254,13 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 1;
+constexpr int kGinAlltoAllSdmaBlockThreads = 512;
+constexpr int kGinAnvilSdmaWaveSize = 64;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA submitPacket uses wave_barrier; only one lane may submit per wavefront.
-// Launch a single thread when the GIN/SDMA path is active (chunkBytes > kAlltoAllLsaMaxBytes).
+// SDMA submitPacket uses wave_barrier; launch a full block and map one remote peer
+// per wavefront (see GinBatchedAlltoAllExchange).
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -279,7 +283,6 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     size_t recvoffset, size_t chunkBytes, int peerBegin, int peerEnd, struct ncclDevComm devComm,
     uint32_t barrierIndex) {
   ncclGin gin { devComm, kGinContextIndex };
-  ncclTeam world = ncclTeamWorld(devComm);
   const int rank = devComm.rank;
 
   int remotePeerCount = 0;
@@ -305,21 +308,41 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA puts: thread 0 only (Anvil submitPacket uses wave_barrier; multi-thread
-  // put loops deadlock waitSignal's coop.sync and can hang SDMA queue submission).
-  if (tid == 0) {
+  // GIN/SDMA puts: one remote peer per wavefront (parallel queues); all lanes in
+  // the wave must enter sdmaPutPeerWave for submitPacket wave_barrier.
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+  const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+  const int waveId = tid / kGinAnvilSdmaWaveSize;
+  auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
+  auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
+  const bool fusedSignals = nccl::gin::anvil::detail::anvilCtxValid(rsCtx) &&
+      nccl::gin::anvil::detail::useSdmaFusedSignal(rsCtx, /*sdmaDataPath=*/true,
+          /*hasSignal=*/true, /*hasCounter=*/false, ncclGinSignalInc);
+
+  int remoteWaveIdx = 0;
+  for (int r = peerBegin; r < peerEnd; ++r) {
+    if (r == rank) continue;
+    if (remoteWaveIdx == waveId) {
+      nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
+          recvoffset + devComm.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
+          chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+    }
+    remoteWaveIdx++;
+  }
+  coop.sync();
+
+  gin.flush(coop);
+
+  if (!fusedSignals && tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
-      gin.put(world, r,
-          recvwin, recvoffset + devComm.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
     }
   }
   coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
-  gin.flush(coop);
 
   ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
   bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
@@ -401,24 +424,46 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
 
     ncclCoopCta coop = ncclCoopCta();
     const int tid = threadIdx.x;
-    if (tid == 0) {
+    const int waveId = tid / kGinAnvilSdmaWaveSize;
+    ncclGinAnvilSdmaGPUContext* rsCtx =
+        (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+    const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
+    auto* dstMh = (ncclGinAnvilSdmaMemHandle*)recvwin;
+    auto* srcMh = (ncclGinAnvilSdmaMemHandle*)sendwin;
+    const bool fusedSignals = nccl::gin::anvil::detail::anvilCtxValid(rsCtx) &&
+        nccl::gin::anvil::detail::useSdmaFusedSignal(rsCtx, /*sdmaDataPath=*/true,
+            /*hasSignal=*/true, /*hasCounter=*/false, ncclGinSignalInc);
+
+    int remoteWaveIdx = 0;
+    for (int r = 0; r < startLsa; ++r, ++remoteWaveIdx) {
+      if (remoteWaveIdx == waveId) {
+        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
+            recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
+            chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+      }
+    }
+    for (int r = startLsa + lsaSize; r < world.nRanks; ++r, ++remoteWaveIdx) {
+      if (remoteWaveIdx == waveId) {
+        nccl::gin::anvil::detail::sdmaPutPeerWave(rsCtx, r, blockId, dstMh,
+            recvoffset + world.rank * chunkBytes, srcMh, sendoffset + r * chunkBytes,
+            chunkBytes, kGinSignalIndex, /*hasSignal=*/true);
+      }
+    }
+    coop.sync();
+
+    gin.flush(coop);
+
+    if (!fusedSignals && tid == 0) {
       for (int r = 0; r < startLsa; ++r) {
-        gin.put(world, r,
-            recvwin, recvoffset + world.rank * chunkBytes,
-            sendwin, sendoffset + r * chunkBytes,
-            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
       }
       for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
-        gin.put(world, r,
-            recvwin, recvoffset + world.rank * chunkBytes,
-            sendwin, sendoffset + r * chunkBytes,
-            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
       }
     }
     coop.sync();
 
     gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
-    gin.flush(coop);
 
     ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, 0u };
     bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);

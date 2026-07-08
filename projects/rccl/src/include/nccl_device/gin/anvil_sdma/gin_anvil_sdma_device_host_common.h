@@ -21,12 +21,12 @@ struct ncclGinAnvilIpcBufEntry;
  *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default off: fused OSS7 copy+signal needs remote GPU signal VA; opt-in via env on MI355. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
+/** Default on OSS7 (MI300/MI350): fused copy+signal via COPY_LINEAR_WAIT_SIGNAL_MI4. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
 
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
-  void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
+  void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueSingleProducerDeviceHandle*
   uint64_t* sdmaDirty;   // GIN-owned dirty bitmask
   uint64_t* signals;
   uint64_t* counters;
