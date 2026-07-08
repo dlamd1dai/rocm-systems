@@ -375,7 +375,7 @@ fi
 
 if _should_run_test5; then
   _trace_on
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5); -D 4 hybrid (LSA local + GIN remote) ==="
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5); -D 3 GinAlltoAll (-V 1, LSA small + GIN/SDMA large) ==="
   TEST5_MPI_EXTRA=()
   if [[ -n "${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}")
@@ -398,6 +398,6 @@ if _should_run_test5; then
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     "${TEST5_MPI_EXTRA[@]}" \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 4 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   _trace_off
 fi

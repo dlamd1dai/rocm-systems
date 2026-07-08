@@ -268,11 +268,7 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     gin.put(world, r,
         recvwin, recvoffset + devComm.rank * chunkBytes,
         sendwin, sendoffset + r * chunkBytes,
-        chunkBytes, ncclGin_None{});
-  }
-  gin.flush(ncclCoopCta());
-  for (int r = tid + peerBegin; r < peerEnd; r += nthreads) {
-    gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
+        chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
   }
 
   gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + expectedSignals);
@@ -362,20 +358,13 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
       gin.put(world, r,
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_None{});
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
     }
     for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
       gin.put(world, r,
           recvwin, recvoffset + world.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_None{});
-    }
-    gin.flush(ncclCoopCta());
-    for (int r = tid; r < startLsa; r += nthreads) {
-      gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
-    }
-    for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-      gin.signal(world, r, ncclGin_SignalInc{kGinSignalIndex}, ncclCoopCta());
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
     }
 
     gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + expectedSignals);
