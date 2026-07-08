@@ -284,13 +284,18 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  for (int r = tid + peerBegin; r < peerEnd; r += nthreads) {
-    if (r == rank) continue;
-    gin.put(world, r,
-        recvwin, recvoffset + devComm.rank * chunkBytes,
-        sendwin, sendoffset + r * chunkBytes,
-        chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+  // GIN/SDMA puts: thread 0 only (Anvil submitPacket uses wave_barrier; multi-thread
+  // put loops deadlock waitSignal's coop.sync and can hang SDMA queue submission).
+  if (tid == 0) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
+      gin.put(world, r,
+          recvwin, recvoffset + devComm.rank * chunkBytes,
+          sendwin, sendoffset + r * chunkBytes,
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+    }
   }
+  coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(coop);
@@ -373,26 +378,29 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     const uint64_t expectedSignals = static_cast<uint64_t>(numRemotePeers);
     uint64_t signalValue = gin.readSignal(kGinSignalIndex);
 
-    int tid = threadIdx.x;
-    int nthreads = blockDim.x;
-    for (int r = tid; r < startLsa; r += nthreads) {
-      gin.put(world, r,
-          recvwin, recvoffset + world.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+    ncclCoopCta coop = ncclCoopCta();
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+      for (int r = 0; r < startLsa; ++r) {
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+      }
+      for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+      }
     }
-    for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-      gin.put(world, r,
-          recvwin, recvoffset + world.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
-    }
+    coop.sync();
 
-    gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + expectedSignals);
-    gin.flush(ncclCoopCta());
+    gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+    gin.flush(coop);
 
-    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, 0u };
-    bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+    ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, 0u };
+    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
   }
 
   if (useLsa && singleCta) {
