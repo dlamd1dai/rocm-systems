@@ -101,7 +101,8 @@ extern "C" int gin_anvil_sdma_create(int nRanks, int myRank, int my_device_id,
     const int remoteDev = devs[static_cast<size_t>(local_pe)];
     for (int c = 0; c < numChannels; ++c) {
       gin_anvil::sdma::SdmaQueue* q = gin_anvil::sdma::anvil.getSdmaQueue(myDev, remoteDev, c);
-      auto* h = q ? reinterpret_cast<gin_anvil::sdma::SdmaQueueDeviceHandle*>(q->deviceHandle())
+      auto* h = q ? reinterpret_cast<gin_anvil::sdma::SdmaQueueDeviceHandle*>(
+                        q->singleProducerDeviceHandle())
                   : nullptr;
       host_handles[static_cast<size_t>(local_pe * numChannels + c)] = h;
       if (h != nullptr) validHandles++;
