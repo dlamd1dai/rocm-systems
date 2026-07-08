@@ -121,12 +121,10 @@ NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
 NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                           gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
-  if (hasCounter) {
-    if (sdmaDataPath && handle != nullptr) {
-      gin_anvil::sdma::quiet(*handle);
-    } else {
-      __threadfence_system();
-    }
+  (void)hasCounter;
+  // Drain the submitting queue before signalPeer (SignalInc or counter), not only for counters.
+  if (sdmaDataPath && handle != nullptr) {
+    gin_anvil::sdma::quiet(*handle);
   } else if (sdmaDataPath) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else if (rsCtx != nullptr && loadConst(&rsCtx->ipcAgentFence) != 0) {
