@@ -256,7 +256,7 @@ constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
 // SDMA path: one remote peer per warp, wave-cooperative gin.put + SignalInc (Fix A);
-// blockDim 512 for LSA self-copy; SP queue handles via gin_anvil_sdma.h.
+// coop.sync() after puts before waitSignal (Fix B1 — CTA barrier deadlock fix).
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -318,6 +318,7 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
         ncclGin_None{},
         ncclCoopWarp{});
   }
+  coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(coop);
@@ -422,6 +423,8 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
           ncclGin_None{},
           ncclCoopWarp{});
     }
+
+    coop.sync();
 
     gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
     gin.flush(coop);
