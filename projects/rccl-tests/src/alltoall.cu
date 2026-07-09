@@ -252,12 +252,12 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 1;
+constexpr int kGinAlltoAllSdmaBlockThreads = 64;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: serial data puts (tid 0), flush + batch signalPeer (phase1e/B2),
-// LSA end barrier intra-node (B3); coop.sync() between phases.
+// SDMA path: one-wave serial peers + ncclCoopWarp puts (SP-safe), flush + batch
+// signalPeer (B2), LSA end barrier intra-node (B3); coop.sync() between phases.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -310,21 +310,23 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: Test#5 (-D 3) launches SDMA with blockDim=1 — serial tid-0 puts
-  // (phase1e). SP submitPacket is wave-collective; serial puts with blockDim>1
-  // deadlock (only lane 0 enters put). blockDim>1 keeps warp-parallel data puts
-  // for Hybrid (-D 4); multi-warp + flush still hangs on large single-node SDMA.
+  // GIN/SDMA: SP submitPacket requires all lanes in the wavefront (see
+  // SdmaQueueSingleProducerDeviceHandle::submitPacket). blockDim=1 + ncclCoopThread
+  // hangs on gfx950; blockDim=512 + multi-warp parallel puts hang at flush (a926d4a2).
+  // Single-wave (<=64 threads): one peer per loop iter, full wave issues each put.
+  // Multi-warp (>64, Hybrid -D 4): one peer per warp in parallel.
   const int warpId = threadIdx.x / WARP_SIZE;
   const int nWarps = blockDim.x / WARP_SIZE;
-  if (blockDim.x <= 1) {
-    if (threadIdx.x == 0) {
-      for (int r = peerBegin; r < peerEnd; ++r) {
-        if (r == rank) continue;
-        gin.put(world, r,
-            recvwin, recvoffset + rank * chunkBytes,
-            sendwin, sendoffset + r * chunkBytes,
-            chunkBytes);
-      }
+  if (blockDim.x <= WARP_SIZE) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
+      gin.put(world, r,
+          recvwin, recvoffset + rank * chunkBytes,
+          sendwin, sendoffset + r * chunkBytes,
+          chunkBytes,
+          ncclGin_None{},
+          ncclGin_None{},
+          ncclCoopWarp{});
     }
   } else {
     for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
