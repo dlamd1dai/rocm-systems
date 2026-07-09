@@ -111,19 +111,6 @@ NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
   return loadConst(handles + peer * numCh + effCh);
 }
 
-// Factory publishes singleProducerDeviceHandle() as SdmaQueueDeviceHandle*; always
-// route SDMA ops through the SP overloads (wave-cooperative submitPacket).
-NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* spQueueHandle(
-    ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId) {
-  return reinterpret_cast<gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle*>(
-      queueHandle(rsCtx, peer, blockId));
-}
-
-NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* spQueueFromDeviceHandle(
-    gin_anvil::sdma::SdmaQueueDeviceHandle* handle) {
-  return reinterpret_cast<gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle*>(handle);
-}
-
 NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                    ncclGinSignal_t signalId, uint64_t value) {
   uint64_t* remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
@@ -132,7 +119,7 @@ NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
 }
 
 NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
-                                          gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle,
+                                          gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
   (void)hasCounter;
   // Drain the submitting queue before signalPeer (SignalInc or counter), not only for counters.
@@ -144,75 +131,6 @@ NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, boo
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else {
     __threadfence_system();
-  }
-}
-
-NCCL_DEVICE_INLINE ncclGinWindow_t ginWindowForConnection(ncclWindow_t win, int connectionId) {
-  return nccl::utility::loadConst(&win->ginWins[connectionId]);
-}
-
-NCCL_DEVICE_INLINE size_t ginWindowByteOffset(ncclWindow_t win, size_t offset) {
-  return 4096 * size_t(nccl::utility::loadConst(&win->ginOffset4K)) + offset;
-}
-
-// Wave-cooperative SDMA put for one remote peer (all lanes in wavefront 0 must call).
-// ncclWindow_t must be resolved to ginWins[connectionId] (same as ncclGin::put).
-// When hasSignal is false the caller batches signalPeer after gin.flush().
-NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId,
-                                        ncclWindow_t dstWin, size_t dstOff, ncclWindow_t srcWin,
-                                        size_t srcOff, int connectionId, size_t bytes,
-                                        ncclGinSignal_t signalId, bool hasSignal) {
-  using nccl::utility::loadConst;
-  if (!anvilCtxValid(rsCtx)) return;
-
-  ncclGinWindow_t dstGinWin = ginWindowForConnection(dstWin, connectionId);
-  ncclGinWindow_t srcGinWin = ginWindowForConnection(srcWin, connectionId);
-  if (dstGinWin == nullptr || srcGinWin == nullptr) return;
-
-  const size_t dstGinOff = ginWindowByteOffset(dstWin, dstOff);
-  const size_t srcGinOff = ginWindowByteOffset(srcWin, srcOff);
-
-  size_t threshold = loadConst(&rsCtx->sdmaThreshold);
-  if (bytes <= threshold) return;
-
-  gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = spQueueHandle(rsCtx, peer, blockId);
-  if (handle == nullptr) return;
-
-  auto* dstMh = (ncclGinAnvilSdmaMemHandle*)dstGinWin;
-  auto* srcMh = (ncclGinAnvilSdmaMemHandle*)srcGinWin;
-  void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstGinOff);
-  void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcGinOff);
-  void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstGinOff);
-  if (dstAddr == nullptr || srcAddr == nullptr) {
-    const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
-    int ipcCount = loadConst(&rsCtx->ipcTableCount);
-    void* fallbackDst = ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
-    if (fallbackDst != nullptr && srcAddr != nullptr) {
-      ipcPut(fallbackDst, srcAddr, bytes);
-      if (__lane_id() == 0 && hasSignal) {
-        signalPeer(rsCtx, peer, signalId, 1);
-      }
-    }
-    return;
-  }
-
-  bool sdmaFusedSignal = false;
-  uint64_t* remoteSig = nullptr;
-  if (hasSignal &&
-      useSdmaFusedSignal(rsCtx, /*sdmaDataPath=*/true, /*hasSignal=*/true, /*hasCounter=*/false,
-                         ncclGinSignalInc)) {
-    remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
-    if (remoteSig != nullptr) sdmaFusedSignal = true;
-  }
-
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  if (sdmaFusedSignal) {
-    gin_anvil::sdma::putSignal(*handle, dstAddr, srcAddr, bytes, remoteSig);
-  } else {
-    gin_anvil::sdma::put(*handle, dstAddr, srcAddr, bytes);
-  }
-  if (__lane_id() == 0) {
-    markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
   }
 }
 
@@ -237,7 +155,6 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
-    using nccl::gin::anvil::detail::spQueueHandle;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
     using nccl::gin::anvil::detail::signalPeer;
@@ -245,8 +162,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool threadOnlyCoop = (coop.size() == 1);
-    if (threadOnlyCoop && coop.thread_rank() != 0) return;
+    if (coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!anvilCtxValid(rsCtx)) return;
@@ -258,9 +174,9 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     bool useIpcPut = hasWins && bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (hasWins && !useIpcPut) {
-      handle = spQueueHandle(rsCtx, peer, blockId);
+      handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
     }
     bool sdmaDataPath = hasWins && !useIpcPut && handle != nullptr;
@@ -273,30 +189,25 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
       void* srcAddr = reinterpret_cast<void*>(loadConst(&srcMh->baseAddr) + srcOff);
 
       if (useIpcPut) {
-        if (__lane_id() == 0) {
-          void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
-          if (dstAddr != nullptr && srcAddr != nullptr) {
-            ipcPut(dstAddr, srcAddr, bytes);
-          }
+        void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
+        if (dstAddr != nullptr && srcAddr != nullptr) {
+          ipcPut(dstAddr, srcAddr, bytes);
         }
       } else if (handle != nullptr) {
         void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
         if (dstAddr == nullptr) {
-          if (__lane_id() == 0) {
-            const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
-            int ipcCount = loadConst(&rsCtx->ipcTableCount);
-            void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
-            if (fallbackDst != nullptr && srcAddr != nullptr) {
-              ipcPut(fallbackDst, srcAddr, bytes);
-            }
+          const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+          int ipcCount = loadConst(&rsCtx->ipcTableCount);
+          void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
+          if (fallbackDst != nullptr && srcAddr != nullptr) {
+            ipcPut(fallbackDst, srcAddr, bytes);
           }
           sdmaDataPath = false;
-        } else if (srcAddr != nullptr && dstAddr != nullptr) {
+        } else if (srcAddr != nullptr) {
           uint64_t* remoteSig = nullptr;
-          if (hasSignal &&
-              useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
+          if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, hasCounter, signalOp)) {
             remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
-            if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
+            if (remoteSig != nullptr) sdmaFusedSignal = true;
           }
           __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
           if (sdmaFusedSignal) {
@@ -304,25 +215,21 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
           } else {
             gin_anvil::sdma::put(*handle, dstAddr, srcAddr, bytes);
           }
-          if (__lane_id() == 0) {
-            markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels),
-                          effectiveChannel(rsCtx, blockId));
-          }
+          markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels),
+                        effectiveChannel(rsCtx, blockId));
         }
       }
     }
 
     if ((hasSignal || hasCounter) && !sdmaFusedSignal) {
-      if (__lane_id() == 0) {
-        fenceBeforeSignal(rsCtx, sdmaDataPath, handle, hasCounter);
+      fenceBeforeSignal(rsCtx, sdmaDataPath, handle, hasCounter);
 
-        if (hasSignal) {
-          if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-          signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
-        }
-        if (hasCounter) {
-          atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
-        }
+      if (hasSignal) {
+        if (signalOp == ncclGinSignalInc) signalOpArg = 1;
+        signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
+      }
+      if (hasCounter) {
+        atomicAdd((unsigned long long*)&loadConst(&rsCtx->counters)[counterId], 1ULL);
       }
     }
   }
@@ -342,7 +249,6 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
-    using nccl::gin::anvil::detail::spQueueHandle;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
     using nccl::gin::anvil::detail::signalPeer;
@@ -350,8 +256,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool threadOnlyCoop = (coop.size() == 1);
-    if (threadOnlyCoop && coop.thread_rank() != 0) return;
+    if (coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!anvilCtxValid(rsCtx)) return;
@@ -366,40 +271,35 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
     bool useIpcPut = bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (!useIpcPut) {
-      handle = spQueueHandle(rsCtx, peer, blockId);
+      handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
     }
     bool sdmaDataPath = !useIpcPut && handle != nullptr;
     bool sdmaFusedSignal = false;
 
     if (useIpcPut) {
-      if (__lane_id() == 0) {
-        void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
-        if (dstAddr != nullptr) {
-          ipcPutScalar(dstAddr, &srcVal, bytes);
-        }
+      void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
+      if (dstAddr != nullptr) {
+        ipcPutScalar(dstAddr, &srcVal, bytes);
       }
     } else if (handle != nullptr) {
       void* dstAddr = resolveRemotePeerVa(rsCtx, dstMh, peer, dstOff);
       if (dstAddr == nullptr) {
-        if (__lane_id() == 0) {
-          void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
-          const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
-          int ipcCount = loadConst(&rsCtx->ipcTableCount);
-          void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
-          if (fallbackDst != nullptr) {
-            ipcPutScalar(fallbackDst, &srcVal, bytes);
-          }
+        void* dstSym = reinterpret_cast<void*>(loadConst(&dstMh->baseAddr) + dstOff);
+        const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+        int ipcCount = loadConst(&rsCtx->ipcTableCount);
+        void* fallbackDst = nccl::gin::anvil::detail::ginAnvilResolvePeerVa(dstSym, peer, table, ipcCount);
+        if (fallbackDst != nullptr) {
+          ipcPutScalar(fallbackDst, &srcVal, bytes);
         }
         sdmaDataPath = false;
-      } else if (dstAddr != nullptr) {
+      } else {
         uint64_t* remoteSig = nullptr;
-        if (hasSignal &&
-            useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, /*hasCounter=*/false, signalOp)) {
+        if (useSdmaFusedSignal(rsCtx, sdmaDataPath, hasSignal, /*hasCounter=*/false, signalOp)) {
           remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
-          if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
+          if (remoteSig != nullptr) sdmaFusedSignal = true;
         }
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         if (sdmaFusedSignal) {
@@ -407,18 +307,14 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
         } else {
           gin_anvil::sdma::put(*handle, dstAddr, (void*)&tmp, bytes);
         }
-        if (__lane_id() == 0) {
-          markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
-        }
+        markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
       }
     }
 
     if (hasSignal && !sdmaFusedSignal) {
-      if (__lane_id() == 0) {
-        fenceBeforeSignal(rsCtx, sdmaDataPath, handle, /*hasCounter=*/false);
-        if (signalOp == ncclGinSignalInc) signalOpArg = 1;
-        signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
-      }
+      fenceBeforeSignal(rsCtx, sdmaDataPath, handle, /*hasCounter=*/false);
+      if (signalOp == ncclGinSignalInc) signalOpArg = 1;
+      signalPeer(rsCtx, peer, signal.indexedSignal.signalId, signalOpArg);
     }
   }
 };
@@ -470,10 +366,8 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     (void)ord;
     (void)abortFlag;
     using nccl::utility::loadConst;
-    using nccl::gin::anvil::detail::anvilCtxValid;
-    using nccl::gin::anvil::detail::spQueueFromDeviceHandle;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    if (!anvilCtxValid(rsCtx)) {
+    if (!nccl::gin::anvil::detail::anvilCtxValid(rsCtx)) {
       __threadfence_system();
       return;
     }
@@ -494,9 +388,7 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
           uint64_t bit = 1ULL << (p * numCh + ch);
           if ((dirty & bit) == 0) continue;
           auto* h = loadConst(handles + p * numCh + ch);
-          if (h != nullptr) {
-            gin_anvil::sdma::quiet(*spQueueFromDeviceHandle(h));
-          }
+          if (h != nullptr) gin_anvil::sdma::quiet(*h);
         }
       }
       coop.sync();

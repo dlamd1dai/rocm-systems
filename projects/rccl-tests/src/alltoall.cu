@@ -7,11 +7,8 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
-#include <cstdio>
-#include <cstdlib>
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
-#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
 #include "rccl_vector_types.h"
 #endif
 
@@ -253,49 +250,8 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // Above this, traffic goes through GIN so Anvil can use SDMA for bulk copies.
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
-constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 1;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
-
-// Compile with -DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1 to enable GPU printf phase markers.
-#ifndef RCCL_GIN_ALLTOALL_DEVICE_TRACE
-#define RCCL_GIN_ALLTOALL_DEVICE_TRACE 0
-#endif
-
-#if RCCL_GIN_ALLTOALL_DEVICE_TRACE
-__device__ __forceinline__ void GinA2aTracePhase(int rank, int phase, size_t chunkBytes) {
-  if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[GinA2A] rank=%d phase=%d chunkBytes=%zu\n", rank, phase, chunkBytes);
-  }
-}
-#else
-__device__ __forceinline__ void GinA2aTracePhase(int, int, size_t) {}
-#endif
-
-// SDMA path: entry world GIN barrier, serial tid-0 data puts, flush, batch
-// signalPeer, wait, LSA exit barrier intra-node (B2 + entry barrier).
-template <typename F>
-testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
-    size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
-    cudaStream_t stream) {
-  if (kernel == nullptr) return testNotImplemented;
-  ncclDevComm* devComm = (ncclDevComm*)comm;
-  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
-  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
-  const size_t chunkBytes = count * wordSize(type);
-  const int blockThreads = (chunkBytes > kAlltoAllLsaMaxBytes)
-      ? kGinAlltoAllSdmaBlockThreads
-      : kGinAlltoAllLsaBlockThreads;
-  if (getenv("RCCL_GIN_ALLTOALL_HOST_TRACE") != nullptr && chunkBytes > kAlltoAllLsaMaxBytes) {
-    fprintf(stderr, "[GinA2A host] launch SDMA path chunkBytes=%zu blockThreads=%d\n",
-        chunkBytes, blockThreads);
-    fflush(stderr);
-  }
-  kernel<<<deviceCtaCount, blockThreads, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count,
-      root, *devComm);
-  return testSuccess;
-}
 
 template <typename T>
 __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
@@ -311,16 +267,12 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-  ncclGinAnvilSdmaGPUContext* rsCtx =
-      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
-  ncclTeam lsa = ncclTeamLsa(devComm);
-  const bool intraNode = (lsa.nRanks == world.nRanks);
 
   ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
 
-  // Phase 1: local rank chunk via LSA store (avoid self-put over GIN/SDMA).
+  // Local rank chunk: LSA store (avoid self-put over GIN/SDMA).
   if (rank >= peerBegin && rank < peerEnd) {
     const size_t elemCount = chunkBytes / sizeof(T);
     T* sendBase = (T*)ncclGetLocalPointer(sendwin, sendoffset);
@@ -331,48 +283,25 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     }
     coop.sync();
   }
-  GinA2aTracePhase(rank, 1, chunkBytes);
 
-  GinA2aTracePhase(rank, 1, chunkBytes);
-
-  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-  GinA2aTracePhase(rank, 2, chunkBytes);
-
+  // GIN/SDMA puts: thread 0 only (Anvil submitPacket uses wave_barrier; multi-thread
+  // put loops deadlock waitSignal's coop.sync and can hang SDMA queue submission).
   if (tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
       gin.put(world, r,
-          recvwin, recvoffset + rank * chunkBytes,
+          recvwin, recvoffset + devComm.rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes);
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
     }
   }
   coop.sync();
-  GinA2aTracePhase(rank, 3, chunkBytes);
-
-  gin.flush(coop);
-  GinA2aTracePhase(rank, 4, chunkBytes);
-
-  if (tid == 0) {
-    for (int r = peerBegin; r < peerEnd; ++r) {
-      if (r == rank) continue;
-      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
-    }
-  }
-  coop.sync();
-  GinA2aTracePhase(rank, 5, chunkBytes);
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
-  GinA2aTracePhase(rank, 6, chunkBytes);
+  gin.flush(coop);
 
-  if (intraNode) {
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
-    lsaBar.sync(coop, cuda::memory_order_release);
-  } else {
-    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
-  }
-  GinA2aTracePhase(rank, 7, chunkBytes);
+  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 template <typename T>
@@ -448,47 +377,27 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     ncclGin gin { devComm, kGinContextIndex };
     const uint64_t expectedSignals = static_cast<uint64_t>(numRemotePeers);
     uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-    ncclGinAnvilSdmaGPUContext* rsCtx =
-        (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
 
     ncclCoopCta coop = ncclCoopCta();
-    const int warpId = threadIdx.x / WARP_SIZE;
-    const int nWarps = blockDim.x / WARP_SIZE;
-
-    for (int r = warpId; r < startLsa; r += nWarps) {
-      gin.put(world, r,
-          recvwin, recvoffset + world.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes,
-          ncclGin_None{},
-          ncclGin_None{},
-          ncclCoopWarp{});
-    }
-    for (int r = startLsa + lsaSize + warpId; r < world.nRanks; r += nWarps) {
-      gin.put(world, r,
-          recvwin, recvoffset + world.rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes,
-          ncclGin_None{},
-          ncclGin_None{},
-          ncclCoopWarp{});
-    }
-
-    coop.sync();
-
-    gin.flush(coop);
-
-    if (threadIdx.x == 0) {
+    const int tid = threadIdx.x;
+    if (tid == 0) {
       for (int r = 0; r < startLsa; ++r) {
-        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
       }
       for (int r = startLsa + lsaSize; r < world.nRanks; ++r) {
-        nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+        gin.put(world, r,
+            recvwin, recvoffset + world.rank * chunkBytes,
+            sendwin, sendoffset + r * chunkBytes,
+            chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
       }
     }
     coop.sync();
 
     gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+    gin.flush(coop);
 
     ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, 0u };
     bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
@@ -558,7 +467,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3:
-        TESTCHECK(testLaunchGinAlltoAllKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
       case 4:
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
