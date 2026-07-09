@@ -5,6 +5,7 @@
 
 NP=${1:-8}
 MAX_BYTES="${2:-128M}"
+MIN_BYTES="${MIN_BYTES:-128}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
@@ -380,6 +381,25 @@ if _should_run_test5; then
   if [[ -n "${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}")
   fi
+  if [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}")
+    TEST5_MPI_EXTRA+=(-x "CUDA_DEVICE_ORDER=PCI_BUS_ID")
+  fi
+  if [[ -n "${ROCR_VISIBLE_DEVICES:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES}")
+  fi
+  if [[ -n "${NCCL_DEBUG:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "NCCL_DEBUG=${NCCL_DEBUG}")
+  fi
+  if [[ -n "${NCCL_DEBUG_SUBSYS:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS}")
+  fi
+  if [[ -n "${ROCSHMEM_DEBUG_LEVEL:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "ROCSHMEM_DEBUG_LEVEL=${ROCSHMEM_DEBUG_LEVEL}")
+  fi
+  if [[ -n "${RCCL_GIN_ALLTOALL_HOST_TRACE:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "RCCL_GIN_ALLTOALL_HOST_TRACE=${RCCL_GIN_ALLTOALL_HOST_TRACE}")
+  fi
   ${DOCKER_CMD} run ${DOCKER_GPU} ${D_MEMLOCK[*]} ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
@@ -398,6 +418,6 @@ if _should_run_test5; then
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     "${TEST5_MPI_EXTRA[@]}" \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+    rccl-tests/alltoall_perf -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
   _trace_off
 fi

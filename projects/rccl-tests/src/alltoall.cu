@@ -7,6 +7,8 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
+#include <cstdio>
+#include <cstdlib>
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma.h"
@@ -252,13 +254,27 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 512;
+constexpr int kGinAlltoAllSdmaBlockThreads = 1;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: June-23 (9c0e098) sync frame — entry world GIN barrier before puts,
-// remote put+SignalInc, wait→flush, exit world GIN barrier. LSA self-copy first.
-// tid==0 serial puts (SP-safe); blockDim 512 for parallel self-copy + CTA collectives.
+// Compile with -DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1 to enable GPU printf phase markers.
+#ifndef RCCL_GIN_ALLTOALL_DEVICE_TRACE
+#define RCCL_GIN_ALLTOALL_DEVICE_TRACE 0
+#endif
+
+#if RCCL_GIN_ALLTOALL_DEVICE_TRACE
+__device__ __forceinline__ void GinA2aTracePhase(int rank, int phase, size_t chunkBytes) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[GinA2A] rank=%d phase=%d chunkBytes=%zu\n", rank, phase, chunkBytes);
+  }
+}
+#else
+__device__ __forceinline__ void GinA2aTracePhase(int, int, size_t) {}
+#endif
+
+// SDMA path: phase1e/B2 (smci355 PASS) — data puts, flush, batch signalPeer, wait.
+// blockDim 1 for SP queues. LSA end barrier intra-node. No entry GIN barrier.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -271,6 +287,11 @@ testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendof
   const int blockThreads = (chunkBytes > kAlltoAllLsaMaxBytes)
       ? kGinAlltoAllSdmaBlockThreads
       : kGinAlltoAllLsaBlockThreads;
+  if (getenv("RCCL_GIN_ALLTOALL_HOST_TRACE") != nullptr && chunkBytes > kAlltoAllLsaMaxBytes) {
+    fprintf(stderr, "[GinA2A host] launch SDMA path chunkBytes=%zu blockThreads=%d\n",
+        chunkBytes, blockThreads);
+    fflush(stderr);
+  }
   kernel<<<deviceCtaCount, blockThreads, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count,
       root, *devComm);
   return testSuccess;
@@ -290,6 +311,10 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  const bool intraNode = (lsa.nRanks == world.nRanks);
 
   ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -306,28 +331,44 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     }
     coop.sync();
   }
+  GinA2aTracePhase(rank, 1, chunkBytes);
 
-  // Phase 2–5: June-23 GIN sync sequence (9c0e098db4, pre–Jul-6 Test#5 fix).
-  // Entry barrier aligns all ranks before SDMA puts; exit barrier after flush.
-  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-
-  // Remote peers only: serial tid-0 puts + SignalInc (SP queue, one producer/peer).
+  // B2: serial data-only puts (tid 0), flush, batch signalPeer, then wait.
   if (tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
       gin.put(world, r,
           recvwin, recvoffset + rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+          chunkBytes);
     }
   }
   coop.sync();
+  GinA2aTracePhase(rank, 2, chunkBytes);
+
+  gin.flush(coop);
+  GinA2aTracePhase(rank, 3, chunkBytes);
+
+  if (tid == 0) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
+      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
+    }
+  }
+  coop.sync();
+  GinA2aTracePhase(rank, 4, chunkBytes);
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
-  gin.flush(coop);
+  GinA2aTracePhase(rank, 5, chunkBytes);
 
-  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  if (intraNode) {
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
+    lsaBar.sync(coop, cuda::memory_order_release);
+  } else {
+    ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  }
+  GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
 template <typename T>
