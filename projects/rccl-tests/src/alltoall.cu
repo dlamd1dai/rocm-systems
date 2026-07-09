@@ -273,8 +273,8 @@ __device__ __forceinline__ void GinA2aTracePhase(int rank, int phase, size_t chu
 __device__ __forceinline__ void GinA2aTracePhase(int, int, size_t) {}
 #endif
 
-// SDMA path: phase1e/B2 (smci355 PASS) — data puts, flush, batch signalPeer, wait.
-// blockDim 1 for SP queues. LSA end barrier intra-node. No entry GIN barrier.
+// SDMA path: June-23 (9c0e098) sync frame — entry world GIN barrier, serial tid-0 puts
+// with SignalInc, wait→flush, exit world GIN barrier. blockDim 1 for SP queues.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -311,10 +311,6 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-  ncclGinAnvilSdmaGPUContext* rsCtx =
-      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
-  ncclTeam lsa = ncclTeamLsa(devComm);
-  const bool intraNode = (lsa.nRanks == world.nRanks);
 
   ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -333,41 +329,31 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   GinA2aTracePhase(rank, 1, chunkBytes);
 
-  // B2: serial data-only puts (tid 0), flush, batch signalPeer, then wait.
+  // Phase 2: entry world GIN barrier aligns ranks before remote puts.
+  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+  GinA2aTracePhase(rank, 2, chunkBytes);
+
+  // Phase 3: serial tid-0 puts + SignalInc (SP-safe; one producer per peer queue).
   if (tid == 0) {
     for (int r = peerBegin; r < peerEnd; ++r) {
       if (r == rank) continue;
       gin.put(world, r,
           recvwin, recvoffset + rank * chunkBytes,
           sendwin, sendoffset + r * chunkBytes,
-          chunkBytes);
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
     }
   }
   coop.sync();
-  GinA2aTracePhase(rank, 2, chunkBytes);
-
-  gin.flush(coop);
   GinA2aTracePhase(rank, 3, chunkBytes);
 
-  if (tid == 0) {
-    for (int r = peerBegin; r < peerEnd; ++r) {
-      if (r == rank) continue;
-      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
-    }
-  }
-  coop.sync();
+  gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   GinA2aTracePhase(rank, 4, chunkBytes);
 
-  gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+  gin.flush(coop);
   GinA2aTracePhase(rank, 5, chunkBytes);
 
-  if (intraNode) {
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
-    lsaBar.sync(coop, cuda::memory_order_release);
-  } else {
-    ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
-  }
+  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
   GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
