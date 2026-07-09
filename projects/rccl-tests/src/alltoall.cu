@@ -256,9 +256,9 @@ constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: parallel put + SignalInc (one peer per thread, SP-safe); wait then
-// flush (rvt2); LSA end barrier intra-node (B3). Batch signalPeer after data-only
-// puts (B2) hangs on MI350X/MI355X at the LSA→SDMA switch.
+// SDMA path: one peer per warp, ncclCoopWarp + SignalInc (142ef snapshot); SP
+// submitPacket needs all 64 lanes — parallel ncclCoopThread puts deadlock at
+// wave_barrier. World GIN end barrier (not LSA-only B3).
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -290,8 +290,6 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-  ncclTeam lsa = ncclTeamLsa(devComm);
-  const bool intraNode = (lsa.nRanks == world.nRanks);
 
   ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -309,28 +307,27 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: one remote peer per thread, SignalInc per put (rvt2). SP queues are
-  // single-producer per peer; ncclCoopThread avoids wave_barrier in submitPacket.
-  // Do not use B2 (data-only puts + batch signalPeer) — hangs at 131072 on Ruby.
-  for (int r = peerBegin + tid; r < peerEnd; r += nthreads) {
+  // GIN/SDMA: SP queue put_signal_counter_impl_sp_wave requires every lane in the
+  // wavefront at submitPacket. One remote peer per warp (ncclCoopWarp), not one
+  // peer per thread (ncclCoopThread) — latter leaves idle lanes and hangs.
+  const int warpId = threadIdx.x / WARP_SIZE;
+  const int nWarps = blockDim.x / WARP_SIZE;
+  for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
     if (r == rank) continue;
     gin.put(world, r,
         recvwin, recvoffset + rank * chunkBytes,
         sendwin, sendoffset + r * chunkBytes,
-        chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+        chunkBytes,
+        ncclGin_SignalInc{kGinSignalIndex},
+        ncclGin_None{},
+        ncclCoopWarp{});
   }
-  coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(coop);
 
-  if (intraNode) {
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
-    lsaBar.sync(coop, cuda::memory_order_release);
-  } else {
-    ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-    bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
-  }
+  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 template <typename T>
