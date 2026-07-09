@@ -256,9 +256,9 @@ constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: one peer per warp, ncclCoopWarp + SignalInc (142ef snapshot); SP
-// submitPacket needs all 64 lanes — parallel ncclCoopThread puts deadlock at
-// wave_barrier. World GIN end barrier (not LSA-only B3).
+// SDMA path: June-23 (9c0e098) sync frame — entry world GIN barrier before puts,
+// remote put+SignalInc, wait→flush, exit world GIN barrier. LSA self-copy first.
+// tid==0 serial puts (SP-safe); blockDim 512 for parallel self-copy + CTA collectives.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -295,7 +295,7 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
 
-  // Local rank chunk: LSA store (avoid self-put over GIN/SDMA).
+  // Phase 1: local rank chunk via LSA store (avoid self-put over GIN/SDMA).
   if (rank >= peerBegin && rank < peerEnd) {
     const size_t elemCount = chunkBytes / sizeof(T);
     T* sendBase = (T*)ncclGetLocalPointer(sendwin, sendoffset);
@@ -307,26 +307,26 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: SP queue put_signal_counter_impl_sp_wave requires every lane in the
-  // wavefront at submitPacket. One remote peer per warp (ncclCoopWarp), not one
-  // peer per thread (ncclCoopThread) — latter leaves idle lanes and hangs.
-  const int warpId = threadIdx.x / WARP_SIZE;
-  const int nWarps = blockDim.x / WARP_SIZE;
-  for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
-    if (r == rank) continue;
-    gin.put(world, r,
-        recvwin, recvoffset + rank * chunkBytes,
-        sendwin, sendoffset + r * chunkBytes,
-        chunkBytes,
-        ncclGin_SignalInc{kGinSignalIndex},
-        ncclGin_None{},
-        ncclCoopWarp{});
+  // Phase 2–5: June-23 GIN sync sequence (9c0e098db4, pre–Jul-6 Test#5 fix).
+  // Entry barrier aligns all ranks before SDMA puts; exit barrier after flush.
+  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  // Remote peers only: serial tid-0 puts + SignalInc (SP queue, one producer/peer).
+  if (tid == 0) {
+    for (int r = peerBegin; r < peerEnd; ++r) {
+      if (r == rank) continue;
+      gin.put(world, r,
+          recvwin, recvoffset + rank * chunkBytes,
+          sendwin, sendoffset + r * chunkBytes,
+          chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
+    }
   }
+  coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
   gin.flush(coop);
 
-  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
   bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
