@@ -252,12 +252,13 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 // On MI355X 8-GPU single-node, ~8 KiB/rank is the ~23 us latency knee (see rvt3).
 constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
-constexpr int kGinAlltoAllSdmaBlockThreads = 64;
+constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
 
-// SDMA path: one-wave serial peers + ncclCoopWarp puts (SP-safe), flush + batch
-// signalPeer (B2), LSA end barrier intra-node (B3); coop.sync() between phases.
+// SDMA path: parallel put + SignalInc (one peer per thread, SP-safe); wait then
+// flush (rvt2); LSA end barrier intra-node (B3). Batch signalPeer after data-only
+// puts (B2) hangs on MI350X/MI355X at the LSA→SDMA switch.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -289,8 +290,6 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   }
   const uint64_t expectedSignals = static_cast<uint64_t>(remotePeerCount);
   uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-  ncclGinAnvilSdmaGPUContext* rsCtx =
-      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[kGinContextIndex];
   ncclTeam lsa = ncclTeamLsa(devComm);
   const bool intraNode = (lsa.nRanks == world.nRanks);
 
@@ -310,49 +309,20 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
     coop.sync();
   }
 
-  // GIN/SDMA: SP submitPacket requires all lanes in the wavefront (see
-  // SdmaQueueSingleProducerDeviceHandle::submitPacket). blockDim=1 + ncclCoopThread
-  // hangs on gfx950; blockDim=512 + multi-warp parallel puts hang at flush (a926d4a2).
-  // Single-wave (<=64 threads): one peer per loop iter, full wave issues each put.
-  // Multi-warp (>64, Hybrid -D 4): one peer per warp in parallel.
-  const int warpId = threadIdx.x / WARP_SIZE;
-  const int nWarps = blockDim.x / WARP_SIZE;
-  if (blockDim.x <= WARP_SIZE) {
-    for (int r = peerBegin; r < peerEnd; ++r) {
-      if (r == rank) continue;
-      gin.put(world, r,
-          recvwin, recvoffset + rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes,
-          ncclGin_None{},
-          ncclGin_None{},
-          ncclCoopWarp{});
-    }
-  } else {
-    for (int r = peerBegin + warpId; r < peerEnd; r += nWarps) {
-      if (r == rank) continue;
-      gin.put(world, r,
-          recvwin, recvoffset + rank * chunkBytes,
-          sendwin, sendoffset + r * chunkBytes,
-          chunkBytes,
-          ncclGin_None{},
-          ncclGin_None{},
-          ncclCoopWarp{});
-    }
-  }
-  coop.sync();
-
-  gin.flush(coop);
-
-  if (threadIdx.x == 0) {
-    for (int r = peerBegin; r < peerEnd; ++r) {
-      if (r == rank) continue;
-      nccl::gin::anvil::detail::signalPeer(rsCtx, r, kGinSignalIndex, 1);
-    }
+  // GIN/SDMA: one remote peer per thread, SignalInc per put (rvt2). SP queues are
+  // single-producer per peer; ncclCoopThread avoids wave_barrier in submitPacket.
+  // Do not use B2 (data-only puts + batch signalPeer) — hangs at 131072 on Ruby.
+  for (int r = peerBegin + tid; r < peerEnd; r += nthreads) {
+    if (r == rank) continue;
+    gin.put(world, r,
+        recvwin, recvoffset + rank * chunkBytes,
+        sendwin, sendoffset + r * chunkBytes,
+        chunkBytes, ncclGin_SignalInc{kGinSignalIndex});
   }
   coop.sync();
 
   gin.waitSignal(coop, kGinSignalIndex, signalValue + expectedSignals);
+  gin.flush(coop);
 
   if (intraNode) {
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { coop, devComm, lsa, devComm.lsaBarrier, barrierIndex };
