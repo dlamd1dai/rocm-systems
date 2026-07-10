@@ -7,6 +7,11 @@
 # libmlx5/libmlx5dv export mlx5dv_reg_dmabuf_mr (MOFED / newer rdma-core). Default 0: stock Ubuntu 24.04
 # often lacks those symbols (ddai-gin-build.log); test scripts can skip Test#5 via MLX5 preflight.
 # Optional: export RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 for strict MLX5 DMA-BUF symbol check at docker build.
+# Optional GinAlltoAll trace (Test#5 debugging; both default off):
+#   RCCL_GIN_ALLTOALL_HOST_TRACE=1   — runtime host stderr launch logs (no rebuild; set when running
+#                                      docker-gin-gda-sdma-test.bash).
+#   RCCL_GIN_ALLTOALL_DEVICE_TRACE=1 — compile GPU phase/signal markers into alltoall_perf; also set
+#                                      RCCL_GIN_ALLTOALL_DEVICE_TRACE=1 at test time to poll them.
 # ROCSHMEM_USE_SDMA="${ROCSHMEM_USE_SDMA:-1}"
 
 DOCKER_NO_CACHE=${1:-0}
@@ -34,13 +39,19 @@ export ROCSHMEM_CACHE_BUST=${ROCSHMEM_CACHE_BUST:-1}
 
 RCCL_GIN_ALLTOALL_DEVICE_TRACE="${RCCL_GIN_ALLTOALL_DEVICE_TRACE:-0}"
 
+TRACE_BUILD_ARGS=()
+if [[ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" == 1 ]]; then
+  TRACE_BUILD_ARGS+=(--build-arg RCCL_GIN_ALLTOALL_DEVICE_TRACE=1)
+  echo "docker build: RCCL_GIN_ALLTOALL_DEVICE_TRACE=1 (GPU kernel phase markers)"
+fi
+
 ${DOCKER_CMD} build -f ${DOCKERFILE} -t ${DOCKER_IMAGE} \
     ${DOCKER_CACHE_OPT} \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \
     --build-arg ROCSHMEM_USE_SDMA=${ROCSHMEM_USE_SDMA} \
     --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS} \
-    --build-arg RCCL_GIN_ALLTOALL_DEVICE_TRACE=${RCCL_GIN_ALLTOALL_DEVICE_TRACE} \
+    "${TRACE_BUILD_ARGS[@]}" \
     --build-arg RCCL_CACHE_BUST=$((RCCL_CACHE_BUST++)) \
     --build-arg ROCSHMEM_CACHE_BUST=$((ROCSHMEM_CACHE_BUST++)) \
     .

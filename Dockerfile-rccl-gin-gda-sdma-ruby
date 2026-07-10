@@ -216,7 +216,7 @@ RUN cd rocshmem/src/projects/rocshmem \
       -DGPU_TARGETS=${GPU_TARGETS} \
       -DCMAKE_INSTALL_PREFIX=${ROCSHMEM_INSTALL_DIR} \
       -DUSE_IPC=ON \
-      -DUSE_SDMA=$([ "${ROCSHMEM_USE_SDMA}" = "1" ] && echo ON || echo OFF) \
+      -DUSE_SDMA=ON \
       -DBUILD_FUNCTIONAL_TESTS=OFF \
       -DBUILD_UNIT_TESTS=OFF \
       -DBUILD_EXAMPLES=OFF \
@@ -272,9 +272,10 @@ RUN if [ "${USE_LOCAL_SRC}" != "1" ]; then \
       git sparse-checkout add --cone projects/rccl-tests && \
       git checkout ${RCCL_BRANCH}; \
     fi
+ARG RCCL_GIN_ALLTOALL_DEVICE_TRACE=0
 RUN mkdir rccl-tests \
     && cd rccl-tests \
-    && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} ${WORKDIR}/rccl/src/projects/rccl-tests \
+    && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} $( [ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" = "1" ] && echo '-DCMAKE_CXX_FLAGS=-DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1' ) ${WORKDIR}/rccl/src/projects/rccl-tests \
     && make -j16
 
 ## set environment variables
