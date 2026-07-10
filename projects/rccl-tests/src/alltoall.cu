@@ -70,8 +70,8 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      reqs->barrierCount = 1;
-      reqs->worldGinBarrierCount = 1;
+      reqs->barrierCount = deviceCtaCount;
+      reqs->worldGinBarrierCount = deviceCtaCount;
       reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
       reqs->lsaBarrierCount = deviceCtaCount;
@@ -113,8 +113,8 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
       return true;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: // GinAlltoAllKernel: multi-CTA GIN puts
-      reqs->barrierCount = 1;
-      reqs->worldGinBarrierCount = 1;
+      reqs->barrierCount = deviceCtaCount;
+      reqs->worldGinBarrierCount = deviceCtaCount;
       reqs->ginContextCount = 1;
       reqs->ginSignalCount = 1;
       reqs->lsaBarrierCount = deviceCtaCount;
@@ -521,11 +521,31 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
     return;
   }
 
-  // Large or multi-node: GIN (Anvil SDMA for bulk intra-node puts).
-  const uint32_t barrierIndex = static_cast<uint32_t>(blockIdx.x);
+  // Large or multi-node: clean-branch GIN frame — thread-loop single-thread puts
+  // (default coop), waitSignal then flush, per-CTA world barriers. Measured ~343 µs
+  // @ 128M on clean vs ~581 µs with putWave + LSA self-copy + batched frame.
+  ncclGin gin { devComm, kGinContextIndex };
+  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
 
-  GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
-      0, world.nRanks, world.nRanks - 1, devComm, barrierIndex);
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  const int rank = devComm.rank;
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  for (int r = tid; r < world.nRanks; r += nthreads) {
+    gin.put(world, r,
+        recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
+        sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
+        chunkBytes,
+        ncclGin_SignalInc{kGinSignalIndex});
+  }
+
+  gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + world.nRanks);
+  gin.flush(ncclCoopCta());
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 // Hybrid LSA+GIN alltoall: CTA 0 handles remote peers via GIN,
