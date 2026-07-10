@@ -44,6 +44,7 @@ struct ncclGinAnvilSdmaGPUContext {
   int ipcTableCount;
   uintptr_t* signal_remote_addrs;  // [nRanks] peer signal region bases (GDA signal_raddrs pattern)
   uint32_t ipcAgentFence;  // 0=__threadfence_system on IPC (default), 1=agent-scope release
+  uint32_t ipcSignalPeer;  // 1=shader IPC atomic signalPeer, 0=SDMA ATOMIC packet (default)
 };
 
 struct ncclGinAnvilSdmaMemHandle {

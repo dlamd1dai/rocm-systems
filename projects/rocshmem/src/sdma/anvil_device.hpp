@@ -597,11 +597,86 @@ __device__ __forceinline__ void put_signal_counter_impl_sp_wave(
   handle.submitPacket(base, pendingWptr);
 }
 
+// Multi-producer wave-cooperative variant: lane 0 reserves/places via CAS; all
+// lanes in the wavefront participate in submitPacket wave_barriers.
+template <bool PUT_EN, bool SIGNAL_EN, bool COUNTER_EN>
+__device__ __forceinline__ void put_signal_counter_impl_mp_wave(
+    SdmaQueueDeviceHandle& handle, void* dst, void* src, size_t size, uint64_t* signal,
+    uint64_t* counter, uint64_t* put_index = nullptr) {
+  const int lane = __lane_id();
+  uint64_t base = 0;
+  uint64_t pendingWptr = 0;
+
+#if SDMA_IS_OSS7
+  if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
+    constexpr bool both = SIGNAL_EN && COUNTER_EN;
+    constexpr size_t space_required =
+        sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
+        (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
+    if (lane == 0) {
+      uint64_t offset = 0;
+      base = handle.ReserveQueueSpace(space_required, offset);
+      pendingWptr = base;
+      uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
+      auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
+      handle.placePacket(ws_pkt, pendingWptr, offset);
+      if (put_index != nullptr) {
+        *put_index = pendingWptr;
+      }
+      offset = 0;
+      if constexpr (both) {
+        auto counter_pkt = CreateAtomicIncPacket(counter);
+        handle.placePacket(counter_pkt, pendingWptr, offset);
+      }
+    }
+    base = __builtin_amdgcn_readfirstlane(base);
+    pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
+    handle.submitPacket(base, pendingWptr);
+    return;
+  }
+#endif  // SDMA_IS_OSS7
+
+  if (lane == 0) {
+    constexpr size_t space_required = ((PUT_EN) ? sizeof(SDMA_PKT_COPY_LINEAR) : 0) +
+                                      ((SIGNAL_EN) ? sizeof(SDMA_PKT_ATOMIC) : 0) +
+                                      ((COUNTER_EN) ? sizeof(SDMA_PKT_ATOMIC) : 0);
+    uint64_t offset = 0;
+    base = handle.ReserveQueueSpace(space_required, offset);
+    pendingWptr = base;
+    if constexpr (PUT_EN) {
+      auto copy_packet = CreateCopyPacket(src, dst, size);
+      handle.placePacket(copy_packet, pendingWptr, offset);
+      if (put_index != nullptr) {
+        *put_index = pendingWptr;
+      }
+      offset = 0;
+    }
+    if constexpr (SIGNAL_EN) {
+      auto signal_packet = CreateAtomicIncPacket(signal);
+      handle.placePacket(signal_packet, pendingWptr, offset);
+      offset = 0;
+    }
+    if constexpr (COUNTER_EN) {
+      auto counter_packet = CreateAtomicIncPacket(counter);
+      handle.placePacket(counter_packet, pendingWptr, offset);
+      offset = 0;
+    }
+  }
+  base = __builtin_amdgcn_readfirstlane(base);
+  pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
+  handle.submitPacket(base, pendingWptr);
+}
+
 // --- Free functions (data transfer) ---
 
 __device__ __forceinline__ void put(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                     size_t size) {
   put_signal_counter_impl<true, false, false>(handle, dst, src, size, nullptr, nullptr);
+}
+
+__device__ __forceinline__ void putWave(SdmaQueueDeviceHandle& handle, void* dst, void* src,
+                                        size_t size) {
+  put_signal_counter_impl_mp_wave<true, false, false>(handle, dst, src, size, nullptr, nullptr);
 }
 
 __device__ __forceinline__ void put(SdmaQueueSingleProducerDeviceHandle& handle, void* dst,
@@ -612,6 +687,11 @@ __device__ __forceinline__ void put(SdmaQueueSingleProducerDeviceHandle& handle,
 __device__ __forceinline__ void putSignal(SdmaQueueDeviceHandle& handle, void* dst, void* src,
                                           size_t size, uint64_t* signal) {
   put_signal_counter_impl<true, true, false>(handle, dst, src, size, signal, nullptr);
+}
+
+__device__ __forceinline__ void putSignalWave(SdmaQueueDeviceHandle& handle, void* dst, void* src,
+                                              size_t size, uint64_t* signal) {
+  put_signal_counter_impl_mp_wave<true, true, false>(handle, dst, src, size, signal, nullptr);
 }
 
 __device__ __forceinline__ void putSignal(SdmaQueueSingleProducerDeviceHandle& handle, void* dst,
@@ -651,6 +731,10 @@ __device__ __forceinline__ void putWithSignal(SdmaQueueDeviceHandle& handle, voi
 
 __device__ __forceinline__ void signal(SdmaQueueDeviceHandle& handle, uint64_t* sig) {
   put_signal_counter_impl<false, true, false>(handle, nullptr, nullptr, 0, sig, nullptr);
+}
+
+__device__ __forceinline__ void signalWave(SdmaQueueDeviceHandle& handle, uint64_t* sig) {
+  put_signal_counter_impl_mp_wave<false, true, false>(handle, nullptr, nullptr, 0, sig, nullptr);
 }
 
 __device__ __forceinline__ void signal(SdmaQueueSingleProducerDeviceHandle& handle, uint64_t* sig) {

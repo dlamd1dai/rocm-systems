@@ -400,6 +400,9 @@ if _should_run_test5; then
   if [[ -n "${RCCL_GIN_ALLTOALL_HOST_TRACE:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "RCCL_GIN_ALLTOALL_HOST_TRACE=${RCCL_GIN_ALLTOALL_HOST_TRACE}")
   fi
+  if [[ -n "${RCCL_GIN_ALLTOALL_DEVICE_TRACE:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "RCCL_GIN_ALLTOALL_DEVICE_TRACE=${RCCL_GIN_ALLTOALL_DEVICE_TRACE}")
+  fi
   ${DOCKER_CMD} run ${DOCKER_GPU} ${D_MEMLOCK[*]} ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \

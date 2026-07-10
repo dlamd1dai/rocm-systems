@@ -348,22 +348,67 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   return ncclSuccess;
 }
 
+static bool ginAnvilSignalDebugEnabled() {
+  const char* v = getenv("RCCL_GIN_ANVIL_SDMA_SIGNAL_DEBUG");
+  return v && atoi(v) != 0;
+}
+
+static uint32_t ginAnvilIpcSignalPeerFromEnv() {
+  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_SIGNAL_IPC");
+  if (!e || !e[0]) return 0;
+  if (e[0] == '0' && e[1] == '\0') return 0;
+  return atoi(e) != 0 ? 1u : 0u;
+}
+
 static ncclResult_t ginAnvilRegisterLsaSignals(ginAnvilGinCtx* ctx, void* lsaSelf, size_t bytes) {
   struct ncclDevrState* devr = &ctx->comm->devrState;
-  int rc = ncclGinAnvilIpcTableRegisterVmm(lsaSelf, bytes, devr->lsaSelf, devr->lsaSize,
-                                           (ptrdiff_t)devr->bigSize);
-  if (rc != 0) {
-    WARN("GIN anvil-sdma: LSA signal IPC table register failed for %p size %zu", lsaSelf, bytes);
-    return ncclSystemError;
+  struct ncclComm* comm = ctx->comm;
+  const ptrdiff_t stride = (ptrdiff_t)devr->bigSize;
+
+  if (ctx->nRanks != devr->lsaSize) {
+    WARN("GIN anvil-sdma: signal nRanks=%d != devr->lsaSize=%d (rank %d)", ctx->nRanks, devr->lsaSize,
+         ctx->rank);
   }
+  if (ctx->rank != devr->lsaSelf) {
+    WARN("GIN anvil-sdma: ctx->rank=%d != devr->lsaSelf=%d (signal peer indexing may be wrong)", ctx->rank,
+         devr->lsaSelf);
+  }
+
   ctx->gpuCtxHost.signals = (uint64_t*)lsaSelf;
 
-  const ptrdiff_t stride = (ptrdiff_t)devr->bigSize;
-  uintptr_t* hostAddrs = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)ctx->nRanks);
+  uintptr_t* hostAddrs = (uintptr_t*)calloc((size_t)ctx->nRanks, sizeof(uintptr_t));
   if (!hostAddrs) return ncclSystemError;
   for (int pe = 0; pe < ctx->nRanks; pe++) {
-    hostAddrs[pe] = (uintptr_t)lsaSelf + static_cast<ptrdiff_t>(pe - devr->lsaSelf) * stride;
+    hostAddrs[pe] = (uintptr_t)lsaSelf + static_cast<ptrdiff_t>(pe - ctx->rank) * stride;
   }
+
+  uintptr_t selfExpected = (uintptr_t)lsaSelf;
+  if (hostAddrs[ctx->rank] != selfExpected) {
+    WARN("GIN anvil-sdma: signal_remote_addrs[self=%d]=%#lx != signals=%#lx (lsaSelf=%#lx stride=%zd)",
+         ctx->rank, (unsigned long)hostAddrs[ctx->rank], (unsigned long)selfExpected,
+         (unsigned long)lsaSelf, (long)stride);
+  }
+
+  // Cross-rank sanity: each rank's published local signals base should match our allgather slot.
+  uintptr_t* gatheredLocalBases = (uintptr_t*)calloc((size_t)ctx->nRanks, sizeof(uintptr_t));
+  if (gatheredLocalBases) {
+    gatheredLocalBases[ctx->rank] = (uintptr_t)lsaSelf;
+    if (ginAnvilBootstrapAllgather(comm->bootstrap, gatheredLocalBases, sizeof(uintptr_t)) != 0) {
+      WARN("GIN anvil-sdma: signal local-base allgather failed");
+    } else if (gatheredLocalBases[ctx->rank] != (uintptr_t)lsaSelf) {
+      WARN("GIN anvil-sdma: signal local-base allgather mismatch rank=%d got=%#lx expect=%#lx", ctx->rank,
+           (unsigned long)gatheredLocalBases[ctx->rank], (unsigned long)lsaSelf);
+    }
+    free(gatheredLocalBases);
+  }
+
+  int rc = ncclGinAnvilIpcTableRegisterExplicit(lsaSelf, hostAddrs, ctx->nRanks, bytes);
+  if (rc != 0) {
+    WARN("GIN anvil-sdma: LSA signal IPC table register failed for %p size %zu", lsaSelf, bytes);
+    free(hostAddrs);
+    return ncclSystemError;
+  }
+
   if (ctx->signal_remote_addrs_dev) (void)hipFree(ctx->signal_remote_addrs_dev);
   if (hipMalloc(&ctx->signal_remote_addrs_dev, sizeof(uintptr_t) * (size_t)ctx->nRanks) != hipSuccess ||
       hipMemcpy(ctx->signal_remote_addrs_dev, hostAddrs, sizeof(uintptr_t) * (size_t)ctx->nRanks,
@@ -371,17 +416,28 @@ static ncclResult_t ginAnvilRegisterLsaSignals(ginAnvilGinCtx* ctx, void* lsaSel
     free(hostAddrs);
     return ncclSystemError;
   }
-  free(hostAddrs);
   ctx->gpuCtxHost.signal_remote_addrs = ctx->signal_remote_addrs_dev;
 
+  if (ginAnvilSignalDebugEnabled()) {
+    for (int pe = 0; pe < ctx->nRanks; pe++) {
+      INFO(NCCL_INIT, "GIN anvil-sdma: signal_remote_addrs rank=%d peer=%d -> %#lx (local signals %#lx)",
+           ctx->rank, pe, (unsigned long)hostAddrs[pe], (unsigned long)lsaSelf);
+    }
+  }
+
+  uintptr_t remote0 = hostAddrs[0];
+  uintptr_t remoteSelf = hostAddrs[ctx->rank];
+  free(hostAddrs);
   ctx->signalsBound = true;
   if (hipMemcpy(ctx->gpuCtxDev, &ctx->gpuCtxHost, sizeof(ncclGinAnvilSdmaGPUContext),
                 hipMemcpyHostToDevice) != hipSuccess) {
     return ncclSystemError;
   }
   INFO(NCCL_INIT,
-       "GIN anvil-sdma: bound LSA signals slot=%d lsaSelf=%p +%zu (rank %d, lsaSize=%d, bigSize=%zu)",
-       ctx->signalSlot, lsaSelf, bytes, devr->lsaSelf, devr->lsaSize, (size_t)devr->bigSize);
+       "GIN anvil-sdma: bound LSA signals slot=%d signals=%p bytes=%zu rank=%d lsaSelf=%d lsaSize=%d "
+       "stride=%zu remote[0]=%#lx remote[self]=%#lx",
+       ctx->signalSlot, lsaSelf, bytes, ctx->rank, devr->lsaSelf, devr->lsaSize, (size_t)devr->bigSize,
+       (unsigned long)remote0, (unsigned long)remoteSelf);
   return ncclSuccess;
 }
 
@@ -468,6 +524,7 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
   ctx->gpuCtxHost.ipcAgentFence = ginAnvilIpcAgentFenceFromEnv();
+  ctx->gpuCtxHost.ipcSignalPeer = ginAnvilIpcSignalPeerFromEnv();
   ctx->gpuCtxHost.signals = nullptr;
   ctx->gpuCtxHost.signal_remote_addrs = nullptr;
   ctx->signal_remote_addrs_dev = nullptr;

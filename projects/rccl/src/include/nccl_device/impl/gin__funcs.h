@@ -356,7 +356,25 @@ NCCL_DEVICE_INLINE void ncclGin_BackendMask<beMask>::put(
   using nccl::gin::internal::teamRankToGinRank;
   ncclGinCtx_M<beMask> ctx = this->_makeCtx();
   coop.sync();
-  if (coop.thread_rank() == 0) {
+  if (coop.size() > 1 && ncclCoopWithinWarp(coop) && ncclGin_isDeviceOnly(bufType)) {
+    ncclGinCall<ncclGinApi_Put>(ctx,
+        coop, teamRankToGinRank(this->comm, team, peer), /*hasWins=*/true,
+        loadConst(&dstWin->ginWins[this->connectionId]),
+        4096*size_t(loadConst(&dstWin->ginOffset4K)) + dstOffset,
+        loadConst(&srcWin->ginWins[this->connectionId]),
+        4096*size_t(loadConst(&srcWin->ginOffset4K)) + srcOffset, bytes,
+        ncclGin_getSignalDescriptor(*this, remoteAction),
+        ncclGin_getSignalOp(remoteAction),
+        ncclGin_getSignalOpArg(remoteAction),
+        ncclGin_isCounter(localAction),
+        ncclGin_getCounterId(*this, localAction),
+        ncclGin_isDescriptor(descriptor),
+        ncclGin_getDescriptor(descriptor),
+        requiredRelease,
+        givenRelease,
+        optFlags
+        );
+  } else if (coop.thread_rank() == 0) {
     if (ncclGin_isDeviceOnly(bufType)) {
       ncclGinCall<ncclGinApi_Put>(ctx,
           ncclCoopThread(), teamRankToGinRank(this->comm, team, peer), /*hasWins=*/true,

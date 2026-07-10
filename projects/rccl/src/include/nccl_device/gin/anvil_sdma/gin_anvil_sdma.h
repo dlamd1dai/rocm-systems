@@ -57,6 +57,14 @@ NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaGPUContext* rsCtx, 
 
 NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                               ncclGinSignal_t signalId) {
+  uint64_t* signals = loadConst(&rsCtx->signals);
+  if (signals != nullptr) {
+    const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
+    int count = loadConst(&rsCtx->ipcTableCount);
+    void* resolved =
+        ginAnvilResolvePeerVa(reinterpret_cast<void*>(signals + signalId), peer, table, count);
+    if (resolved != nullptr) return reinterpret_cast<uint64_t*>(resolved);
+  }
   uintptr_t* signalRemoteAddrs = loadConst(&rsCtx->signal_remote_addrs);
   if (signalRemoteAddrs != nullptr) {
     uintptr_t base = loadConst(&signalRemoteAddrs[peer]);
@@ -64,11 +72,7 @@ NCCL_DEVICE_INLINE uint64_t* remoteSignalAddr(ncclGinAnvilSdmaGPUContext* rsCtx,
       return reinterpret_cast<uint64_t*>(base + static_cast<size_t>(signalId) * sizeof(uint64_t));
     }
   }
-  uint64_t* signals = loadConst(&rsCtx->signals);
-  if (signals == nullptr) return nullptr;
-  const ncclGinAnvilIpcBufEntry* table = loadConst(&rsCtx->ipcTable);
-  int count = loadConst(&rsCtx->ipcTableCount);
-  return reinterpret_cast<uint64_t*>(ginAnvilResolvePeerVa(signals + signalId, peer, table, count));
+  return nullptr;
 }
 
 NCCL_DEVICE_INLINE bool useSdmaFusedSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
@@ -111,28 +115,71 @@ NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
   return loadConst(handles + peer * numCh + effCh);
 }
 
-// Factory publishes singleProducerDeviceHandle() as SdmaQueueDeviceHandle*; always
-// route SDMA ops through the SP overloads (wave-cooperative submitPacket).
-NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* spQueueHandle(
-    ncclGinAnvilSdmaGPUContext* rsCtx, int peer, int blockId) {
-  return reinterpret_cast<gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle*>(
-      queueHandle(rsCtx, peer, blockId));
+NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::sdma::SdmaQueueDeviceHandle& handle,
+                                  int peer, int blockId, void* dstAddr, void* srcAddr, size_t bytes,
+                                  bool waveCoop, bool sdmaFusedSignal, uint64_t* remoteSig) {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  if (sdmaFusedSignal) {
+    if (waveCoop) {
+      gin_anvil::sdma::putSignalWave(handle, dstAddr, srcAddr, bytes, remoteSig);
+    } else {
+      gin_anvil::sdma::putSignal(handle, dstAddr, srcAddr, bytes, remoteSig);
+    }
+  } else {
+    if (waveCoop) {
+      gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);
+    } else {
+      gin_anvil::sdma::put(handle, dstAddr, srcAddr, bytes);
+    }
+  }
+  if (__lane_id() == 0) {
+    markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
+  }
 }
 
-NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* spQueueFromDeviceHandle(
-    gin_anvil::sdma::SdmaQueueDeviceHandle* handle) {
-  return reinterpret_cast<gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle*>(handle);
+NCCL_DEVICE_INLINE void signalPeerIpc(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
+                                      ncclGinSignal_t signalId, uint64_t value) {
+  uint64_t* remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
+  if (remoteSig == nullptr) return;
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  ipcFlatAtomicAddSys64(remoteSig, value);
+  __threadfence_system();
+}
+
+// Wave-cooperative SDMA ATOMIC packet to peer signal cell (all lanes in the wavefront
+// must call). Prefer over shader flat atomics for cross-GPU signal delivery on gfx950.
+NCCL_DEVICE_INLINE void signalPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
+                                       ncclGinSignal_t signalId, int blockId) {
+  uint64_t* remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
+  if (remoteSig == nullptr) return;
+
+  if (loadConst(&rsCtx->ipcSignalPeer) != 0) {
+    if (__lane_id() == 0) signalPeerIpc(rsCtx, peer, signalId, 1);
+    __builtin_amdgcn_wave_barrier();
+    return;
+  }
+
+  gin_anvil::sdma::SdmaQueueDeviceHandle* handle = queueHandle(rsCtx, peer, blockId);
+  if (handle == nullptr) {
+    if (__lane_id() == 0) signalPeerIpc(rsCtx, peer, signalId, 1);
+    __builtin_amdgcn_wave_barrier();
+    return;
+  }
+
+  gin_anvil::sdma::signalWave(*handle, remoteSig);
+  if (__lane_id() == 0) {
+    markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
+  }
 }
 
 NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
                                    ncclGinSignal_t signalId, uint64_t value) {
-  uint64_t* remoteSig = remoteSignalAddr(rsCtx, peer, signalId);
-  if (remoteSig == nullptr) return;
-  ipcFlatAtomicAddSys64(remoteSig, value);
+  (void)value;
+  signalPeerIpc(rsCtx, peer, signalId, 1);
 }
 
 NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
-                                          gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle,
+                                          gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
   (void)hasCounter;
   // Drain the submitting queue before signalPeer (SignalInc or counter), not only for counters.
@@ -175,7 +222,7 @@ NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int p
   size_t threshold = loadConst(&rsCtx->sdmaThreshold);
   if (bytes <= threshold) return;
 
-  gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = spQueueHandle(rsCtx, peer, blockId);
+  gin_anvil::sdma::SdmaQueueDeviceHandle* handle = queueHandle(rsCtx, peer, blockId);
   if (handle == nullptr) return;
 
   auto* dstMh = (ncclGinAnvilSdmaMemHandle*)dstGinWin;
@@ -205,15 +252,8 @@ NCCL_DEVICE_INLINE void sdmaPutPeerWave(ncclGinAnvilSdmaGPUContext* rsCtx, int p
     if (remoteSig != nullptr) sdmaFusedSignal = true;
   }
 
-  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  if (sdmaFusedSignal) {
-    gin_anvil::sdma::putSignal(*handle, dstAddr, srcAddr, bytes, remoteSig);
-  } else {
-    gin_anvil::sdma::put(*handle, dstAddr, srcAddr, bytes);
-  }
-  if (__lane_id() == 0) {
-    markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
-  }
+  sdmaPutMp(rsCtx, *handle, peer, blockId, dstAddr, srcAddr, bytes, /*waveCoop=*/true,
+            sdmaFusedSignal, remoteSig);
 }
 
 }  // namespace detail
@@ -237,16 +277,16 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
-    using nccl::gin::anvil::detail::spQueueHandle;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::sdmaPutMp;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPut;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool threadOnlyCoop = (coop.size() == 1);
-    if (threadOnlyCoop && coop.thread_rank() != 0) return;
+    const bool waveCoop = (coop.size() > 1);
+    if (!waveCoop && coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!anvilCtxValid(rsCtx)) return;
@@ -258,9 +298,9 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     bool useIpcPut = hasWins && bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (hasWins && !useIpcPut) {
-      handle = spQueueHandle(rsCtx, peer, blockId);
+      handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
     }
     bool sdmaDataPath = hasWins && !useIpcPut && handle != nullptr;
@@ -298,16 +338,8 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
             remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
             if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
           }
-          __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-          if (sdmaFusedSignal) {
-            gin_anvil::sdma::putSignal(*handle, dstAddr, srcAddr, bytes, remoteSig);
-          } else {
-            gin_anvil::sdma::put(*handle, dstAddr, srcAddr, bytes);
-          }
-          if (__lane_id() == 0) {
-            markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels),
-                          effectiveChannel(rsCtx, blockId));
-          }
+          sdmaPutMp(rsCtx, *handle, peer, blockId, dstAddr, srcAddr, bytes, waveCoop,
+                    sdmaFusedSignal, remoteSig);
         }
       }
     }
@@ -342,16 +374,16 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::useSdmaFusedSignal;
     using nccl::gin::anvil::detail::fenceBeforeSignal;
     using nccl::gin::anvil::detail::markSdmaDirty;
-    using nccl::gin::anvil::detail::spQueueHandle;
     using nccl::gin::anvil::detail::queueHandle;
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
+    using nccl::gin::anvil::detail::sdmaPutMp;
     using nccl::gin::anvil::detail::signalPeer;
     using nccl::gin::anvil::ipcPutScalar;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool threadOnlyCoop = (coop.size() == 1);
-    if (threadOnlyCoop && coop.thread_rank() != 0) return;
+    const bool waveCoop = (coop.size() > 1);
+    if (!waveCoop && coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!anvilCtxValid(rsCtx)) return;
@@ -366,9 +398,9 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     size_t threshold = loadConst(&rsCtx->sdmaThreshold);
     const size_t bytes = sizeof(T);
     bool useIpcPut = bytes <= threshold;
-    gin_anvil::sdma::SdmaQueueSingleProducerDeviceHandle* handle = nullptr;
+    gin_anvil::sdma::SdmaQueueDeviceHandle* handle = nullptr;
     if (!useIpcPut) {
-      handle = spQueueHandle(rsCtx, peer, blockId);
+      handle = queueHandle(rsCtx, peer, blockId);
       if (handle == nullptr) useIpcPut = true;
     }
     bool sdmaDataPath = !useIpcPut && handle != nullptr;
@@ -401,15 +433,8 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
           remoteSig = remoteSignalAddr(rsCtx, peer, signal.indexedSignal.signalId);
           if (reinterpret_cast<uintptr_t>(remoteSig) != 0) sdmaFusedSignal = true;
         }
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-        if (sdmaFusedSignal) {
-          gin_anvil::sdma::putSignal(*handle, dstAddr, (void*)&tmp, bytes, remoteSig);
-        } else {
-          gin_anvil::sdma::put(*handle, dstAddr, (void*)&tmp, bytes);
-        }
-        if (__lane_id() == 0) {
-          markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
-        }
+        sdmaPutMp(rsCtx, *handle, peer, blockId, dstAddr, (void*)&tmp, bytes, waveCoop,
+                  sdmaFusedSignal, remoteSig);
       }
     }
 
@@ -471,7 +496,6 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     (void)abortFlag;
     using nccl::utility::loadConst;
     using nccl::gin::anvil::detail::anvilCtxValid;
-    using nccl::gin::anvil::detail::spQueueFromDeviceHandle;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
     if (!anvilCtxValid(rsCtx)) {
       __threadfence_system();
@@ -495,7 +519,7 @@ struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
           if ((dirty & bit) == 0) continue;
           auto* h = loadConst(handles + p * numCh + ch);
           if (h != nullptr) {
-            gin_anvil::sdma::quiet(*spQueueFromDeviceHandle(h));
+            gin_anvil::sdma::quiet(*h);
           }
         }
       }
