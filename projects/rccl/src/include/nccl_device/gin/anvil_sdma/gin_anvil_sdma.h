@@ -281,6 +281,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
     using nccl::gin::anvil::detail::sdmaPutMp;
     using nccl::gin::anvil::detail::signalPeer;
+    using nccl::gin::anvil::detail::signalPeerWave;
     using nccl::gin::anvil::ipcPut;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
@@ -345,7 +346,11 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     }
 
     if ((hasSignal || hasCounter) && !sdmaFusedSignal) {
-      if (__lane_id() == 0) {
+      if (hasSignal && waveCoop && sdmaDataPath) {
+        if (__lane_id() == 0) fenceBeforeSignal(rsCtx, sdmaDataPath, handle, hasCounter);
+        __builtin_amdgcn_wave_barrier();
+        signalPeerWave(rsCtx, peer, signal.indexedSignal.signalId, blockId);
+      } else if (__lane_id() == 0) {
         fenceBeforeSignal(rsCtx, sdmaDataPath, handle, hasCounter);
 
         if (hasSignal) {
