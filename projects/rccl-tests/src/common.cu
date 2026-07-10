@@ -149,11 +149,11 @@ int deviceCtaCount = 16; // Default number of CTAs for device implementation
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 static bool isGinAlltoAllDevCommReqs(struct ncclDevCommRequirements const* reqs) {
-  if (reqs->barrierCount != 1 || reqs->ginContextCount != 1) return false;
+  if (reqs->ginContextCount != 1) return false;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
-  return reqs->worldGinBarrierCount == 1;
+  return reqs->worldGinBarrierCount >= 1 && reqs->barrierCount >= 1;
 #else
-  return true;
+  return reqs->barrierCount >= 1;
 #endif
 }
 
@@ -167,14 +167,6 @@ static testResult_t validateDeviceCtaGinContexts(
     struct ncclDevComm const* devComm, struct ncclDevCommRequirements const* reqs) {
 #endif
   if (!isGinAlltoAllDevCommReqs(reqs)) return testSuccess;
-
-  if (deviceCtaCount != 1) {
-    fprintf(stderr,
-      "Error: GinAlltoAllKernel (-D 3) requires -V 1 (got -V %d). "
-      "Multi-CTA GIN AlltoAll is not supported.\n",
-      deviceCtaCount);
-    return testInvalidUsage;
-  }
 
   if ((int)devComm->ginContextCount < 1) {
     fprintf(stderr,
@@ -1925,13 +1917,6 @@ int main(int argc, char* argv[], char **envp) {
   }
   if (deviceImpl > 0 && (local_register != SYMMETRIC_REGISTER)) {
     fprintf(stderr, "device implementation (-D > 0) requires enabling symmetric memory registration (-R 2)\n");
-    return -1;
-  }
-  if (deviceImpl == 3 && deviceCtaCount != 1) {
-    fprintf(stderr,
-      "GinAlltoAllKernel (-D 3) requires -V 1 (got -V %d). "
-      "Multi-CTA GIN AlltoAll is not supported.\n",
-      deviceCtaCount);
     return -1;
   }
 

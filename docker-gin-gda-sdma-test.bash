@@ -11,6 +11,7 @@ DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
 GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${TEST2_HOST_SO_SEARCH_DIRS:-/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}"
 ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
+TEST5_NUM_CTAS="${TEST5_NUM_CTAS:-16}"
 
 _run_test() {
   [[ ",${RCCL_GIN_RUN_TESTS}," == *",$1,"* ]]
@@ -376,10 +377,13 @@ fi
 
 if _should_run_test5; then
   _trace_on
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5); -D 3 GinAlltoAll (-V 1, LSA small + GIN/SDMA large) ==="
+  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=5); -D 3 GinAlltoAll (-V ${TEST5_NUM_CTAS}, LSA small + GIN/SDMA large) ==="
   TEST5_MPI_EXTRA=()
   if [[ -n "${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}")
+  fi
+  if [[ -n "${NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL:-}" ]]; then
+    TEST5_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL=${NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL}")
   fi
   if [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]; then
     TEST5_MPI_EXTRA+=(-x "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}")
@@ -421,6 +425,6 @@ if _should_run_test5; then
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     "${TEST5_MPI_EXTRA[@]}" \
-    rccl-tests/alltoall_perf -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+    rccl-tests/alltoall_perf -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V "${TEST5_NUM_CTAS}"
   _trace_off
 fi
