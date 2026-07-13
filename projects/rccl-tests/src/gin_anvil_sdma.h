@@ -305,6 +305,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
     using nccl::gin::anvil::detail::sdmaPutMp;
     using nccl::gin::anvil::detail::signalPeer;
+    using nccl::gin::anvil::detail::anvilSdmaWaveCoop;
     using nccl::gin::anvil::ipcPut;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
@@ -403,6 +404,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::gin::anvil::detail::resolveRemotePeerVa;
     using nccl::gin::anvil::detail::sdmaPutMp;
     using nccl::gin::anvil::detail::signalPeer;
+    using nccl::gin::anvil::detail::anvilSdmaWaveCoop;
     using nccl::gin::anvil::ipcPutScalar;
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
