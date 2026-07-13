@@ -130,17 +130,19 @@ NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
   int numCh = loadConst(&rsCtx->numChannels);
   int effCh = effectiveChannel(rsCtx, blockId);
   auto** handles = (gin_anvil::sdma::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
+  if (handles == nullptr) return nullptr;
   return loadConst(handles + peer * numCh + effCh);
 }
 
 template <typename Coop>
 NCCL_DEVICE_INLINE bool anvilSdmaWaveCoop(Coop coop) {
-  return coop.size() == 64;
+  return ncclCoopWithinWarp(coop) && coop.size() == WARP_SIZE;
 }
 
 NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::sdma::SdmaQueueDeviceHandle& handle,
                                   int peer, int blockId, void* dstAddr, void* srcAddr, size_t bytes,
                                   bool waveCoop, bool sdmaFusedSignal, uint64_t* remoteSig) {
+  if (sdmaFusedSignal && remoteSig == nullptr) sdmaFusedSignal = false;
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (sdmaFusedSignal) {
     if (waveCoop) {

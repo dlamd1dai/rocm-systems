@@ -529,34 +529,60 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
-// Clean-branch GIN AlltoAll frame: single-lane fused put+SignalInc per peer,
-// waitSignal, flush, per-CTA world barrier. Default for -D 3 large and -D 4 large.
+// Clean-branch GIN AlltoAll frame: warp-cooperative fused put+SignalInc per remote peer,
+// waitSignal, flush. Matches GinBatched fused semantics (LSA diagonal + remote GIN only).
 template <typename T>
 __device__ void GinCleanAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
     size_t recvoffset, size_t chunkBytes, struct ncclDevComm devComm, uint32_t barrierIndex) {
   ncclGin gin { devComm, kGinContextIndex };
   ncclTeam world = ncclTeamWorld(devComm);
   const int rank = devComm.rank;
-  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-
-  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, barrierIndex };
-  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-
+  ncclCoopCta coop = ncclCoopCta();
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
+  const bool multiCta = gridDim.x > 1;
 
-  for (int r = tid; r < world.nRanks; r += nthreads) {
+  // Diagonal chunk via LSA (do not use GIN/SDMA self-put).
+  {
+    const size_t elemCount = chunkBytes / sizeof(T);
+    T* sendBase = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* recvBase = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+    for (size_t off = tid; off < elemCount; off += nthreads) {
+      recvBase[static_cast<size_t>(rank) * elemCount + off] =
+          sendBase[static_cast<size_t>(rank) * elemCount + off];
+    }
+    coop.sync();
+  }
+
+  const int warpId = (threadIdx.x + blockIdx.x * blockDim.x) / WARP_SIZE;
+  const int nWarps = (blockDim.x * gridDim.x) / WARP_SIZE;
+
+  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+  const uint64_t signalLeast = signalValue + static_cast<uint64_t>(world.nRanks - 1);
+
+  for (int r = warpId; r < world.nRanks; r += nWarps) {
+    if (r == rank) continue;
     gin.put(world, r,
         recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
         sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
         chunkBytes,
-        ncclGin_SignalInc{kGinSignalIndex});
+        ncclGin_SignalInc{kGinSignalIndex},
+        ncclGin_None{},
+        ncclCoopWarp{});
   }
-
-  gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + world.nRanks);
-  gin.flush(ncclCoopCta());
-
-  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  coop.sync();
+  if (!multiCta || blockIdx.x == 0) {
+    gin.flush(coop);
+  }
+  if (multiCta) {
+    __threadfence_system();
+    coop.sync();
+  }
+  gin.waitSignal(coop, kGinSignalIndex, signalLeast);
+  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 // Large-message GIN exchange: clean frame by default; batched PR2 frame when

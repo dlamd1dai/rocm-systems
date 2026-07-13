@@ -131,6 +131,7 @@ NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
   int numCh = loadConst(&rsCtx->numChannels);
   int effCh = effectiveChannel(rsCtx, blockId);
   auto** handles = (gin_anvil::sdma::SdmaQueueDeviceHandle**)loadConst(&rsCtx->queueHandles);
+  if (handles == nullptr) return nullptr;
   return loadConst(handles + peer * numCh + effCh);
 }
 
@@ -142,6 +143,7 @@ NCCL_DEVICE_INLINE bool anvilSdmaWaveCoop(Coop coop) {
 NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::sdma::SdmaQueueDeviceHandle& handle,
                                   int peer, int blockId, void* dstAddr, void* srcAddr, size_t bytes,
                                   bool waveCoop, bool sdmaFusedSignal, uint64_t* remoteSig) {
+  if (sdmaFusedSignal && remoteSig == nullptr) sdmaFusedSignal = false;
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (sdmaFusedSignal) {
     // Single-lane: one COPY_LINEAR_WAIT_SIGNAL_MI4 doorbell (clean path).
