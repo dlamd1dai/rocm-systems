@@ -357,7 +357,7 @@ static testResult_t ginA2aHostSetExchangeMode() {
   return testSuccess;
 }
 
-// SDMA path: fused put+SignalInc when enabled; else decoupled PR2 frame.
+// SDMA path: clean thread-coop frame by default (RCCL_GIN_ALLTOALL_BATCHED=0); batched PR2 when set.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
@@ -534,16 +534,36 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
-// Clean-branch GIN AlltoAll: reuse GinBatched device frame (LSA diagonal, intra-node LSA
-// entry barrier for fused OSS7, decoupled put+signalPeerWave fallback). The prior clean
-// path used ncclTeamTagWorld hybrid barriers around fused puts and faulted on MI355X at
-// the first SDMA-sized message (16 KiB); see ddai-gin-perf-trace.log.
+// Clean-branch GIN AlltoAll (7dbf frame): thread-loop default-coop puts, waitSignal then flush,
+// per-CTA world barriers. Single-lane SDMA (no ncclCoopWarp). Measured ~343 µs @ 128M on MI355.
 template <typename T>
 __device__ void GinCleanAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
     size_t recvoffset, size_t chunkBytes, struct ncclDevComm devComm, uint32_t barrierIndex) {
+  ncclGin gin { devComm, kGinContextIndex };
   ncclTeam world = ncclTeamWorld(devComm);
-  GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
-      0, world.nRanks, world.nRanks - 1, devComm, barrierIndex);
+  const int rank = devComm.rank;
+  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  for (int r = tid; r < world.nRanks; r += nthreads) {
+    if (r == rank) continue;
+    gin.put(world, r,
+        recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
+        sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
+        chunkBytes,
+        ncclGin_SignalInc{kGinSignalIndex});
+  }
+
+  gin.waitSignal(ncclCoopCta(), kGinSignalIndex,
+      signalValue + static_cast<uint64_t>(world.nRanks - 1));
+  gin.flush(ncclCoopCta());
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
 
 // Large-message GIN exchange: clean frame by default; batched PR2 frame when

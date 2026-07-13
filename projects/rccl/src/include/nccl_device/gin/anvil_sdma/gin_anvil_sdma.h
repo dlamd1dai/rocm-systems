@@ -147,12 +147,14 @@ NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::
   if (sdmaFusedSignal && remoteSig == nullptr) sdmaFusedSignal = false;
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (sdmaFusedSignal) {
-    // Single-lane: one COPY_LINEAR_WAIT_SIGNAL_MI4 doorbell (clean path).
-    // Full ncclCoopWarp: wave-cooperative fused packet via putSignalWave.
+    // OSS7 COPY_LINEAR_WAIT_SIGNAL_MI4 can fault on MI355 at some sizes; issue copy
+    // then signal on the same queue (ordered) instead of the fused packet.
     if (waveCoop) {
-      gin_anvil::sdma::putSignalWave(handle, dstAddr, srcAddr, bytes, remoteSig);
+      gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);
+      gin_anvil::sdma::signalWave(handle, remoteSig);
     } else {
-      gin_anvil::sdma::putSignal(handle, dstAddr, srcAddr, bytes, remoteSig);
+      gin_anvil::sdma::put(handle, dstAddr, srcAddr, bytes);
+      gin_anvil::sdma::signal(handle, remoteSig);
     }
   } else if (waveCoop) {
     gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);

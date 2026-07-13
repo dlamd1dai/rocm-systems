@@ -21,11 +21,11 @@ struct ncclGinAnvilIpcBufEntry;
  *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default on (OSS7): fused COPY_LINEAR_WAIT_SIGNAL_MI4 for large SDMA puts with SignalInc. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
+/** Default off: fused COPY_LINEAR_WAIT_SIGNAL_MI4; opt in via NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL=1. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
 
-/** Default on MI355 (gfx950): emit OSS7 MI4 SDMA packets when compiled with SDMA_IS_OSS7. */
-#define NCCL_GIN_ANVIL_SDMA_OSS7_DEFAULT 1u
+/** Default off on MI355 until fusion is validated; opt in via NCCL_GIN_ANVIL_SDMA_OSS7=1. */
+#define NCCL_GIN_ANVIL_SDMA_OSS7_DEFAULT 0u
 
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
