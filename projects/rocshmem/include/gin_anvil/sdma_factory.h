@@ -57,4 +57,14 @@ GIN_ANVIL_SDMA_API int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t
 }
 #endif
 
+#ifdef __cplusplus
+#include <hip/hip_runtime.h>
+namespace gin_anvil {
+namespace sdma {
+/** Device OSS7 toggle (default 1 on gfx950). Defined once in rocshmem ipc_policy.cpp. */
+extern __device__ int gin_anvil_sdma_oss7_enabled;
+}  // namespace sdma
+}  // namespace gin_anvil
+#endif
+
 #endif  // GIN_ANVIL_SDMA_FACTORY_H_

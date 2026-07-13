@@ -199,9 +199,10 @@ static uint32_t ginAnvilOss7FromEnv() {
 
 static void ginAnvilUploadSdmaOss7DeviceFlag(uint32_t enabled) {
   int val = (int)enabled;
-  hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(gin_anvil_sdma_oss7_enabled), &val, sizeof(val));
+  hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(gin_anvil::sdma::gin_anvil_sdma_oss7_enabled), &val,
+                                   sizeof(val));
   if (err != hipSuccess) {
-    WARN("GIN anvil-sdma: hipMemcpyToSymbol(gin_anvil_sdma_oss7_enabled) failed: %s",
+    WARN("GIN anvil-sdma: hipMemcpyToSymbol(gin_anvil::sdma::gin_anvil_sdma_oss7_enabled) failed: %s",
          hipGetErrorString(err));
   }
 }
