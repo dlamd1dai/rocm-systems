@@ -250,6 +250,8 @@ constexpr size_t kAlltoAllLsaMaxBytes = 8192;
 constexpr int kGinAlltoAllLsaBlockThreads = 512;
 // gfx9/gfx950 (MI300/MI350) use 64-lane wavefronts; MP SDMA submitPacket requires
 // a full wave per peer put/signal. 512 threads → 8 warps so up to 8 peers in flight.
+// SDMA uses a single CTA per rank (see testLaunchGinAlltoAllKernel): Anvil queues are
+// per-peer (numChannels=1) and concurrent multi-CTA wave puts fault on MI355X.
 constexpr int kGinAlltoAllSdmaBlockThreads = 512;
 constexpr int kGinContextIndex = 0;
 constexpr ncclGinSignal_t kGinSignalIndex = 0;
@@ -366,21 +368,22 @@ testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendof
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
   const size_t chunkBytes = count * wordSize(type);
-  const int blockThreads = (chunkBytes > kAlltoAllLsaMaxBytes)
-      ? kGinAlltoAllSdmaBlockThreads
-      : kGinAlltoAllLsaBlockThreads;
-  if (getenv("RCCL_GIN_ALLTOALL_HOST_TRACE") != nullptr && chunkBytes > kAlltoAllLsaMaxBytes) {
-    fprintf(stderr, "[GinA2A host] launch SDMA path chunkBytes=%zu blockThreads=%d\n",
-        chunkBytes, blockThreads);
+  const bool sdmaPath = chunkBytes > kAlltoAllLsaMaxBytes;
+  const int blockThreads = sdmaPath ? kGinAlltoAllSdmaBlockThreads : kGinAlltoAllLsaBlockThreads;
+  // -V N>1 stripes LSA small messages across CTAs; SDMA must use one CTA (Hybrid -D 4 pattern).
+  const int gridCtas = sdmaPath ? 1 : deviceCtaCount;
+  if (getenv("RCCL_GIN_ALLTOALL_HOST_TRACE") != nullptr && sdmaPath) {
+    fprintf(stderr, "[GinA2A host] launch SDMA path chunkBytes=%zu gridCtas=%d blockThreads=%d\n",
+        chunkBytes, gridCtas, blockThreads);
     fflush(stderr);
   }
 #if RCCL_GIN_ALLTOALL_DEVICE_TRACE
-  if (chunkBytes > kAlltoAllLsaMaxBytes) ginA2aResetDeviceTrace();
+  if (sdmaPath) ginA2aResetDeviceTrace();
 #endif
-  kernel<<<deviceCtaCount, blockThreads, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count,
+  kernel<<<gridCtas, blockThreads, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count,
       root, *devComm);
 #if RCCL_GIN_ALLTOALL_DEVICE_TRACE
-  if (chunkBytes > kAlltoAllLsaMaxBytes) ginA2aPollDeviceTrace(stream, 240);
+  if (sdmaPath) ginA2aPollDeviceTrace(stream, 240);
 #endif
   return testSuccess;
 }
@@ -578,9 +581,10 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
     return;
   }
 
-  // Large or multi-node: clean GIN frame (default) or batched frame (RCCL_GIN_ALLTOALL_BATCHED=1).
+  // Large or multi-node: one CTA per rank for SDMA (multi-CTA -V is LSA-only above).
+  if (blockIdx.x != 0) return;
   GinLargeAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
-      0, world.nRanks, world.nRanks - 1, devComm, blockIdx.x);
+      0, world.nRanks, world.nRanks - 1, devComm, 0u);
 }
 
 // Hybrid LSA+GIN alltoall: CTA 0 handles remote peers via GIN,

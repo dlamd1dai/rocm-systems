@@ -143,6 +143,7 @@ NCCL_DEVICE_INLINE bool anvilSdmaWaveCoop(Coop coop) {
 NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::sdma::SdmaQueueDeviceHandle& handle,
                                   int peer, int blockId, void* dstAddr, void* srcAddr, size_t bytes,
                                   bool waveCoop, bool sdmaFusedSignal, uint64_t* remoteSig) {
+  if (dstAddr == nullptr || srcAddr == nullptr || bytes == 0) return;
   if (sdmaFusedSignal && remoteSig == nullptr) sdmaFusedSignal = false;
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (sdmaFusedSignal) {

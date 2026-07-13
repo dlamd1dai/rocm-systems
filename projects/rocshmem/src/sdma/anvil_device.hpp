@@ -623,6 +623,10 @@ __device__ __forceinline__ void put_signal_counter_impl_mp_wave(
   uint64_t base = 0;
   uint64_t pendingWptr = 0;
 
+  if constexpr (PUT_EN) {
+    if (src == nullptr || dst == nullptr || size == 0) return;
+  }
+
 #if SDMA_IS_OSS7
   if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
     if (sdmaRuntimeOss7Enabled()) {
