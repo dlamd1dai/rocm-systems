@@ -313,7 +313,8 @@ __host__ void IpcSdmaImpl::ipcHostStop() {
 #if defined(USE_SDMA) && SDMA_IS_OSS7
 namespace gin_anvil {
 namespace sdma {
-__device__ int gin_anvil_sdma_oss7_enabled = 1;
+// Weak so librccl.so (ENABLE_ROCSHMEM_GIN) can provide the strong device symbol.
+__device__ __attribute__((weak)) int gin_anvil_sdma_oss7_enabled = 1;
 }  // namespace sdma
 }  // namespace gin_anvil
 #endif
