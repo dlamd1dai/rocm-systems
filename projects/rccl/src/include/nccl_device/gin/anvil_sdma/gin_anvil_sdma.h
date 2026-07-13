@@ -8,6 +8,7 @@
 #define _NCCL_DEVICE_GIN_ANVIL_SDMA_H_
 
 #include "../gin_device_common.h"
+#include "../../coop.h"
 #include "gin_anvil_sdma_device_host_common.h"
 #include "gin_anvil_ipc_copy.h"
 #include "gin_anvil_ipc_table_device.h"
@@ -93,7 +94,7 @@ NCCL_DEVICE_INLINE bool useSdmaFusedSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bo
   return anvilCtxValid(rsCtx) && sdmaDataPath && hasSignal && !hasCounter &&
          signalOp == ncclGinSignalInc && loadConst(&rsCtx->signals) != nullptr &&
          loadConst(&rsCtx->signal_remote_addrs) != nullptr &&
-         loadConst(&rsCtx->fusedSdmaSignal) != 0;
+         loadConst(&rsCtx->fusedSdmaSignal) != 0 && loadConst(&rsCtx->sdmaOss7) != 0;
 #else
   (void)rsCtx;
   (void)sdmaDataPath;
@@ -133,28 +134,29 @@ NCCL_DEVICE_INLINE gin_anvil::sdma::SdmaQueueDeviceHandle* queueHandle(
   return loadConst(handles + peer * numCh + effCh);
 }
 
+template <typename Coop>
+NCCL_DEVICE_INLINE bool anvilSdmaWaveCoop(Coop coop) {
+  return ncclCoopWithinWarp(coop) && coop.size() == WARP_SIZE;
+}
+
 NCCL_DEVICE_INLINE void sdmaPutMp(ncclGinAnvilSdmaGPUContext* rsCtx, gin_anvil::sdma::SdmaQueueDeviceHandle& handle,
                                   int peer, int blockId, void* dstAddr, void* srcAddr, size_t bytes,
                                   bool waveCoop, bool sdmaFusedSignal, uint64_t* remoteSig) {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   if (sdmaFusedSignal) {
-    // OSS7 COPY_LINEAR_WAIT_SIGNAL_MI4 faults on MI355 at some sizes; issue copy
-    // then signal on the same queue (ordered) instead of the fused packet.
+    // Single-lane: one COPY_LINEAR_WAIT_SIGNAL_MI4 doorbell (clean path).
+    // Full ncclCoopWarp: wave-cooperative fused packet via putSignalWave.
     if (waveCoop) {
-      gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);
-      gin_anvil::sdma::signalWave(handle, remoteSig);
+      gin_anvil::sdma::putSignalWave(handle, dstAddr, srcAddr, bytes, remoteSig);
     } else {
-      gin_anvil::sdma::put(handle, dstAddr, srcAddr, bytes);
-      gin_anvil::sdma::signal(handle, remoteSig);
+      gin_anvil::sdma::putSignal(handle, dstAddr, srcAddr, bytes, remoteSig);
     }
+  } else if (waveCoop) {
+    gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);
   } else {
-    if (waveCoop) {
-      gin_anvil::sdma::putWave(handle, dstAddr, srcAddr, bytes);
-    } else {
-      gin_anvil::sdma::put(handle, dstAddr, srcAddr, bytes);
-    }
+    gin_anvil::sdma::put(handle, dstAddr, srcAddr, bytes);
   }
-  if (__lane_id() == 0) {
+  if (!waveCoop || __lane_id() == 0) {
     markSdmaDirty(rsCtx, peer, loadConst(&rsCtx->numChannels), effectiveChannel(rsCtx, blockId));
   }
 }
@@ -203,10 +205,12 @@ NCCL_DEVICE_INLINE void signalPeer(ncclGinAnvilSdmaGPUContext* rsCtx, int peer,
 NCCL_DEVICE_INLINE void fenceBeforeSignal(ncclGinAnvilSdmaGPUContext* rsCtx, bool sdmaDataPath,
                                           gin_anvil::sdma::SdmaQueueDeviceHandle* handle,
                                           bool hasCounter) {
-  (void)hasCounter;
-  // Drain the submitting queue before signalPeer (SignalInc or counter), not only for counters.
-  if (sdmaDataPath && handle != nullptr) {
-    gin_anvil::sdma::quiet(*handle);
+  if (hasCounter) {
+    if (sdmaDataPath && handle != nullptr) {
+      gin_anvil::sdma::quiet(*handle);
+    } else {
+      __threadfence_system();
+    }
   } else if (sdmaDataPath) {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   } else if (rsCtx != nullptr && loadConst(&rsCtx->ipcAgentFence) != 0) {
@@ -308,7 +312,7 @@ struct ncclGinApi_Put<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool waveCoop = (coop.size() > 1);
+    const bool waveCoop = anvilSdmaWaveCoop(coop);
     if (!waveCoop && coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
@@ -406,7 +410,7 @@ struct ncclGinApi_PutValue<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
     using nccl::utility::loadConst;
     bool hasSignal = signal.type != NCCL_GIN_SIGNAL_TYPE_NONE;
 
-    const bool waveCoop = (coop.size() > 1);
+    const bool waveCoop = anvilSdmaWaveCoop(coop);
     if (!waveCoop && coop.thread_rank() != 0) return;
 
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;

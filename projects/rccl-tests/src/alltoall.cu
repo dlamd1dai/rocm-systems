@@ -329,12 +329,39 @@ static void ginA2aPollDeviceTrace(cudaStream_t stream, int maxPolls) {
 __device__ __forceinline__ void GinA2aTracePhase(int, int, size_t) {}
 #endif
 
+// Host sets via cudaMemcpyToSymbol before -D 3 / -D 4 launch (see ginA2aHostSetExchangeMode).
+// RCCL_GIN_ALLTOALL_BATCHED=1 selects GinBatchedAlltoAllExchange for large GIN paths.
+__device__ int ginA2aUseBatchedExchange;
+
+__device__ __forceinline__ bool GinA2aUseBatchedExchange() {
+  return ginA2aUseBatchedExchange != 0;
+}
+
+static testResult_t ginA2aHostSetExchangeMode() {
+  const char* e = getenv("RCCL_GIN_ALLTOALL_BATCHED");
+  int useBatched = 0;
+  if (e && e[0] && !(e[0] == '0' && e[1] == '\0')) {
+    useBatched = atoi(e) != 0 ? 1 : 0;
+  }
+  cudaError_t err = cudaMemcpyToSymbol(ginA2aUseBatchedExchange, &useBatched, sizeof(useBatched));
+  if (err != cudaSuccess) {
+    fprintf(stderr, "[GinA2A host] batched-exchange flag upload failed: %s\n", cudaGetErrorString(err));
+    return testCudaError;
+  }
+  if (getenv("RCCL_GIN_ALLTOALL_HOST_TRACE") != nullptr) {
+    fprintf(stderr, "[GinA2A host] RCCL_GIN_ALLTOALL_BATCHED=%d (0=clean, 1=batched)\n", useBatched);
+    fflush(stderr);
+  }
+  return testSuccess;
+}
+
 // SDMA path: fused put+SignalInc when enabled; else decoupled PR2 frame.
 template <typename F>
 testResult_t testLaunchGinAlltoAllKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
     size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm,
     cudaStream_t stream) {
   if (kernel == nullptr) return testNotImplemented;
+  TESTCHECK(ginA2aHostSetExchangeMode());
   ncclDevComm* devComm = (ncclDevComm*)comm;
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
@@ -397,7 +424,8 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
       : blockDim.x / WARP_SIZE;
   const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
   const bool fusedPutSignal = rsCtx != nullptr &&
-      nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0;
+      nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0 &&
+      nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0;
   const bool liteWorldSync = multiCta && fusedPutSignal && intraNode;
 
   if (!liteWorldSync && multiCta) {
@@ -501,6 +529,51 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
+// Clean-branch GIN AlltoAll frame: single-lane fused put+SignalInc per peer,
+// waitSignal, flush, per-CTA world barrier. Default for -D 3 large and -D 4 large.
+template <typename T>
+__device__ void GinCleanAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
+    size_t recvoffset, size_t chunkBytes, struct ncclDevComm devComm, uint32_t barrierIndex) {
+  ncclGin gin { devComm, kGinContextIndex };
+  ncclTeam world = ncclTeamWorld(devComm);
+  const int rank = devComm.rank;
+  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
+
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, barrierIndex };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  for (int r = tid; r < world.nRanks; r += nthreads) {
+    gin.put(world, r,
+        recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
+        sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
+        chunkBytes,
+        ncclGin_SignalInc{kGinSignalIndex});
+  }
+
+  gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + world.nRanks);
+  gin.flush(ncclCoopCta());
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+}
+
+// Large-message GIN exchange: clean frame by default; batched PR2 frame when
+// RCCL_GIN_ALLTOALL_BATCHED=1 (host uploads ginA2aUseBatchedExchange before launch).
+template <typename T>
+__device__ void GinLargeAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
+    size_t recvoffset, size_t chunkBytes, int peerBegin, int peerEnd, int totalRemotePeers,
+    struct ncclDevComm devComm, uint32_t barrierIndex) {
+  if (GinA2aUseBatchedExchange()) {
+    GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
+        peerBegin, peerEnd, totalRemotePeers, devComm, barrierIndex);
+  } else {
+    GinCleanAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes, devComm,
+        barrierIndex);
+  }
+}
+
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   ncclTeam world = ncclTeamWorld(devComm);
@@ -521,31 +594,9 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
     return;
   }
 
-  // Large or multi-node: clean-branch GIN frame — thread-loop single-thread puts
-  // (default coop), waitSignal then flush, per-CTA world barriers. Measured ~343 µs
-  // @ 128M on clean vs ~581 µs with putWave + LSA self-copy + batched frame.
-  ncclGin gin { devComm, kGinContextIndex };
-  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-
-  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
-  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-
-  const int rank = devComm.rank;
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int nthreads = blockDim.x * gridDim.x;
-
-  for (int r = tid; r < world.nRanks; r += nthreads) {
-    gin.put(world, r,
-        recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
-        sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
-        chunkBytes,
-        ncclGin_SignalInc{kGinSignalIndex});
-  }
-
-  gin.waitSignal(ncclCoopCta(), kGinSignalIndex, signalValue + world.nRanks);
-  gin.flush(ncclCoopCta());
-
-  bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  // Large or multi-node: clean GIN frame (default) or batched frame (RCCL_GIN_ALLTOALL_BATCHED=1).
+  GinLargeAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
+      0, world.nRanks, world.nRanks - 1, devComm, blockIdx.x);
 }
 
 // Hybrid LSA+GIN alltoall: CTA 0 handles remote peers via GIN,
@@ -588,8 +639,7 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
 
   // CTA 0
   if (!useLsa) {
-    // Large messages: all peers via GIN/SDMA (including intra-node locals).
-    GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
+    GinLargeAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
         0, world.nRanks, world.nRanks - 1, devComm, 0u);
   } else if (numRemotePeers > 0) {
     // Small messages on multi-node: remote peers only via GIN.
@@ -603,7 +653,8 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     const int warpId = threadIdx.x / WARP_SIZE;
     const int nWarps = blockDim.x / WARP_SIZE;
     const bool fusedPutSignal = rsCtx != nullptr &&
-        nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0;
+        nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0 &&
+        nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0;
 
     for (int r = warpId; r < startLsa; r += nWarps) {
       if (fusedPutSignal) {
@@ -731,6 +782,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         TESTCHECK(testLaunchGinAlltoAllKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
       case 4:
+        TESTCHECK(ginA2aHostSetExchangeMode());
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
 #endif

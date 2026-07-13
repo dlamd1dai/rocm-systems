@@ -24,6 +24,9 @@ struct ncclGinAnvilIpcBufEntry;
 /** Default on (OSS7): fused COPY_LINEAR_WAIT_SIGNAL_MI4 for large SDMA puts with SignalInc. */
 #define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
 
+/** Default on MI355 (gfx950): emit OSS7 MI4 SDMA packets when compiled with SDMA_IS_OSS7. */
+#define NCCL_GIN_ANVIL_SDMA_OSS7_DEFAULT 1u
+
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
   void** queueHandles;   // [local_pe * numChannels + ch] SdmaQueueDeviceHandle*
@@ -34,6 +37,7 @@ struct ncclGinAnvilSdmaGPUContext {
   uint32_t nCounters;
   uint32_t sdmaThreshold;
   uint32_t fusedSdmaSignal;  // use COPY_LINEAR_WAIT_SIGNAL_MI4 for SignalInc SDMA puts
+  uint32_t sdmaOss7;  // runtime OSS7 MI4 packets (NCCL_GIN_ANVIL_SDMA_OSS7; MI355 default on)
   int nRanks;
   int rank;
   int numChannels;

@@ -356,7 +356,9 @@ NCCL_DEVICE_INLINE void ncclGin_BackendMask<beMask>::put(
   using nccl::gin::internal::teamRankToGinRank;
   ncclGinCtx_M<beMask> ctx = this->_makeCtx();
   coop.sync();
-  if (coop.size() > 1 && ncclCoopWithinWarp(coop) && ncclGin_isDeviceOnly(bufType)) {
+  // Wave-cooperative SDMA only for explicit full ncclCoopWarp puts; all other
+  // coops collapse to single-lane putSignal/put (clean-branch economics).
+  if (ncclCoopWithinWarp(coop) && coop.size() == WARP_SIZE && ncclGin_isDeviceOnly(bufType)) {
     ncclGinCall<ncclGinApi_Put>(ctx,
         coop, teamRankToGinRank(this->comm, team, peer), /*hasWins=*/true,
         loadConst(&dstWin->ginWins[this->connectionId]),

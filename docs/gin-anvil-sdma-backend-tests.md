@@ -328,6 +328,10 @@ Formal matrix: **[design doc — Test plan](gin-anvil-sdma-backend-design.md#tes
 | **`TEST5_HOST_MLX5_LIB_DIR`** | unset | Bind-mount host `libmlx5*` / `libmlx5dv*` into container for Test#5 |
 | **`TEST5_NUM_CHANNELS`** | `1` | Sets `NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS` for Test#5 |
 | **`NCCL_GIN_ANVIL_SDMA_THRESHOLD`** | unset (128 B in RCCL) | IPC vs SDMA boundary; passthrough on Test#5 |
+| **`NCCL_GIN_ANVIL_SDMA_OSS7`** | unset (`1`) | `0` = legacy COPY_LINEAR + ATOMIC SDMA packets on MI355; `1` = OSS7 MI4 fused packets (`COPY_LINEAR_WAIT_SIGNAL_MI4`) when compiled for gfx950 |
+| **`NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL`** | unset (`1`) | `0` = decoupled put + signal; requires `NCCL_GIN_ANVIL_SDMA_OSS7=1` for hardware fusion |
+| **`RCCL_GIN_ALLTOALL_BATCHED`** | unset (`0`) | `1` = large `-D 3` / `-D 4` paths use `GinBatchedAlltoAllExchange` (legacy PR2 frame); default is clean single-lane fused frame |
+| **`RCCL_GIN_ALLTOALL_HOST_TRACE`** | unset | `1` = host stderr lines for SDMA launch and batched/clean selection |
 
 ### Docker / harness
 

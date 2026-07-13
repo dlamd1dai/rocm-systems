@@ -161,6 +161,16 @@ __device__ __forceinline__ SDMA_PKT_FENCE_64B_MI4 CreateFence64BPacketMI4(uint64
 
 #endif  // SDMA_IS_OSS7
 
+#if SDMA_IS_OSS7
+// Runtime toggle for OSS7 MI4 SDMA packets on MI355 (default 1). Host sets via
+// NCCL_GIN_ANVIL_SDMA_OSS7 and hipMemcpyToSymbol from gin_plugin_anvil_sdma.cc.
+__device__ int gin_anvil_sdma_oss7_enabled = 1;
+
+__device__ __forceinline__ bool sdmaRuntimeOss7Enabled() {
+  return gin_anvil_sdma_oss7_enabled != 0;
+}
+#endif  // SDMA_IS_OSS7
+
 // Spin-poll until *addr >= expected (agent-scope relaxed load)
 template <int64_t MAX_SPIN_COUNT = -1>
 __device__ __forceinline__ void poll_until_ge(uint64_t* addr, uint64_t expected) {
@@ -471,31 +481,33 @@ __device__ __forceinline__ void put_signal_counter_impl(QueueHandle& handle, voi
   // When only a counter is requested (putCounter pattern), it is routed into
   // the fused signal slot.
   if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
-    constexpr bool both = SIGNAL_EN && COUNTER_EN;
-    constexpr size_t space_required =
-        sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
-        (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
-    uint64_t offset = 0;
-    auto base = handle.ReserveQueueSpace(space_required, offset);
-    uint64_t pendingWptr = base;
+    if (sdmaRuntimeOss7Enabled()) {
+      constexpr bool both = SIGNAL_EN && COUNTER_EN;
+      constexpr size_t space_required =
+          sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
+          (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
+      uint64_t offset = 0;
+      auto base = handle.ReserveQueueSpace(space_required, offset);
+      uint64_t pendingWptr = base;
 
-    // Route signal into the fused slot; fall back to counter slot if no signal
-    uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
-    auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1,
-                                                false, nullptr, 0, 0);
-    handle.placePacket(ws_pkt, pendingWptr, offset);
-    if (put_index != nullptr) {
-      *put_index = pendingWptr;
-    }
-    offset = 0;
-
-    if constexpr (both) {
-      auto counter_pkt = CreateAtomicIncPacket(counter);
-      handle.placePacket(counter_pkt, pendingWptr, offset);
+      // Route signal into the fused slot; fall back to counter slot if no signal
+      uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
+      auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1,
+                                                  false, nullptr, 0, 0);
+      handle.placePacket(ws_pkt, pendingWptr, offset);
+      if (put_index != nullptr) {
+        *put_index = pendingWptr;
+      }
       offset = 0;
+
+      if constexpr (both) {
+        auto counter_pkt = CreateAtomicIncPacket(counter);
+        handle.placePacket(counter_pkt, pendingWptr, offset);
+        offset = 0;
+      }
+      handle.submitPacket(base, pendingWptr);
+      return;
     }
-    handle.submitPacket(base, pendingWptr);
-    return;
   }
 #endif  // SDMA_IS_OSS7
 
@@ -539,30 +551,32 @@ __device__ __forceinline__ void put_signal_counter_impl_sp_wave(
 
 #if SDMA_IS_OSS7
   if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
-    constexpr bool both = SIGNAL_EN && COUNTER_EN;
-    constexpr size_t space_required =
-        sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
-        (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
-    if (lane == 0) {
-      uint64_t offset = 0;
-      base = handle.ReserveQueueSpace(space_required, offset);
-      pendingWptr = base;
-      uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
-      auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
-      handle.placePacket(ws_pkt, pendingWptr, offset);
-      if (put_index != nullptr) {
-        *put_index = pendingWptr;
+    if (sdmaRuntimeOss7Enabled()) {
+      constexpr bool both = SIGNAL_EN && COUNTER_EN;
+      constexpr size_t space_required =
+          sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
+          (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
+      if (lane == 0) {
+        uint64_t offset = 0;
+        base = handle.ReserveQueueSpace(space_required, offset);
+        pendingWptr = base;
+        uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
+        auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
+        handle.placePacket(ws_pkt, pendingWptr, offset);
+        if (put_index != nullptr) {
+          *put_index = pendingWptr;
+        }
+        offset = 0;
+        if constexpr (both) {
+          auto counter_pkt = CreateAtomicIncPacket(counter);
+          handle.placePacket(counter_pkt, pendingWptr, offset);
+        }
       }
-      offset = 0;
-      if constexpr (both) {
-        auto counter_pkt = CreateAtomicIncPacket(counter);
-        handle.placePacket(counter_pkt, pendingWptr, offset);
-      }
+      base = __builtin_amdgcn_readfirstlane(base);
+      pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
+      handle.submitPacket(base, pendingWptr);
+      return;
     }
-    base = __builtin_amdgcn_readfirstlane(base);
-    pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
-    handle.submitPacket(base, pendingWptr);
-    return;
   }
 #endif  // SDMA_IS_OSS7
 
@@ -609,30 +623,32 @@ __device__ __forceinline__ void put_signal_counter_impl_mp_wave(
 
 #if SDMA_IS_OSS7
   if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
-    constexpr bool both = SIGNAL_EN && COUNTER_EN;
-    constexpr size_t space_required =
-        sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
-        (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
-    if (lane == 0) {
-      uint64_t offset = 0;
-      base = handle.ReserveQueueSpace(space_required, offset);
-      pendingWptr = base;
-      uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
-      auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
-      handle.placePacket(ws_pkt, pendingWptr, offset);
-      if (put_index != nullptr) {
-        *put_index = pendingWptr;
+    if (sdmaRuntimeOss7Enabled()) {
+      constexpr bool both = SIGNAL_EN && COUNTER_EN;
+      constexpr size_t space_required =
+          sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
+          (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
+      if (lane == 0) {
+        uint64_t offset = 0;
+        base = handle.ReserveQueueSpace(space_required, offset);
+        pendingWptr = base;
+        uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
+        auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
+        handle.placePacket(ws_pkt, pendingWptr, offset);
+        if (put_index != nullptr) {
+          *put_index = pendingWptr;
+        }
+        offset = 0;
+        if constexpr (both) {
+          auto counter_pkt = CreateAtomicIncPacket(counter);
+          handle.placePacket(counter_pkt, pendingWptr, offset);
+        }
       }
-      offset = 0;
-      if constexpr (both) {
-        auto counter_pkt = CreateAtomicIncPacket(counter);
-        handle.placePacket(counter_pkt, pendingWptr, offset);
-      }
+      base = __builtin_amdgcn_readfirstlane(base);
+      pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
+      handle.submitPacket(base, pendingWptr);
+      return;
     }
-    base = __builtin_amdgcn_readfirstlane(base);
-    pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
-    handle.submitPacket(base, pendingWptr);
-    return;
   }
 #endif  // SDMA_IS_OSS7
 
