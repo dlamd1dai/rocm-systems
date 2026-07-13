@@ -355,15 +355,18 @@ NCCL_DEVICE_INLINE void ncclGin_BackendMask<beMask>::put(
   using nccl::utility::loadConst;
   using nccl::gin::internal::teamRankToGinRank;
   ncclGinCtx_M<beMask> ctx = this->_makeCtx();
+  ncclGinWindow_t dstGin = loadConst(&dstWin->ginWins[this->connectionId]);
+  ncclGinWindow_t srcGin = loadConst(&srcWin->ginWins[this->connectionId]);
   coop.sync();
+  if (dstGin == nullptr || srcGin == nullptr) return;
   // Wave-cooperative SDMA only for explicit full ncclCoopWarp puts; all other
   // coops collapse to single-lane putSignal/put (clean-branch economics).
   if (ncclCoopWithinWarp(coop) && coop.size() == WARP_SIZE && ncclGin_isDeviceOnly(bufType)) {
     ncclGinCall<ncclGinApi_Put>(ctx,
         coop, teamRankToGinRank(this->comm, team, peer), /*hasWins=*/true,
-        loadConst(&dstWin->ginWins[this->connectionId]),
+        dstGin,
         4096*size_t(loadConst(&dstWin->ginOffset4K)) + dstOffset,
-        loadConst(&srcWin->ginWins[this->connectionId]),
+        srcGin,
         4096*size_t(loadConst(&srcWin->ginOffset4K)) + srcOffset, bytes,
         ncclGin_getSignalDescriptor(*this, remoteAction),
         ncclGin_getSignalOp(remoteAction),
@@ -380,9 +383,9 @@ NCCL_DEVICE_INLINE void ncclGin_BackendMask<beMask>::put(
     if (ncclGin_isDeviceOnly(bufType)) {
       ncclGinCall<ncclGinApi_Put>(ctx,
           ncclCoopThread(), teamRankToGinRank(this->comm, team, peer), /*hasWins=*/true,
-          loadConst(&dstWin->ginWins[this->connectionId]),
+          dstGin,
           4096*size_t(loadConst(&dstWin->ginOffset4K)) + dstOffset,
-          loadConst(&srcWin->ginWins[this->connectionId]),
+          srcGin,
           4096*size_t(loadConst(&srcWin->ginOffset4K)) + srcOffset, bytes,
           ncclGin_getSignalDescriptor(*this, remoteAction),
           ncclGin_getSignalOp(remoteAction),

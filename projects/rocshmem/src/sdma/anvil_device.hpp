@@ -626,30 +626,32 @@ __device__ __forceinline__ void put_signal_counter_impl_mp_wave(
 #if SDMA_IS_OSS7
   if constexpr (PUT_EN && (SIGNAL_EN || COUNTER_EN)) {
     if (sdmaRuntimeOss7Enabled()) {
-      constexpr bool both = SIGNAL_EN && COUNTER_EN;
-      constexpr size_t space_required =
-          sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
-          (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
-      if (lane == 0) {
-        uint64_t offset = 0;
-        base = handle.ReserveQueueSpace(space_required, offset);
-        pendingWptr = base;
-        uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
-        auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
-        handle.placePacket(ws_pkt, pendingWptr, offset);
-        if (put_index != nullptr) {
-          *put_index = pendingWptr;
+      uint64_t* fused_addr = SIGNAL_EN ? signal : counter;
+      if (fused_addr != nullptr) {
+        constexpr bool both = SIGNAL_EN && COUNTER_EN;
+        constexpr size_t space_required =
+            sizeof(SDMA_PKT_COPY_LINEAR_WAIT_SIGNAL_MI4) +
+            (both ? sizeof(SDMA_PKT_ATOMIC) : 0);
+        if (lane == 0) {
+          uint64_t offset = 0;
+          base = handle.ReserveQueueSpace(space_required, offset);
+          pendingWptr = base;
+          auto ws_pkt = CreateCopyWaitSignalPacketMI4(src, dst, size, fused_addr, 1, false, nullptr, 0, 0);
+          handle.placePacket(ws_pkt, pendingWptr, offset);
+          if (put_index != nullptr) {
+            *put_index = pendingWptr;
+          }
+          offset = 0;
+          if constexpr (both) {
+            auto counter_pkt = CreateAtomicIncPacket(counter);
+            handle.placePacket(counter_pkt, pendingWptr, offset);
+          }
         }
-        offset = 0;
-        if constexpr (both) {
-          auto counter_pkt = CreateAtomicIncPacket(counter);
-          handle.placePacket(counter_pkt, pendingWptr, offset);
-        }
+        base = __builtin_amdgcn_readfirstlane(base);
+        pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
+        handle.submitPacket(base, pendingWptr);
+        return;
       }
-      base = __builtin_amdgcn_readfirstlane(base);
-      pendingWptr = __builtin_amdgcn_readfirstlane(pendingWptr);
-      handle.submitPacket(base, pendingWptr);
-      return;
     }
   }
 #endif  // SDMA_IS_OSS7
@@ -670,14 +672,18 @@ __device__ __forceinline__ void put_signal_counter_impl_mp_wave(
       offset = 0;
     }
     if constexpr (SIGNAL_EN) {
-      auto signal_packet = CreateAtomicIncPacket(signal);
-      handle.placePacket(signal_packet, pendingWptr, offset);
-      offset = 0;
+      if (signal != nullptr) {
+        auto signal_packet = CreateAtomicIncPacket(signal);
+        handle.placePacket(signal_packet, pendingWptr, offset);
+        offset = 0;
+      }
     }
     if constexpr (COUNTER_EN) {
-      auto counter_packet = CreateAtomicIncPacket(counter);
-      handle.placePacket(counter_packet, pendingWptr, offset);
-      offset = 0;
+      if (counter != nullptr) {
+        auto counter_packet = CreateAtomicIncPacket(counter);
+        handle.placePacket(counter_packet, pendingWptr, offset);
+        offset = 0;
+      }
     }
   }
   base = __builtin_amdgcn_readfirstlane(base);

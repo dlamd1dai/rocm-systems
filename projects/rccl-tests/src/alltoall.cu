@@ -425,7 +425,9 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   const int blockId = blockIdx.x + blockIdx.y * gridDim.x;
   const bool fusedPutSignal = rsCtx != nullptr &&
       nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0 &&
-      nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0;
+      nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0 &&
+      nccl::utility::loadConst(&rsCtx->signals) != nullptr &&
+      nccl::utility::loadConst(&rsCtx->signal_remote_addrs) != nullptr;
   const bool liteWorldSync = multiCta && fusedPutSignal && intraNode;
 
   if (!liteWorldSync && multiCta) {
@@ -529,60 +531,16 @@ __device__ void GinBatchedAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffs
   GinA2aTracePhase(rank, 6, chunkBytes);
 }
 
-// Clean-branch GIN AlltoAll frame: warp-cooperative fused put+SignalInc per remote peer,
-// waitSignal, flush. Matches GinBatched fused semantics (LSA diagonal + remote GIN only).
+// Clean-branch GIN AlltoAll: reuse GinBatched device frame (LSA diagonal, intra-node LSA
+// entry barrier for fused OSS7, decoupled put+signalPeerWave fallback). The prior clean
+// path used ncclTeamTagWorld hybrid barriers around fused puts and faulted on MI355X at
+// the first SDMA-sized message (16 KiB); see ddai-gin-perf-trace.log.
 template <typename T>
 __device__ void GinCleanAlltoAllExchange(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
     size_t recvoffset, size_t chunkBytes, struct ncclDevComm devComm, uint32_t barrierIndex) {
-  ncclGin gin { devComm, kGinContextIndex };
   ncclTeam world = ncclTeamWorld(devComm);
-  const int rank = devComm.rank;
-  ncclCoopCta coop = ncclCoopCta();
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int nthreads = blockDim.x * gridDim.x;
-  const bool multiCta = gridDim.x > 1;
-
-  // Diagonal chunk via LSA (do not use GIN/SDMA self-put).
-  {
-    const size_t elemCount = chunkBytes / sizeof(T);
-    T* sendBase = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-    T* recvBase = (T*)ncclGetLocalPointer(recvwin, recvoffset);
-    for (size_t off = tid; off < elemCount; off += nthreads) {
-      recvBase[static_cast<size_t>(rank) * elemCount + off] =
-          sendBase[static_cast<size_t>(rank) * elemCount + off];
-    }
-    coop.sync();
-  }
-
-  const int warpId = (threadIdx.x + blockIdx.x * blockDim.x) / WARP_SIZE;
-  const int nWarps = (blockDim.x * gridDim.x) / WARP_SIZE;
-
-  ncclBarrierSession<ncclCoopCta> bar { coop, ncclTeamTagWorld(), gin, barrierIndex };
-  bar.sync(coop, cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
-
-  uint64_t signalValue = gin.readSignal(kGinSignalIndex);
-  const uint64_t signalLeast = signalValue + static_cast<uint64_t>(world.nRanks - 1);
-
-  for (int r = warpId; r < world.nRanks; r += nWarps) {
-    if (r == rank) continue;
-    gin.put(world, r,
-        recvwin, recvoffset + static_cast<size_t>(rank) * chunkBytes,
-        sendwin, sendoffset + static_cast<size_t>(r) * chunkBytes,
-        chunkBytes,
-        ncclGin_SignalInc{kGinSignalIndex},
-        ncclGin_None{},
-        ncclCoopWarp{});
-  }
-  coop.sync();
-  if (!multiCta || blockIdx.x == 0) {
-    gin.flush(coop);
-  }
-  if (multiCta) {
-    __threadfence_system();
-    coop.sync();
-  }
-  gin.waitSignal(coop, kGinSignalIndex, signalLeast);
-  bar.sync(coop, cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+  GinBatchedAlltoAllExchange<T>(sendwin, sendoffset, recvwin, recvoffset, chunkBytes,
+      0, world.nRanks, world.nRanks - 1, devComm, barrierIndex);
 }
 
 // Large-message GIN exchange: clean frame by default; batched PR2 frame when
@@ -680,7 +638,9 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     const int nWarps = blockDim.x / WARP_SIZE;
     const bool fusedPutSignal = rsCtx != nullptr &&
         nccl::utility::loadConst(&rsCtx->fusedSdmaSignal) != 0 &&
-        nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0;
+        nccl::utility::loadConst(&rsCtx->sdmaOss7) != 0 &&
+        nccl::utility::loadConst(&rsCtx->signals) != nullptr &&
+        nccl::utility::loadConst(&rsCtx->signal_remote_addrs) != nullptr;
 
     for (int r = warpId; r < startLsa; r += nWarps) {
       if (fusedPutSignal) {
