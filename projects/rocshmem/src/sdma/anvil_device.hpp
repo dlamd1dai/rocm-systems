@@ -164,7 +164,9 @@ __device__ __forceinline__ SDMA_PKT_FENCE_64B_MI4 CreateFence64BPacketMI4(uint64
 #if SDMA_IS_OSS7
 // Runtime toggle for OSS7 MI4 SDMA packets on MI355 (default 1). Host sets via
 // NCCL_GIN_ANVIL_SDMA_OSS7 and hipMemcpyToSymbol from gin_plugin_anvil_sdma.cc.
-__device__ int gin_anvil_sdma_oss7_enabled = 1;
+// Defined once in ipc_policy.cpp (host + device bitcode); extern here to avoid
+// multiply-defined globals when this header is included from many TUs.
+extern __device__ int gin_anvil_sdma_oss7_enabled;
 
 __device__ __forceinline__ bool sdmaRuntimeOss7Enabled() {
   return gin_anvil_sdma_oss7_enabled != 0;

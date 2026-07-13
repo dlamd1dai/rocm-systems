@@ -309,3 +309,11 @@ __host__ void IpcSdmaImpl::ipcHostStop() {
 #endif  // USE_SDMA
 
 }  // namespace rocshmem
+
+#if defined(USE_SDMA) && SDMA_IS_OSS7
+namespace gin_anvil {
+namespace sdma {
+__device__ int gin_anvil_sdma_oss7_enabled = 1;
+}  // namespace sdma
+}  // namespace gin_anvil
+#endif
