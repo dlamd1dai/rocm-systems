@@ -36,6 +36,14 @@ if [[ -f "${_anvil_header}" ]]; then
   fi
 fi
 
+# ENABLE_ROCSHMEM_GIN: hipMemcpyToSymbol(HIP_SYMBOL(gin_anvil_sdma_oss7_enabled)) leaves an
+# unresolved host symbol in librccl.so and breaks alltoall_perf at dlopen (ddai-gin-perf.log).
+_anvil_plugin=projects/rccl/src/gin/gin_plugin_anvil_sdma.cc
+if [[ -f "${_anvil_plugin}" ]] && grep -q 'HIP_SYMBOL(gin_anvil::sdma::gin_anvil_sdma_oss7_enabled)' "${_anvil_plugin}"; then
+  echo "ERROR: ${_anvil_plugin} must not use HIP_SYMBOL(gin_anvil_sdma_oss7_enabled); use gpuCtxHost.sdmaOss7" >&2
+  _preflight_fail=1
+fi
+
 # Host Open MPI dev packages (libopenmpi-dev).  Docker image builds carry their own MPI;
 # the host only needs these for bare-metal mpirun or optional rocSHMEM unit suite F.
 # GIN_ANVIL_PREFLIGHT_MPI: skip | warn (default from gin-anvil-smci355-test.bash) | require

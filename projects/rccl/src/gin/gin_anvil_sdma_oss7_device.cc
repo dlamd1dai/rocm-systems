@@ -7,12 +7,12 @@
 #ifdef ENABLE_ROCSHMEM_GIN
 
 /**
- * Device OSS7 runtime toggle for GIN Anvil SDMA (NCCL_GIN_TYPE=5).
+ * Default device OSS7 toggle for shared anvil_device.hpp templates (put/putSignal).
  *
- * ENABLE_ROCSHMEM_GIN builds link only host GIN plugins into librccl.so; rocSHMEM
- * device globals live in librocshmem.a linked by the test binary. hipMemcpyToSymbol
- * from gin_plugin_anvil_sdma.cc still needs this symbol inside librccl.so or
- * dlopen fails before any test runs (undefined gin_anvil_sdma_oss7_enabled).
+ * RCCL runtime control of OSS7 MI4 fusion uses ncclGinAnvilSdmaGPUContext::sdmaOss7
+ * (see useSdmaFusedSignal in gin_anvil_sdma.h). This global defaults to enabled on
+ * gfx950; NCCL_GIN_ANVIL_SDMA_OSS7=0 is honored via the context field, not host
+ * hipMemcpyToSymbol (which would leave an unresolved host symbol in librccl.so).
  *
  * rocSHMEM keeps a weak definition in ipc_policy.cpp for standalone binaries.
  */

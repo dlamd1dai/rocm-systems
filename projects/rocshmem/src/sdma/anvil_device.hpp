@@ -162,10 +162,10 @@ __device__ __forceinline__ SDMA_PKT_FENCE_64B_MI4 CreateFence64BPacketMI4(uint64
 #endif  // SDMA_IS_OSS7
 
 #if SDMA_IS_OSS7
-// Runtime toggle for OSS7 MI4 SDMA packets on MI355 (default 1). Host sets via
-// NCCL_GIN_ANVIL_SDMA_OSS7 and hipMemcpyToSymbol from gin_plugin_anvil_sdma.cc.
-// Strong definition in librccl (gin_anvil_sdma_oss7_device.cc) for ENABLE_ROCSHMEM_GIN;
-// weak fallback in ipc_policy.cpp for standalone rocSHMEM binaries.
+// Compile-time default for OSS7 MI4 templates (gfx950). RCCL honors
+// NCCL_GIN_ANVIL_SDMA_OSS7 via ncclGinAnvilSdmaGPUContext::sdmaOss7 at the
+// fusion decision layer; librccl defines this global in gin_anvil_sdma_oss7_device.cc.
+// Weak fallback in ipc_policy.cpp for standalone rocSHMEM binaries.
 extern __device__ int gin_anvil_sdma_oss7_enabled;
 
 __device__ __forceinline__ bool sdmaRuntimeOss7Enabled() {

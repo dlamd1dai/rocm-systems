@@ -197,16 +197,6 @@ static uint32_t ginAnvilOss7FromEnv() {
   return atoi(e) != 0 ? 1u : 0u;
 }
 
-static void ginAnvilUploadSdmaOss7DeviceFlag(uint32_t enabled) {
-  int val = (int)enabled;
-  hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(gin_anvil::sdma::gin_anvil_sdma_oss7_enabled), &val,
-                                   sizeof(val));
-  if (err != hipSuccess) {
-    WARN("GIN anvil-sdma: hipMemcpyToSymbol(gin_anvil::sdma::gin_anvil_sdma_oss7_enabled) failed: %s",
-         hipGetErrorString(err));
-  }
-}
-
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,
                                     void** collComm) {
   auto* ictx = (ginAnvilInitCtx*)ctx;
@@ -540,8 +530,10 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* c
   ctx->gpuCtxHost.sdmaDirty = ctx->sdma_dirty_d;
   ctx->gpuCtxHost.sdmaThreshold = (uint32_t)ginAnvilSdmaThresholdFromEnv();
   ctx->gpuCtxHost.fusedSdmaSignal = ginAnvilFusedSignalFromEnv();
+  // OSS7 MI4 packet enable is carried in gpuCtxHost.sdmaOss7 (device context).
+  // Do not hipMemcpyToSymbol(HIP_SYMBOL(gin_anvil_sdma_oss7_enabled)): that creates
+  // a host-side undefined symbol in librccl.so and breaks dlopen of alltoall_perf.
   ctx->gpuCtxHost.sdmaOss7 = ginAnvilOss7FromEnv();
-  ginAnvilUploadSdmaOss7DeviceFlag(ctx->gpuCtxHost.sdmaOss7);
   ctx->gpuCtxHost.ipcAgentFence = ginAnvilIpcAgentFenceFromEnv();
   ctx->gpuCtxHost.ipcSignalPeer = ginAnvilIpcSignalPeerFromEnv();
   ctx->gpuCtxHost.signals = nullptr;
