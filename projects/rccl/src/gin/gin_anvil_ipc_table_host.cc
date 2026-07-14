@@ -9,14 +9,46 @@
 #include "nccl_device/gin/anvil_sdma/gin_anvil_ipc_table.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
+
+static bool ipcDebugEnabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = std::getenv("NCCL_GIN_ANVIL_IPC_DEBUG");
+    cached = (e && e[0] && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+  }
+  return cached != 0;
+}
+
+static void logIpcEntry(const char* action, const ncclGinAnvilIpcBufEntry* entry, int nRanks) {
+  if (!ipcDebugEnabled() || entry == nullptr) return;
+  std::fprintf(stderr,
+               "[gin-anvil-ipc] %s local_base=0x%lx length=%zu (nRanks=%d)\n", action,
+               static_cast<unsigned long>(entry->local_base), entry->length, nRanks);
+  const int limit = nRanks < NCCL_GIN_ANVIL_IPC_MAX_RANKS ? nRanks : NCCL_GIN_ANVIL_IPC_MAX_RANKS;
+  for (int pe = 0; pe < limit; ++pe) {
+    std::fprintf(stderr, "[gin-anvil-ipc]   peer[%d] remote_base=0x%lx\n", pe,
+                 static_cast<unsigned long>(entry->remote_bases[pe]));
+  }
+}
 
 ncclGinAnvilIpcBufEntry masterEntries[NCCL_GIN_ANVIL_IPC_MAX_BUFS];
 int masterEntryCount = 0;
 
 ncclGinAnvilIpcBufEntry* d_ipcTable = nullptr;
 int d_ipcTableCount = 0;
+
+static void logIpcTableSnapshot(const char* action) {
+  if (!ipcDebugEnabled()) return;
+  std::fprintf(stderr, "[gin-anvil-ipc] %s table_count=%d d_ipcTable=%p\n", action, masterEntryCount,
+               static_cast<void*>(d_ipcTable));
+  for (int i = 0; i < masterEntryCount; ++i) {
+    logIpcEntry("entry", &masterEntries[i], NCCL_GIN_ANVIL_IPC_MAX_RANKS);
+  }
+}
 
 struct LiveGpuContext {
   ncclGinAnvilSdmaGPUContext* hostCtx;
@@ -59,6 +91,7 @@ static int syncTableToDevice() {
   if (err != hipSuccess) return -1;
   d_ipcTableCount = count;
   refreshAllLiveContexts();
+  logIpcTableSnapshot("syncTableToDevice");
   return 0;
 }
 
@@ -103,6 +136,12 @@ extern "C" void ncclGinAnvilIpcTableTrackContext(ncclGinAnvilSdmaGPUContext* hos
   hostCtx->ipcTable = d_ipcTable;
   hostCtx->ipcTableCount = d_ipcTableCount;
   (void)hipMemcpy(devCtx, hostCtx, sizeof(ncclGinAnvilSdmaGPUContext), hipMemcpyHostToDevice);
+  if (ipcDebugEnabled()) {
+    std::fprintf(stderr,
+                 "[gin-anvil-ipc] TrackContext hostCtx=%p devCtx=%p ipcTable=%p ipcTableCount=%d\n",
+                 static_cast<void*>(hostCtx), static_cast<void*>(devCtx),
+                 static_cast<void*>(d_ipcTable), d_ipcTableCount);
+  }
 }
 
 extern "C" void ncclGinAnvilIpcTableUntrackContext(ncclGinAnvilSdmaGPUContext* hostCtx) {
@@ -128,6 +167,12 @@ extern "C" int ncclGinAnvilIpcTableRegisterVmm(void* localBase, size_t length, i
   entry.length = length;
   for (int pe = 0; pe < nRanks; pe++) {
     entry.remote_bases[pe] = entry.local_base + static_cast<ptrdiff_t>(pe - myRank) * strideBytes;
+  }
+  if (ipcDebugEnabled()) {
+    std::fprintf(stderr,
+                 "[gin-anvil-ipc] RegisterVmm localBase=%p length=%zu myRank=%d nRanks=%d stride=%td\n",
+                 localBase, length, myRank, nRanks, static_cast<ptrdiff_t>(strideBytes));
+    logIpcEntry("RegisterVmm", &entry, nRanks);
   }
   return addEntry(&entry);
 }
