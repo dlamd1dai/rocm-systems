@@ -7,6 +7,7 @@
 #ifndef _NCCL_DEVICE_GIN_ANVIL_SDMA_DEVICE_HOST_COMMON_H_
 #define _NCCL_DEVICE_GIN_ANVIL_SDMA_DEVICE_HOST_COMMON_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 struct ncclGinAnvilIpcBufEntry;
@@ -20,13 +21,16 @@ struct ncclGinAnvilIpcBufEntry;
  *  larger transfers use direct Anvil SDMA. */
 #define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
 
-/** Default off: fused OSS7 copy+signal needs remote GPU signal VA; opt-in via env on MI355. */
-#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 0u
+/** Default on (OSS7): fused COPY_LINEAR_WAIT_SIGNAL_MI4 for large SDMA puts with SignalInc. */
+#define NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT 1u
 
 /** SDMA COPY_LINEAR chunk size (bytes) for Anvil queues. Env:
  *  NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK or ANVIL_SDMA_MAX_COPY_CHUNK.
  *  0 disables chunking. When unset on xGMI-capable GPUs, Anvil defaults to 4096. */
 #define NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK_DEFAULT_XGMI 4096u
+
+/** MI355X/gfx950: legacy SDMA COPY_LINEAR per doorbell is reliable up to this size. */
+#define NCCL_GIN_ANVIL_HW_PUT_CHUNK_LIMIT 8192u
 
 struct ncclGinAnvilSdmaGPUContext {
   uint32_t layoutMagic;  // NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC
@@ -43,12 +47,17 @@ struct ncclGinAnvilSdmaGPUContext {
   int numChannels;
   int sdmaChannel;
   int sdmaChannelStride;
-  const ncclGinAnvilIpcBufEntry* ipcTable;  // device pointer; peer VA lookup for IPC puts
+  const ncclGinAnvilIpcBufEntry* ipcTable;  // device pointer; fallback peer VA lookup
   int ipcTableCount;
+  uintptr_t* signal_remote_addrs;  // [nRanks] peer signal region bases (GDA signal_raddrs pattern)
+  uint32_t ipcAgentFence;  // 0=__threadfence_system on IPC (default), 1=agent-scope release
+  uint32_t ipcSignalPeer;  // 1=shader IPC atomic signalPeer, 0=SDMA ATOMIC packet (default)
 };
 
 struct ncclGinAnvilSdmaMemHandle {
-  uintptr_t baseAddr;  // Symmetric LSA flat VA; peer resolved via ginAnvilResolvePeerVa
+  uintptr_t baseAddr;       // Symmetric LSA flat VA for this rank
+  uintptr_t* remote_vas;    // [nRanks] precomputed peer VAs (GDA remote_vas pattern)
+  ptrdiff_t vmmStride;      // LSA VMM stride; O(1) peer VA when non-zero
 };
 
 #endif
