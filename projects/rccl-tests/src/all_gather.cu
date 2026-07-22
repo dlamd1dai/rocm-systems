@@ -1,3 +1,4 @@
+
 /*************************************************************************
  * Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
  * Modifications Copyright (c) 2019-2022 Advanced Micro Devices, Inc. All rights reserved.
@@ -48,7 +49,7 @@ testResult_t  AllGatherGetAlgoProtoChannels(ncclComm_t comm, size_t count, ncclD
 
 testResult_t  AllGatherGetSymkInfo(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op, int* algo, int* proto, int* nchannels) {
   if(rcclTestsGetSymkInfo == NULL) return testInternalError;
-  NCCLCHECK(rcclTestsGetSymkInfo(comm, ncclFuncAllGather , count, type , op, algo, proto, nchannels));
+  NCCLCHECK(rcclTestsGetSymkInfo(comm, ncclFunc_t::ncclFuncAllGather , count, type , op, algo, proto, nchannels));
   return testSuccess;
 }
 
@@ -65,12 +66,13 @@ testResult_t AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
   if (!reqs || !commProperties) return testInternalError;
 
   switch(deviceImpl) {
-    case 3: // GinAllGatherKernel: all CTAs participate, one barrier per CTA
+    case 3: { // GinHybridAllGatherKernel: LSA direct (small) + direct GIN puts (large)
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
       reqs->barrierCount = deviceCtaCount;
+      reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -78,6 +80,7 @@ testResult_t AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
       reqs->ginForceEnable = true;
 #endif
       return testSuccess;
+    }
     default:
       return testNotImplemented;
   }
@@ -89,8 +92,9 @@ bool AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
 
   switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-    case 3: // GinAllGatherKernel: all CTAs, one barrier per CTA
+    case 3: // GinHybridAllGatherKernel: LSA direct (small) + direct GIN puts (large)
       reqs->barrierCount = deviceCtaCount;
+      reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
       return true;
 #endif
@@ -102,26 +106,58 @@ bool AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+#ifndef NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT
+#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
+#endif
+
 template <typename T>
-__global__ void GinAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  int ginContext = 0;
-  unsigned int signalIndex = 0;
+__device__ void AllGatherLsaDirect(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
+  T* src = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+  const size_t dstOff = (size_t)rank * count;
+  for (size_t i = tid; i < count; i += nthreads) {
+    T value = src[i];
+    for (int lp = 0; lp < nRanks; lp++) {
+      T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset, lp) + dstOff;
+      dst[i] = value;
+    }
+  }
+}
+
+// Single-node hybrid AllGather (-D 3):
+//   chunkBytes <= sdmaThreshold: direct LSA (all CTAs).
+//   chunkBytes >  sdmaThreshold: direct all-peers GIN puts (proven MI355X path).
+template <typename T>
+__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+  const size_t chunkBytes = count * sizeof(T);
+
+  if (chunkBytes <= NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT) {
+    ncclTeam lsa = ncclTeamLsa(devComm);
+    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nthreads = blockDim.x * gridDim.x;
+
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    AllGatherLsaDirect<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm.rank, devComm.nRanks, tid, nthreads);
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    return;
+  }
+
+  const int ginContext = 0;
+  const unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
-  uint64_t signalValue = gin.readSignal(signalIndex);
+  const uint64_t signalValue = gin.readSignal(signalIndex);
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
-  int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int nthreads = blockDim.x * gridDim.x;
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
 
-  /* broadcast this rank's send slice to all peers' recv slot [rank] */
-  const size_t size = count * sizeof(T);
   for (int r = tid; r < devComm.nRanks; r += nthreads) {
     gin.put(ncclTeamWorld(devComm), r,
-        recvwin, recvoffset + devComm.rank * size,
+        recvwin, recvoffset + (size_t)devComm.rank * chunkBytes,
         sendwin, sendoffset,
-        size, ncclGin_SignalInc{signalIndex});
+        chunkBytes, ncclGin_SignalInc{signalIndex});
   }
 
   gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
@@ -139,7 +175,7 @@ testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
 #endif
       default:
