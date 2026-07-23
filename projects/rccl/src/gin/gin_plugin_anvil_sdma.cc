@@ -180,7 +180,12 @@ static int ginAnvilEnvInt(const char* name, int defaultVal) {
 }
 
 static int ginAnvilSdmaThresholdFromEnv() {
-  return ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_THRESHOLD", (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
+  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
+  if (e && e[0]) {
+    int v = atoi(e);
+    if (v >= 0) return v;
+  }
+  return (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
 }
 
 static int ginAnvilSdmaNumChannelsFromEnv() {
