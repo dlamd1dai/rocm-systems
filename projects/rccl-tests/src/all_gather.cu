@@ -10,6 +10,7 @@
 #include "common.h"
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include "rccl_vector_types.h"
 #endif
 
@@ -106,9 +107,19 @@ bool AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-#ifndef NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT
-#define NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT 128u
-#endif
+__device__ size_t AllGatherGetSdmaThreshold(struct ncclDevComm const& devComm) {
+  using nccl::utility::loadConst;
+  if (devComm.ginConnectionCount == 0 || devComm.ginHandles[0] == nullptr) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[0];
+  if (rsCtx == nullptr ||
+      loadConst(&rsCtx->layoutMagic) != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  return loadConst(&rsCtx->sdmaThreshold);
+}
 
 template <typename T>
 __device__ void AllGatherLsaDirect(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
@@ -129,8 +140,9 @@ __device__ void AllGatherLsaDirect(ncclWindow_t sendwin, size_t sendoffset, nccl
 template <typename T>
 __global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   const size_t chunkBytes = count * sizeof(T);
+  const size_t sdmaThreshold = AllGatherGetSdmaThreshold(devComm);
 
-  if (chunkBytes <= NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT) {
+  if (chunkBytes <= sdmaThreshold) {
     ncclTeam lsa = ncclTeamLsa(devComm);
     const int tid = threadIdx.x + blockIdx.x * blockDim.x;
     const int nthreads = blockDim.x * gridDim.x;
