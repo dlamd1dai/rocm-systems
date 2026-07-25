@@ -146,10 +146,17 @@ __device__ void BroadcastLsaDirect(ncclWindow_t sendwin, size_t sendoffset, nccl
 //   msgBytes >  sdmaThreshold: root issues one GIN put per non-self peer
 //                              (Anvil picks IPC or SDMA by size).
 // Non-root ranks only participate in the entry/exit barriers.
+//
+// sdmaThresholdOverride lets the Broadcast-specific env var
+// NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST tune this LSA<->GIN cutover
+// independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
+// value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
   const size_t msgBytes = count * sizeof(T);
-  const size_t sdmaThreshold = BroadcastGetSdmaThreshold(devComm);
+  const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
+                                   ? sdmaThresholdOverride
+                                   : BroadcastGetSdmaThreshold(devComm);
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const int nthreads = blockDim.x * gridDim.x;
 
@@ -225,9 +232,16 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   } else {
     switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-      case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      case 3: {
+        // Broadcast-specific LSA<->GIN threshold. Default = 256 KiB (full
+        // message): on 8x MI355X (NCCL_GIN_TYPE=6) LSA wins <=256K and GIN wins
+        // >=512K (measured 2026-07-24). Override with
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST, or the shared
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
+        static const size_t bcastThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST", (size_t)262144);
+        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr));
         return testSuccess;
+      }
 #endif
       default:
         return testNotImplemented;
