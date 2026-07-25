@@ -137,10 +137,17 @@ __device__ void AllGatherLsaDirect(ncclWindow_t sendwin, size_t sendoffset, nccl
 // Single-node hybrid AllGather (-D 3):
 //   chunkBytes <= sdmaThreshold: direct LSA (all CTAs).
 //   chunkBytes >  sdmaThreshold: direct all-peers GIN puts (proven MI355X path).
+//
+// sdmaThresholdOverride lets the AllGather-specific env var
+// NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER tune this LSA<->GIN cutover
+// independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
+// value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
   const size_t chunkBytes = count * sizeof(T);
-  const size_t sdmaThreshold = AllGatherGetSdmaThreshold(devComm);
+  const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
+                                   ? sdmaThresholdOverride
+                                   : AllGatherGetSdmaThreshold(devComm);
 
   if (chunkBytes <= sdmaThreshold) {
     ncclTeam lsa = ncclTeamLsa(devComm);
@@ -186,9 +193,17 @@ testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   } else {
     switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-      case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      case 3: {
+        // AllGather-specific LSA<->GIN threshold. Compared against the per-rank
+        // chunk (count*sizeof(T)). Default = 256 KiB/rank: on 8x MI355X
+        // (NCCL_GIN_TYPE=6) LSA wins for a chunk <=256K (total <=2M) and GIN
+        // wins >=512K/rank (total >=4M) (measured 2026-07-24). Override with
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER, or the shared
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
+        static const size_t agThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", (size_t)262144);
+        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr));
         return testSuccess;
+      }
 #endif
       default:
         return testNotImplemented;

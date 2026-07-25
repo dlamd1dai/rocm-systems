@@ -22,6 +22,7 @@
 #endif
 #include <stdio.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #ifdef MPI_SUPPORT
@@ -411,6 +412,44 @@ static int ncclstringtomtype (char *str) {
 extern int is_main_proc;
 extern thread_local int is_main_thread;
 
+// Sentinel meaning "no per-collective override; use the device/backend value
+// (i.e. rsCtx->sdmaThreshold, populated from NCCL_GIN_ANVIL_SDMA_THRESHOLD)".
+#define TEST_SDMA_THRESHOLD_UNSET ((size_t)-1)
+
+// Parse a per-collective LSA<->GIN threshold env var (bytes; optional K/M/G
+// suffix). Returns TEST_SDMA_THRESHOLD_UNSET when unset/empty/unparseable so
+// the kernel falls back to the shared NCCL_GIN_ANVIL_SDMA_THRESHOLD value.
+static inline size_t testParseSdmaThresholdEnv(const char* name) {
+  const char* v = getenv(name);
+  if (v == NULL || v[0] == '\0') return TEST_SDMA_THRESHOLD_UNSET;
+  char* end = NULL;
+  unsigned long long val = strtoull(v, &end, 10);
+  if (end == v) return TEST_SDMA_THRESHOLD_UNSET;
+  if (end && *end) {
+    switch (*end) {
+      case 'k': case 'K': val *= 1024ULL; break;
+      case 'm': case 'M': val *= 1024ULL * 1024ULL; break;
+      case 'g': case 'G': val *= 1024ULL * 1024ULL * 1024ULL; break;
+      default: break;
+    }
+  }
+  return (size_t)val;
+}
+
+// Resolve a collective's LSA<->GIN threshold with the fallback chain:
+//   1. the collective-specific env var (collVar), if set;
+//   2. the shared NCCL_GIN_ANVIL_SDMA_THRESHOLD, if explicitly set (keeps the
+//      global force knob, e.g. BC-D4's THRESHOLD=0, working);
+//   3. the collective's data-driven default (collDefault).
+// Always returns a concrete value, so callers pass it straight to the kernel.
+static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDefault) {
+  size_t v = testParseSdmaThresholdEnv(collVar);
+  if (v != TEST_SDMA_THRESHOLD_UNSET) return v;
+  v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
+  if (v != TEST_SDMA_THRESHOLD_UNSET) return v;
+  return collDefault;
+}
+
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 template <typename F>
 testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
@@ -420,6 +459,20 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
   kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
+  return testSuccess;
+}
+
+// Variant that passes a per-collective LSA<->GIN threshold override as the last
+// kernel argument. Used by AllGather/Broadcast GIN kernels; AlltoAll keeps the
+// base launcher (its LSA-vs-GIN split is topology-based, not size-based).
+template <typename F>
+testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride);
   return testSuccess;
 }
 
@@ -439,6 +492,10 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
 #else
 template <typename F>
 testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
