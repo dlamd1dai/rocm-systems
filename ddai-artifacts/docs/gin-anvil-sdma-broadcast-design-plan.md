@@ -101,7 +101,7 @@ On single-node xGMI with `NCCL_GIN_TYPE=6`:
 
 | Message size | Active rank(s) | Path |
 |--------------|----------------|------|
-| ≤ `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (128 B default) | **root only** | LSA direct stores to every peer’s `recvbuff` |
+| ≤ broadcast LSA↔GIN threshold (**256 KiB default**, see §4.3.1) | **root only** | LSA direct stores to every peer’s `recvbuff` |
 | > threshold | **root only** | One-round **`gin.put` to all non-self peers**; Anvil picks IPC (≤ threshold) or SDMA (> threshold) |
 | all ranks | all | Entry world/LSA barrier; **non-roots complete via receiver-side `waitSignal(+1)`** (see §4.4) |
 
@@ -296,9 +296,25 @@ Root-put is the conservative, proven choice. Pull-broadcast is a future optimiza
 
 ### 4.3 Why hybrid LSA + GIN (not always GIN)
 
-AllGather MI355X data shows a **~7 µs → ~22 µs cliff** at the 128 B threshold when crossing from LSA to GIN setup. Broadcast small messages are typically latency-bound; LSA peer stores avoid GIN session/signal/flush overhead.
+AllGather MI355X data shows a **~7 µs → ~22 µs cliff** when crossing from LSA to GIN setup. Broadcast small/medium messages are latency-bound; LSA peer stores avoid GIN session/signal/flush overhead, and LSA stays ahead until the message is large enough that root-outbound SDMA bandwidth beats SM-store bandwidth.
 
-One env var (`NCCL_GIN_ANVIL_SDMA_THRESHOLD`) controls both the **kernel branch** and **`gin.put` IPC vs SDMA split**, same as AllGather — no new tuning surface.
+The shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` still controls the backend **`gin.put` IPC vs SDMA split** (per put, in `gin_anvil_sdma.h`) for every collective. The **kernel LSA↔GIN branch** in the rccl-tests kernels, however, is now tunable **per collective** so each can sit at its own measured crossover.
+
+#### 4.3.1 Per-collective LSA↔GIN threshold and defaults (rccl-tests)
+
+`broadcast.cu` and `all_gather.cu` resolve their kernel branch threshold host-side with the chain (`testResolveSdmaThreshold`, `common.h`):
+
+1. the collective-specific env var, if set;
+2. the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD`, if explicitly set (keeps the global force knob — e.g. **BC-D4** `THRESHOLD=0` → all-GIN — working);
+3. the collective's data-driven **default**.
+
+| Collective | Env var | Compared against | Default | Basis (8× MI355X, `NCCL_GIN_TYPE=6`, 2026-07-24) |
+|---|---|---|---|---|
+| Broadcast | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST` | full `msgBytes` | **262144 (256 KiB)** | LSA wins ≤256K (256K: 22.8 µs vs GIN 29.9); GIN wins ≥512K (512K: 34.0 µs vs LSA 39.2; 128M: 60.6 vs 17.0 GB/s) |
+| AllGather | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | per-rank `chunkBytes` (= total/nRanks) | **262144 (256 KiB/rank)** | LSA wins ≤256K/rank i.e. ≤2M total (2M: 22.6 µs vs GIN 32.3); GIN wins ≥512K/rank i.e. ≥4M total (4M: 36.5 µs vs LSA 38.0; 128M: 388 vs 129 GB/s) |
+| AlltoAll | *(none)* | — | — | LSA↔GIN split is **topology-based** (intra-node LSA vs inter-node GIN), not size-based; uses only the shared var for the backend IPC/SDMA split |
+
+Values are bytes with an optional `K`/`M`/`G` suffix. The Anvil backend is unchanged (no GIN ABI change): the per-collective value is read in `RunColl` and passed to the kernel as an extra launch argument (`testLaunchDeviceKernelThreshold`).
 
 ### 4.4 Synchronization model
 
