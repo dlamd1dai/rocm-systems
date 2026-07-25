@@ -1,51 +1,50 @@
 #!/usr/bin/env bash
-# GIN Anvil SDMA AllGather gate + smoke (docker or bare-metal).
-# Primary SUT: smci355-ccs-aus-m03-17 (MI355X, ~/rocm-systems). Also validated on smci350 (MI350X).
+# GIN Anvil SDMA Broadcast gate + smoke (docker or bare-metal).
+# Primary SUT: smci355-ccs-aus-m03-17 (MI355X, ~/rocm-systems). Mirrors gin-sdma-ag-test.bash.
 #
-# Usage: ./gin-anvil-allgather-test.bash [NP] [MAX_BYTES]
+# Usage: ./gin-sdma-bcast-test.bash [NP] [MAX_BYTES]
 #   NP         default 8 (formal gate); use 2 or 4 for smoke
-#   MAX_BYTES  default 128M (max total gathered size for AG-C2/C3)
+#   MAX_BYTES  default 128M (max broadcast size for BC-C2)
 #
-# Checks (order: AG-C1 → AG-C2 → AG-C3; AG-C1 runs first to avoid GPU state
-# contamination from rocSHMEM fcollect):
-#   AG-C1  Host-initiated ncclAllGather       (all_gather_perf -D 0, -R 0)
-#          Full range by default (no 64M cap): earlier images faulted >64M only because the
-#          AllGather ring device kernel was absent (ncclDevFuncId not found for coll:2); the
-#          image now ships it via ONLY_FUNCS="...|AllGather". Note >64M no longer uses the
-#          rcclDirectAllGather fast path, so busbw drops to the ring kernel rate.
-#          Always NCCL_CUMEM_ENABLE=0 (matches docker-gin-gda-sdma-test.bash Test#1).
-#   AG-C2  GIN hybrid AllGather (-D 3, NCCL_GIN_TYPE=6)
-#   AG-C3  rocSHMEM team fcollect cross-check  (rocshmem_functional_tests -a teamfcollect)
+# Checks (order: BC-C1 -> BC-C2; BC-C1 host baseline runs first):
+#   BC-C1  Host-initiated ncclBroadcast          (broadcast_perf -D 0, -R 0)
+#          Always NCCL_CUMEM_ENABLE=0 (matches AllGather AG-C1 / docker Test#1).
+#          Requires broadcast host device kernels: the image includes them via
+#          ONLY_FUNCS="...|Broadcast" (Dockerfile / docker-gin-gda-sdma-build.bash). On an RCCL
+#          build without them it fails "ncclDevFuncId ... not found for coll:0"; disable with
+#          RUN_HOST_BASELINE=0 in that case.
+#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=6), root sweep (-r all by default)
 #
-# Full gate (default): AG-C1 + AG-C2 + AG-C3 — all fatal on failure.
-# Skip sections: RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0, RUN_FCOLLECT=0
+# Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4):
+#   flat/star fan-out from root; non-roots complete via receiver-side waitSignal(+1).
 #
-# mi350 AG-C3 @ 128M may segfault — GIN-only gate: RUN_FCOLLECT=0 ./gin-anvil-allgather-test.bash 8 128M
-# Enable GPU reset if needed: GPU_RESET_BEFORE_TEST=1
-# AG-C1 only: RUN_GIN_SDMA=0 RUN_FCOLLECT=0 ./gin-anvil-allgather-test.bash 8 128M
+# Full gate (default): BC-C1 + BC-C2 (both fatal on failure).
+# Skip sections:   RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0
+# All-SDMA (BC-D4): NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RUN_HOST_BASELINE=0 ./gin-sdma-bcast-test.bash 8 128M
+# Single root:     ROOT=0 ./gin-sdma-bcast-test.bash 8 128M
+# GPU reset first: GPU_RESET_BEFORE_TEST=1
 
 set -euo pipefail
 
 NP="${1:-8}"
 MAX_BYTES="${2:-128M}"
 MIN_BYTES="${MIN_BYTES:-128}"
-# Host ncclAllGather runs the full size range now that the AllGather ring kernel is built
-# (ONLY_FUNCS includes AllGather); AG-C1 sweeps the same range as AG-C2 by default.
+# Host broadcast runs at full size on MI355X (validated to 256M), so BC-C1 sweeps the same
+# range as BC-C2 by default. There is no 64M host cap (that was an AllGather-specific limit).
 HOST_MAX_BYTES="${HOST_MAX_BYTES:-${MAX_BYTES}}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
-HOST_RANKS="${HOST_RANKS:-0}"
-GIN_RANKS="${GIN_RANKS:-2}"
-DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-1}"
+HOST_RANKS="${HOST_RANKS:-0}"     # -R register mode for host path (0 = none)
+GIN_RANKS="${GIN_RANKS:-2}"       # -R register mode for GIN path (2 = symmetric, REQUIRED for -D 3)
+DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-8}"
+ROOT="${ROOT:-all}"               # broadcast root: 'all' sweeps 0..NP-1, or pin an integer
+FACTOR="${FACTOR:-2}"
 
 _HOST="$(hostname -s 2>/dev/null || hostname)"
 
-# RCCL / all_gather_perf MPI (matches docker-gin-gda-sdma-test.bash Test#5)
+# RCCL / *_perf MPI (matches docker-gin-gda-sdma-test.bash Test#5)
 MPI_OPT_RCCL="${MPI_OPT_RCCL:---allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none}"
-
-# rocSHMEM functional tests need ^openib (self,vader,tcp breaks MPI_Win_create)
-MPI_OPT_ROCSHMEM="${MPI_OPT_ROCSHMEM:---allow-run-as-root -mca pml ob1 -mca btl ^openib}"
 
 _parse_size_to_bytes() {
   local s="$1" n u
@@ -65,9 +64,8 @@ _parse_size_to_bytes() {
 
 MAX_BYTES_INT="$(_parse_size_to_bytes "${MAX_BYTES}")"
 HOST_MAX_BYTES_INT="$(_parse_size_to_bytes "${HOST_MAX_BYTES}")"
-MIN_BYTES_INT="$(_parse_size_to_bytes "${MIN_BYTES}")"
 
-# AG-C1 sweep: min(HOST_MAX_BYTES, MAX_BYTES).
+# BC-C1 sweep: min(HOST_MAX_BYTES, MAX_BYTES).
 HOST_MAX_BYTES_EFFECTIVE_INT="${HOST_MAX_BYTES_INT}"
 if [[ "${MAX_BYTES_INT}" -lt "${HOST_MAX_BYTES_EFFECTIVE_INT}" ]]; then
   HOST_MAX_BYTES_EFFECTIVE_INT="${MAX_BYTES_INT}"
@@ -89,20 +87,14 @@ HOST_MAX_BYTES_EFFECTIVE="$(_format_bytes "${HOST_MAX_BYTES_EFFECTIVE_INT}")"
 
 ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD:-${MAX_BYTES_INT}}"
 HOST_ROCSHMEM_THRESHOLD="${HOST_ROCSHMEM_THRESHOLD:-${HOST_MAX_BYTES_EFFECTIVE_INT}}"
-ALL_GATHER_PERF="${ALL_GATHER_PERF:-rccl-tests/all_gather_perf}"
-FCOLLECT_BIN="${FCOLLECT_BIN:-/opt/rocm/core-7.13/bin/rocshmem_functional_tests}"
-FCOLLECT_ALGO="${FCOLLECT_ALGO:-teamfcollect}"
-FCOLLECT_WGS="${FCOLLECT_WGS:-1}"
-FCOLLECT_WG_SIZE="${FCOLLECT_WG_SIZE:-64}"
-FCOLLECT_MAX_VOL="${FCOLLECT_MAX_VOL:-${MAX_BYTES_INT}}"
-FCOLLECT_MAX_MSG="${FCOLLECT_MAX_MSG:-$((FCOLLECT_MAX_VOL / NP / FCOLLECT_WGS))}"
+BROADCAST_PERF="${BROADCAST_PERF:-rccl-tests/broadcast_perf}"
 
+# BC-C1 host baseline (perf reference) is on by default now that the image ships broadcast
+# host kernels (ONLY_FUNCS includes Broadcast). Set RUN_HOST_BASELINE=0 to skip it.
 RUN_HOST_BASELINE="${RUN_HOST_BASELINE:-1}"
 RUN_GIN_SDMA="${RUN_GIN_SDMA:-1}"
-RUN_FCOLLECT="${RUN_FCOLLECT:-1}"
 
-# Optional GPU reset before gate (off by default). Enable with GPU_RESET_BEFORE_TEST=1
-# after hung GIN/fcollect runs leave GPUs in a bad state for AG-C1.
+# Optional GPU reset before gate (off by default). Enable with GPU_RESET_BEFORE_TEST=1.
 GPU_RESET_BEFORE_TEST="${GPU_RESET_BEFORE_TEST:-0}"
 
 DOCKER_GPU="--rm --init --ulimit memlock=-1:-1 --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged"
@@ -110,6 +102,7 @@ if getent group rdma >/dev/null 2>&1; then
   DOCKER_GPU+=" --group-add rdma"
 fi
 
+# GIN Anvil SDMA env (matches AllGather AG-C2 / docker Test#5).
 MPI_BASE=(
   -x OMPI_ALLOW_RUN_AS_ROOT=1
   -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -126,7 +119,7 @@ MPI_BASE=(
   -x HSA_NO_SCRATCH_RECLAIM=1
 )
 
-# Host ncclAllGather (-D 0): no GIN/Anvil SDMA env; intranet/xGMI only.
+# Host ncclBroadcast (-D 0): no GIN/Anvil SDMA env; intranet/xGMI only.
 MPI_BASE_HOST=(
   -x OMPI_ALLOW_RUN_AS_ROOT=1
   -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
@@ -212,45 +205,40 @@ _maybe_gpu_reset_before_gate() {
   _gpu_reset "GPU reset before gate (GPU_RESET_BEFORE_TEST=1)"
 }
 
-AG_C1_STATUS="skipped"
+BC_C1_STATUS="skipped"
 
-echo "AllGather gate: NP=${NP} host=${_HOST}"
+echo "Broadcast gate: NP=${NP} host=${_HOST} root=${ROOT}"
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "  AG-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (NCCL_CUMEM_ENABLE=0)"
+  echo "  BC-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (NCCL_CUMEM_ENABLE=0)"
 else
-  echo "  AG-C1 host:  skipped (RUN_HOST_BASELINE=0)"
+  echo "  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "  AG-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, CTAs=${DEVICE_CTA_COUNT})"
+  echo "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, CTAs=${DEVICE_CTA_COUNT}, THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-128})"
 else
-  echo "  AG-C2 gin:   skipped (RUN_GIN_SDMA=0)"
-fi
-if [[ "${RUN_FCOLLECT}" != "0" ]]; then
-  echo "  AG-C3 fcol:  ${MIN_BYTES} .. ${MAX_BYTES} (teamfcollect)"
-else
-  echo "  AG-C3 fcol:  skipped (RUN_FCOLLECT=0)"
+  echo "  BC-C2 gin:   skipped (RUN_GIN_SDMA=0)"
 fi
 
 if [[ "${MAX_BYTES_INT}" -lt $((1024 * 1024)) ]]; then
-  echo "WARN: MAX_BYTES=${MAX_BYTES} (<1M) — AG-C2 will not reach GIN SDMA ring path (chunk >128 B); use 128M for full gate"
+  echo "WARN: MAX_BYTES=${MAX_BYTES} (<1M) — BC-C2 mostly exercises the LSA/GIN-setup floor; use 128M for full SDMA path"
 fi
 
 _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
 
-# --- AG-C1: host-initiated ncclAllGather (-D 0, no GIN); runs first (hard gate) ---
+# --- BC-C1: host-initiated ncclBroadcast (-D 0, no GIN); runs first (hard gate) ---
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "AG-C1: host ncclAllGather -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS})"
+  echo "BC-C1: host ncclBroadcast -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS}, -r ${ROOT})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE_HOST[@]}" \
-    "${ALL_GATHER_PERF}" -b "${MIN_BYTES}" -e "${HOST_MAX_BYTES_EFFECTIVE}" -f 2 -g 1 -R "${HOST_RANKS}" -D 0 -A 1 -V 1
-  AG_C1_STATUS="passed"
+    "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${HOST_MAX_BYTES_EFFECTIVE}" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 -r "${ROOT}"
+  BC_C1_STATUS="passed"
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
-# --- AG-C2: GIN hybrid AllGather kernel (-D 3, NCCL_GIN_TYPE=6) ---
+# --- BC-C2: GIN hybrid Broadcast kernel (-D 3, NCCL_GIN_TYPE=6) ---
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "AG-C2: GIN hybrid AllGather -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT})"
+  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, -r ${ROOT})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none \
@@ -259,32 +247,11 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=6 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS:-1}" \
     -x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-128}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    "${ALL_GATHER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -A 1 -C 0
+    "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -r "${ROOT}"
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
-# --- AG-C3: rocSHMEM fcollect (runs last; may leave GPUs in bad state for a follow-up AG-C1) ---
-if [[ "${RUN_FCOLLECT}" != "0" ]]; then
-  if [[ "${USE_DOCKER}" == "1" ]] || [[ -x "${FCOLLECT_BIN}" ]]; then
-    echo "AG-C3: rocSHMEM teamfcollect NP=${NP}, max total vol=${MAX_BYTES} (per-rank msg max=${FCOLLECT_MAX_MSG} B)"
-    _run mpirun -n "${NP}" ${MPI_OPT_ROCSHMEM} \
-      -x OMPI_ALLOW_RUN_AS_ROOT=1 \
-      -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
-      -x ROCSHMEM_BACKEND=ipc \
-      -x ROCSHMEM_DISABLE_MIXED_IPC=1 \
-      -x ROCSHMEM_DEBUG_LEVEL=info:noversion \
-      "${FCOLLECT_BIN}" \
-      -a "${FCOLLECT_ALGO}" \
-      -w "${FCOLLECT_WGS}" \
-      -z "${FCOLLECT_WG_SIZE}" \
-      -s "${FCOLLECT_MAX_MSG}" \
-      -v "${FCOLLECT_MAX_VOL}"
-  else
-    echo "skip: rocSHMEM fcollect (${FCOLLECT_BIN} not found; set FCOLLECT_BIN or USE_DOCKER=1)"
-  fi
-fi
-
-echo "PASS: gin-anvil-allgather-test np=${NP} AG-C1=${AG_C1_STATUS} AG-C2/C3=${MIN_BYTES}..${MAX_BYTES}"
+echo "PASS: gin-sdma-bcast-test np=${NP} root=${ROOT} BC-C1=${BC_C1_STATUS} BC-C2=${MIN_BYTES}..${MAX_BYTES}"

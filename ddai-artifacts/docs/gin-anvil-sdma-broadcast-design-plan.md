@@ -1,7 +1,7 @@
 # GIN-SDMA Broadcast on xGMI: Design Proposal
 
 **Document type:** Internal AMD planning
-**Status:** Draft — design proposal (updated 2026-07-24)
+**Status:** Implemented & validated in `broadcast_perf -D 3` (rev. 2026-07-24) — see §3.2/§4.4 sync correction. Host baseline BC-C1 (`-D 0`) now runs the full size range (64M cap removed) since the image ships the Broadcast **and** AllGather host ring kernels.
 **Date:** 2026-07-22 (rev. 2026-07-24)
 **Location:** `work-plans/gin-sdma-backend/broadcast/` (not committed to git)
 **Branch:** `users/dondai/gin-stage2c-sdma-bcast-wip`
@@ -12,7 +12,15 @@
 > PR-7826 era; the NCCL GIN **v14 API sync** (`[AICOMRCCL-1281] adapt GIN-SDMA/GIN-GDA
 > to v14`) reassigned type **5 → rocSHMEM-GDA** and moved **Anvil SDMA to 6**. All
 > broadcast configs below use `=6`. Verified this session on the current ROCm 7.13
-> image: A2A (`-D 3`, type 6) passes at ~81.9 GB/s busbw and AllGather passes.
+> image: A2A (`-D 3`, type 6) passes at ~81.9 GB/s busbw; the broadcast gate
+> (BC-C1 host + BC-C2 GIN) and the AllGather gate (AG-C1 host + AG-C2 GIN) both
+> pass across the full size range with `#wrong == 0`.
+>
+> **Kernel set (2026-07-24):** the image builds RCCL device kernels with
+> `ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather"`
+> (Dockerfile ARG + `docker-gin-gda-sdma-build.bash`). `Broadcast` and `AllGather`
+> were added so the host baselines (`-D 0`) run the full range — without them the
+> host paths faulted above 64M (`ncclDevFuncId not found for coll:0`/`coll:2`).
 
 ---
 
@@ -95,7 +103,11 @@ On single-node xGMI with `NCCL_GIN_TYPE=6`:
 |--------------|----------------|------|
 | ≤ `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (128 B default) | **root only** | LSA direct stores to every peer’s `recvbuff` |
 | > threshold | **root only** | One-round **`gin.put` to all non-self peers**; Anvil picks IPC (≤ threshold) or SDMA (> threshold) |
-| all ranks | all | World/LSA barriers for completion |
+| all ranks | all | Entry world/LSA barrier; **non-roots complete via receiver-side `waitSignal(+1)`** (see §4.4) |
+
+> **Validated 2026-07-24 (8× MI355X, `NCCL_GIN_TYPE=6`, `-V 8`):** `#wrong == 0` for
+> every root 0..7, 128 B–128 MB, in-place and OOP, at both `THRESHOLD=128` (hybrid) and
+> `THRESHOLD=0` (all-SDMA, BC-D4). Perf @128 MB: in-place ~60 GB/s, OOP ~41 GB/s.
 
 **Reject ring/tree** for the same reasons as AllGather: full xGMI mesh, one-round direct is native; ring adds steps and signal complexity with no topology benefit.
 
@@ -137,29 +149,39 @@ if msgBytes <= threshold:
   lsaBar.sync(relaxed)
   if rank == root:
     BroadcastLsaDirect<T>(sendwin, sendoffset, recvwin, recvoffset,
-                          count, nRanks, tid, nthreads)
+                          count, lsa.nRanks, tid, nthreads)   // writes every peer incl. self
   lsaBar.sync(release)
   return
 
-// --- Phase B: large messages, GIN (root sends) ---
+// --- Phase B: large messages, GIN ---
 gin = ncclGin(devComm, context=0)
 signalIndex = 0
-signalValue = gin.readSignal(signalIndex)
+signalValue = gin.readSignal(signalIndex)   // every rank reads ITS OWN signal base
 
 worldBar.sync(relaxed)   // all ranks: recv buffers quiescent before root writes
 
 if rank == root:
+  // out-of-place self copy (no-op in-place); 16B-vectorized when aligned
+  if localSrc != localDst:
+    BroadcastLocalCopy(localDst, localSrc, count, tid, nthreads)
   for r = tid; r < nRanks; r += nthreads:
     if r == root: continue
     gin.put(world, r,
             recvwin, recvoffset,     // same offset on every peer
-            sendwin, sendoffset,
-            msgBytes, SignalInc{signalIndex})
-  gin.waitSignal(Cta, signalIndex, signalValue + (nRanks - 1))
-  gin.flush(Cta)
-
-worldBar.sync(release)   // non-roots: recv visible before return
+            sendwin, sendoffset,     // ncclGin_SignalInc is a REMOTE action:
+            msgBytes, SignalInc{signalIndex})  //   it increments PEER r's signal
+  gin.flush(Cta)                     // source buffers safe to reuse
+else:
+  // each non-root receives exactly ONE put from root -> wait for it to settle
+  gin.waitSignal(Cta, signalIndex, signalValue + 1)
 ```
+
+> **Critical (corrected 2026-07-24):** `ncclGin_SignalInc` is the `put` **`RemoteAction`**
+> ("action to take *on peer* when put completes", `gin.h`) — it increments the **receiver's**
+> signal, not the sender's. The root receives no puts, so it must **not** `waitSignal` on its
+> own signal (an earlier draft's `signalValue + (nRanks-1)` on the root would deadlock). The
+> completion is the mirror image of AllGather: every non-root receives exactly one put and
+> waits `signalValue + 1`; the root only `flush`es. No exit barrier is used — see §4.4.
 
 ### 3.3 `BroadcastLsaDirect` (root-only)
 
@@ -190,7 +212,11 @@ gin.put(world, peer,
     msgBytes, ncclGin_SignalInc{0});
 ```
 
-Self-copy: skip `peer == root` in the loop; `gin.put` self path is unused. Signal wait: **`signalValue + (nRanks - 1)`**, not `+ nRanks`.
+Self-copy: skip `peer == root` in the loop; the root performs an explicit local
+`send → recv` copy (`BroadcastLocalCopy`, 16-byte-vectorized when aligned, no-op in-place)
+instead of a self-`gin.put`. Completion signalling is **receiver-side**: each non-root waits
+`signalValue + 1` (it receives one put); the root does **not** `waitSignal` (it receives none)
+and only `flush`es. See §4.4.
 
 ### 3.4.1 When SDMA is actually used (per-put size decision)
 
@@ -276,16 +302,35 @@ One env var (`NCCL_GIN_ANVIL_SDMA_THRESHOLD`) controls both the **kernel branch*
 
 ### 4.4 Synchronization model
 
-**Challenge**: In AllGather, every rank sends and waits on `signalValue + nRanks`. In broadcast, only root sends.
+**Signal semantics (the key fact).** `ncclGin::put`'s `ncclGin_SignalInc` is the template's
+**`RemoteAction`** parameter — documented in `gin.h` as *"Action to take **on peer** when put
+completes"*. It increments the **receiving** peer's signal, **not** the sender's. (`put` has a
+separate `LocalAction` parameter, e.g. `ncclGin_WeakCounterInc`, for a *local* completion
+counter — a different mechanism entirely.) This is confirmed by AllGather/AlltoAll, where each
+rank issues N puts, **receives** N puts, and waits `base + N` on its own signal.
 
-**Solution**:
+**Challenge.** In AllGather every rank both sends and receives N puts, so the "wait `base + N`"
+is symmetric. In broadcast only the root sends, so the flow is asymmetric:
 
-- Root: `waitSignal(0, base + nRanks - 1)` then `flush()` — ensures all remote puts completed and SDMA queues are quiet.
-- Non-roots: no puts, no waitSignal; they rely on the **exit world barrier** (`memory_order_release`) after root finishes.
+- The **root** issues `N-1` puts but **receives 0** puts → its own signal is never incremented.
+- Each **non-root** receives **exactly 1** put → its signal goes `base → base + 1`.
 
-This matches the AlltoAll observation that post-flush world barriers may be redundant for pairwise quiet, but here non-roots **must** block until root’s writes are visible. The exit barrier is the clean, proven pattern from AllGather’s entry barrier.
+**Solution (receiver-side completion):**
 
-Optional: non-roots could `waitSignal` on a per-rank counter incremented by incoming puts, but that requires signal semantics per destination — more complex, no proven benefit yet.
+- **Root:** issue the `N-1` puts, then `flush()`. `flush` guarantees the root's *source buffers
+  are safe to reuse*; the root does **not** `waitSignal` (waiting on its own never-incremented
+  signal would **deadlock** — this was the bug in the earlier draft that told the root to wait
+  `base + nRanks - 1`).
+- **Non-roots:** `waitSignal(0, base + 1)`. Because `SignalInc` visibility "implies all preceding
+  puts are settled," this is exactly what makes the payload visible on the receiver.
+
+**Why no exit barrier.** `gin.h` is explicit that `flush` *"does not guarantee that data has
+settled in remote memory."* So a post-root world barrier — even with `memory_order_release` —
+would **not** be sufficient to guarantee non-roots see the data; a non-root could pass the
+barrier before the SDMA write to its HBM lands. The receiver-side `waitSignal(+1)` is the
+correct and necessary completion primitive, and it makes an exit barrier redundant. Only the
+**entry** barrier is kept (recv buffers quiescent before the root starts writing, mirroring
+AllGather's entry barrier).
 
 ### 4.5 Root rotation and in-place
 
@@ -295,11 +340,15 @@ Optional: non-roots could `waitSignal` on a per-rank counter incremented by inco
 
 ### 4.6 Expected performance
 
-| Regime | Expectation |
-|--------|-------------|
-| ≤128 B | ~7–8 µs (LSA), similar to AllGather LSA |
-| Medium | GIN setup floor ~21–22 µs |
-| 128 MiB | Root fan-out (N−1) puts; busbw ≈ `(N-1)/N × link_BW`; should beat ring (~7 steps) significantly |
+| Regime | Expectation | Measured (8× MI355X, 2026-07-24) |
+|--------|-------------|-----------------------------------|
+| ≤128 B | ~7–8 µs (LSA), similar to AllGather LSA | ~7.2 µs @128 B (LSA); ~23 µs when forced to GIN (`THRESHOLD=0`) |
+| Medium | GIN setup floor ~21–22 µs | ~23 µs @1–8 KB |
+| 128 MiB | Root fan-out (N−1) puts; busbw ≈ `(N-1)/N × link_BW` | **in-place ~60 GB/s**, **OOP ~41 GB/s** (OOP bounded by the root's local send→recv copy; 16B-vectorized) |
+
+> The OOP < in-place gap is the extra root-local `send → recv` copy that in-place skips.
+> Vectorizing that copy (16-byte stores) lifted OOP from ~24 → ~41 GB/s @128 MB with `-V 8`.
+> Further OOP gains would come from overlapping the local copy with the remote puts.
 
 Bus bandwidth formula for the test harness:
 
@@ -344,7 +393,7 @@ Bus bandwidth formula for the test harness:
 
 | ID | Test | Config |
 |----|------|--------|
-| **BC-C1** | Host `ncclBroadcast` | `-D 0`, 128 B–64 M, `NCCL_CUMEM_ENABLE=0` |
+| **BC-C1** | Host `ncclBroadcast` | `-D 0`, 128 B–`MAX_BYTES` (full range, no 64M cap — host broadcast validated to 256M on MI355X), `NCCL_CUMEM_ENABLE=0` — perf reference, **on by default**. Requires the broadcast host ring kernels, which the image now ships via `ONLY_FUNCS="…|Broadcast|AllGather"` (Dockerfile ARG + `docker-gin-gda-sdma-build.bash`). Earlier images omitted them (`ncclDevFuncId … not found for coll:0`); unlike AllGather, broadcast has no direct/copy fast path so it always needs the ring device func. The sibling AllGather gate (`gin-sdma-ag-test.bash`, AG-C1) had the same 64M host cap for the same reason and has likewise been lifted now that `AllGather` is in `ONLY_FUNCS`. |
 | **BC-C2** | GIN hybrid | `-D 3 -V 8`, 128 B–128 M, `NCCL_GIN_TYPE=6` |
 | **BC-C3** | rocSHMEM `team_broadcast` | optional cross-check |
 | **BC-D4** | All-SDMA gate | `THRESHOLD=0` |
