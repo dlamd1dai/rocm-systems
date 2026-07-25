@@ -43,7 +43,7 @@ kernarg_preload=true
 quiet_warnings=false
 build_rocshmem_support=false
 build_rocshmem_gin=false
-rocshmem_mono_hash="0e2998b11f99e8302c72f1ac2ce9f2b8c1816587"
+rocshmem_mono_hash="b76636bd9260cc307d80047b92c31b4d3e86a1e4"
 custom_cmake_options=""
 
 # #################################################
