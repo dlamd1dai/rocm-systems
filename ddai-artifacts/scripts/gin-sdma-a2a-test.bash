@@ -322,9 +322,18 @@ _should_run_test5() {
   return 0
 }
 
-if _run_test 1; then
-  _trace_on
-  echo "=== Test#1: A2A, ${NP} gpus, Host Initiated ==="
+# Host-initiated A2A paths (all -D 0), measured 8x MI355X (NCCL_GIN_TYPE=6,
+# 2026-07-24), out-of-place busbw:
+#   * RING (SM copy): pin the channel count so the tuner does not collapse
+#     channels on large messages. Without the pin busbw cliffs hard past 8M
+#     (~182 GB/s @4M -> ~30 @8M -> ~45 @128M); pinning MIN=MAX (any 16..64 is
+#     equivalent) lifts 8M to ~205 and 128M to ~326 with no small-size loss.
+#     Best for <=32M.
+#   * CE/SDMA (copy engines): NCCL_CUMEM_ENABLE=1 + symmetric reg (-R 2) +
+#     NCCL_CTA_POLICY=ZERO. Slow for small/mid but scales to ~373 @128M.
+#     Best for >=64M.
+# TEST1_MODE selects: ring (default) | hybrid (RING<=split, CE>split) | ce.
+_a2a_host_ring() {  # $1=min $2=max
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
     mpirun -n "${NP}" ${MPI_OPT} \
     "${MPI_BASE[@]}" \
@@ -332,7 +341,51 @@ if _run_test 1; then
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1
+    -x NCCL_MIN_NCHANNELS="${TEST1_NCHANNELS}" \
+    -x NCCL_MAX_NCHANNELS="${TEST1_NCHANNELS}" \
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1
+}
+_a2a_host_ce() {  # $1=min $2=max
+  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    "${MPI_BASE[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x NCCL_GIN_ENABLE=0 \
+    -x NCCL_GIN_TYPE=0 \
+    -x NCCL_CTA_POLICY=ZERO \
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
+}
+
+if _run_test 1; then
+  _trace_on
+  TEST1_NCHANNELS="${TEST1_NCHANNELS:-32}"
+  TEST1_MODE="${TEST1_MODE:-ring}"
+  case "${TEST1_MODE}" in
+    ring)
+      echo "=== Test#1: A2A, ${NP} gpus, Host Initiated RING (channels=${TEST1_NCHANNELS}) ==="
+      _a2a_host_ring 128 "${MAX_BYTES}"
+      ;;
+    ce)
+      echo "=== Test#1: A2A, ${NP} gpus, Host Initiated CE/SDMA ==="
+      _a2a_host_ce 128 "${MAX_BYTES}"
+      ;;
+    hybrid)
+      # RING for <=split, CE/SDMA for >split. Default split 32M; CE phase
+      # starts at the next f2 step (2*split). Override split with
+      # TEST1_HYBRID_SPLIT (bytes).
+      TEST1_HYBRID_SPLIT="${TEST1_HYBRID_SPLIT:-33554432}"
+      _ce_min=$(( TEST1_HYBRID_SPLIT * 2 ))
+      echo "=== Test#1a: A2A, ${NP} gpus, Host Initiated HYBRID/RING (channels=${TEST1_NCHANNELS}) 128..${TEST1_HYBRID_SPLIT} ==="
+      _a2a_host_ring 128 "${TEST1_HYBRID_SPLIT}"
+      echo "=== Test#1b: A2A, ${NP} gpus, Host Initiated HYBRID/CE-SDMA ${_ce_min}..${MAX_BYTES} ==="
+      _a2a_host_ce "${_ce_min}" "${MAX_BYTES}"
+      ;;
+    *)
+      echo "error: TEST1_MODE must be ring, hybrid, or ce" >&2
+      exit 1
+      ;;
+  esac
   _trace_off
 fi
 
@@ -373,27 +426,64 @@ fi
 
 if _should_run_test5; then
   _trace_on
-  echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA (NCCL_GIN_TYPE=6) ==="
+  # Backend gin.put SDMA control (rsCtx->sdmaThreshold): 0 = every GIN put uses
+  # the copy engine. Kept at 0 so the -D 3 SDMA branch always drives SDMA.
   NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-0}"
   NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK="${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK:-8192}"
-  TEST5_CTA_COUNT="${TEST5_CTA_COUNT:-1}"
+  # Kernel-level LSA<->SDMA switch for the -D 3 size-hybrid (per-peer bytes).
+  # Set explicitly so it takes precedence over the shared THRESHOLD=0 above
+  # (which would otherwise force the kernel all-SDMA). Default matches the
+  # rccl-tests built-in default (262144 = 256K/peer = 2M total on 8 ranks).
+  # Set to 0 to force all-SDMA, or a huge value to force all-LSA (sweeps).
+  TEST5_A2A_THRESHOLD="${TEST5_A2A_THRESHOLD:-262144}"
   TEST5_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
+    -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=${TEST5_A2A_THRESHOLD}"
   )
-  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
-    mpirun -n "${NP}" ${MPI_OPT} \
-    "${MPI_BASE[@]}" \
-    "${GIN_PLUGIN_X[@]}" \
-    -x NCCL_CUMEM_ENABLE=1 \
-    -x NCCL_NET_PLUGIN=none \
-    -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
-    -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=6 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
-    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    "${TEST5_MPI_EXTRA[@]}" \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V "${TEST5_CTA_COUNT}"
+  # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=6), measured 8x MI355X
+  # (2026-07-26), out-of-place:
+  #   * -D 3 GinHybridAlltoAllKernel: size-hybrid. Per-peer chunk <=threshold
+  #     uses a direct LSA all-peers copy (all CTAs; ~11us small-msg latency,
+  #     ~2x mid-range busbw vs SDMA); above threshold uses all-peers GIN puts
+  #     (SDMA copy engines; scales to ~390 GB/s @128M). Needs -V 8 so the LSA
+  #     branch gets enough CTAs; SDMA is CTA-insensitive. Best across the range.
+  #   * -D 4 HybridAlltoAllKernel: topology split (CTA 0 = remote via GIN, CTAs
+  #     1..N = intra-node via LSA). On a single node LSA carries all traffic:
+  #     low small-msg latency but scalar SM copy caps large BW. Kept for debug.
+  # TEST5_MODE: d3 (default, kernel size-hybrid -V 8) | d4 (LSA topology split).
+  TEST5_MODE="${TEST5_MODE:-d3}"
+  TEST5_D4_CTA_COUNT="${TEST5_D4_CTA_COUNT:-${TEST5_CTA_COUNT:-8}}"
+  TEST5_D3_CTA_COUNT="${TEST5_D3_CTA_COUNT:-8}"
+  _a2a_gin() {  # $1=deviceImpl $2=ctaCount $3=minBytes $4=maxBytes
+    ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
+      mpirun -n "${NP}" ${MPI_OPT} \
+      "${MPI_BASE[@]}" \
+      "${GIN_PLUGIN_X[@]}" \
+      -x NCCL_CUMEM_ENABLE=1 \
+      -x NCCL_NET_PLUGIN=none \
+      -x ROCSHMEM_SDMA_ENABLED=0 \
+      -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
+      -x NCCL_GIN_ENABLE=1 \
+      -x NCCL_GIN_TYPE=6 \
+      -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
+      -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+      "${TEST5_MPI_EXTRA[@]}" \
+      rccl-tests/alltoall_perf -b "$3" -e "$4" -f 2 -g 1 -R 2 -D "$1" -A 1 -V "$2"
+  }
+  case "${TEST5_MODE}" in
+    d3)
+      echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=${TEST5_A2A_THRESHOLD}B/peer, SDMA above; V=${TEST5_D3_CTA_COUNT}, NCCL_GIN_TYPE=6) ==="
+      _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
+      ;;
+    d4)
+      echo "=== Test#5: A2A, ${NP} gpus, GIN hybrid -D 4 LSA (V=${TEST5_D4_CTA_COUNT}, NCCL_GIN_TYPE=6) ==="
+      _a2a_gin 4 "${TEST5_D4_CTA_COUNT}" 128 "${MAX_BYTES}"
+      ;;
+    *)
+      echo "error: TEST5_MODE must be d3 or d4" >&2
+      exit 1
+      ;;
+  esac
   _trace_off
 fi

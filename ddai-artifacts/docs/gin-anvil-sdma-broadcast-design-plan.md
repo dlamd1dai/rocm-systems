@@ -302,19 +302,21 @@ The shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` still controls the backend **`gin.put
 
 #### 4.3.1 Per-collective LSA↔GIN threshold and defaults (rccl-tests)
 
-`broadcast.cu` and `all_gather.cu` resolve their kernel branch threshold host-side with the chain (`testResolveSdmaThreshold`, `common.h`):
+`broadcast.cu`, `all_gather.cu`, and `alltoall.cu` resolve their kernel branch threshold host-side with the chain (`testResolveSdmaThreshold`, `common.h`):
 
 1. the collective-specific env var, if set;
 2. the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD`, if explicitly set (keeps the global force knob — e.g. **BC-D4** `THRESHOLD=0` → all-GIN — working);
 3. the collective's data-driven **default**.
 
-| Collective | Env var | Compared against | Default | Basis (8× MI355X, `NCCL_GIN_TYPE=6`, 2026-07-24) |
+| Collective | Env var | Compared against | Default | Basis (8× MI355X, `NCCL_GIN_TYPE=6`) |
 |---|---|---|---|---|
-| Broadcast | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST` | full `msgBytes` | **262144 (256 KiB)** | LSA wins ≤256K (256K: 22.8 µs vs GIN 29.9); GIN wins ≥512K (512K: 34.0 µs vs LSA 39.2; 128M: 60.6 vs 17.0 GB/s) |
-| AllGather | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | per-rank `chunkBytes` (= total/nRanks) | **262144 (256 KiB/rank)** | LSA wins ≤256K/rank i.e. ≤2M total (2M: 22.6 µs vs GIN 32.3); GIN wins ≥512K/rank i.e. ≥4M total (4M: 36.5 µs vs LSA 38.0; 128M: 388 vs 129 GB/s) |
-| AlltoAll | *(none)* | — | — | LSA↔GIN split is **topology-based** (intra-node LSA vs inter-node GIN), not size-based; uses only the shared var for the backend IPC/SDMA split |
+| Broadcast | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST` | full `msgBytes` | **262144 (256 KiB)** | (2026-07-24) LSA wins ≤256K (256K: 22.8 µs vs GIN 29.9); GIN wins ≥512K (512K: 34.0 µs vs LSA 39.2; 128M: 60.6 vs 17.0 GB/s) |
+| AllGather | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | per-rank `chunkBytes` (= total/nRanks) | **262144 (256 KiB/rank)** | (2026-07-24) LSA wins ≤256K/rank i.e. ≤2M total (2M: 22.6 µs vs GIN 32.3); GIN wins ≥512K/rank i.e. ≥4M total (4M: 36.5 µs vs LSA 38.0; 128M: 388 vs 129 GB/s) |
+| AlltoAll (`-D 3`) | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL` | per-peer `chunkBytes` (= total/nRanks) | **262144 (256 KiB/peer)** | (2026-07-26, `-V 8`) LSA wins ≤256K/peer i.e. ≤2M total (small-msg 11 µs vs GIN 24.5; 2M busbw 61.7 vs 57.8 GB/s); GIN/SDMA wins ≥512K/peer i.e. ≥4M total (4M: 102.9 vs 44.3; 128M: 389.6 vs 56.4 GB/s) |
 
 Values are bytes with an optional `K`/`M`/`G` suffix. The Anvil backend is unchanged (no GIN ABI change): the per-collective value is read in `RunColl` and passed to the kernel as an extra launch argument (`testLaunchDeviceKernelThreshold`).
+
+**AlltoAll `-D 3` is a size-hybrid** (`GinHybridAlltoAllKernel`): a per-peer chunk ≤ threshold uses a direct all-peers **LSA** copy across all CTAs (latency-optimal for small, ~2× mid-range busbw); above the threshold it uses all-peers **GIN puts** over SDMA copy engines (bandwidth-optimal, scaling to ~390 GB/s @128M). The LSA branch needs enough CTAs, so Test#5 runs `-V 8` (SDMA is CTA-insensitive: `-V 1` ≈ `-V 8` at ~390 GB/s). This supersedes the earlier topology-only note and the shell-level `-D 4`/`-D 3` two-phase split; `-D 4` (`HybridAlltoAllKernel`, topology-based intra-node LSA vs inter-node GIN) is retained for debugging.
 
 ### 4.4 Synchronization model
 
