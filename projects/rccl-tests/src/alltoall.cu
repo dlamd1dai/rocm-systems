@@ -9,6 +9,7 @@
 #include "common.h"
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include "rccl_vector_types.h"
 #endif
 
@@ -60,12 +61,13 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
     case 2: // NvlAlltoAllKernelOptimized
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
-    case 3: // GinAlltoAllKernel: all CTAs participate, one barrier per CTA
+    case 3: // GinHybridAlltoAllKernel: LSA direct (small) + all-peers GIN puts (large)
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
       reqs->barrierCount = deviceCtaCount;
+      reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
@@ -103,8 +105,9 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
       reqs->lsaBarrierCount = deviceCtaCount;
       return true;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-    case 3: // GinAlltoAllKernel: all CTAs, one barrier per CTA
+    case 3: // GinHybridAlltoAllKernel: LSA direct (small) + all-peers GIN puts (large)
       reqs->barrierCount = deviceCtaCount;
+      reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
       return true;
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
@@ -134,35 +137,15 @@ __device__ void AlltoAllScalarImpl(ncclWindow_t sendwin, size_t sendoffset, nccl
   }
 }
 
-// Device implementation #1 - simple NVL kernel
+// shared vectorized+unrolled LSA AlltoAll body (falls back to scalar when the
+// data is not vector-aligned). Used by NvlAlltoAllKernelOptimized and by the
+// LSA branch of the size-hybrid GinHybridAlltoAllKernel.
 template <typename T>
-__global__ void NvlAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
-  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
-
-  int rank = devComm.rank, nRanks = devComm.nRanks;
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int nthreads = blockDim.x * gridDim.x;
-
-  AlltoAllScalarImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
-
-  bar.sync(ncclCoopCta(), cuda::memory_order_release);
-}
-
-// Device implementation #2 - optimized NVL kernel using vectorization and unrolling
-template <typename T>
-__global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
-  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
-
+__device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
   using TN = typename VectorTypeMapping<T>::Type;
   constexpr int VECTOR_FACTOR = sizeof(TN) / sizeof(T);
   constexpr int UNROLL_FACTOR = 128/sizeof(TN);
   constexpr int PEER_UNROLL = 2;
-
-  int rank = devComm.rank, nRanks = devComm.nRanks;
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int nthreads = blockDim.x * gridDim.x;
 
   T* sendPtr = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
 
@@ -226,13 +209,86 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
     // simple scalar fallback for unaligned data (identical to simple kernel)
     AlltoAllScalarImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
   }
+}
+
+// Device implementation #1 - simple NVL kernel
+template <typename T>
+__global__ void NvlAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+  ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  int rank = devComm.rank, nRanks = devComm.nRanks;
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  AlltoAllScalarImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_release);
+}
+
+// Device implementation #2 - optimized NVL kernel using vectorization and unrolling
+template <typename T>
+__global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+  ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  int rank = devComm.rank, nRanks = devComm.nRanks;
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  int nthreads = blockDim.x * gridDim.x;
+
+  AlltoAllVectorizedImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release);
 }
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+__device__ size_t AlltoAllGetSdmaThreshold(struct ncclDevComm const& devComm) {
+  using nccl::utility::loadConst;
+  if (devComm.ginConnectionCount == 0 || devComm.ginHandles[0] == nullptr) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[0];
+  if (rsCtx == nullptr ||
+      loadConst(&rsCtx->layoutMagic) != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  return loadConst(&rsCtx->sdmaThreshold);
+}
+
+// Single-node size-hybrid AlltoAll (-D 3):
+//   per-peer chunkBytes <= sdmaThreshold: direct LSA all-peers copy (all CTAs),
+//                                         latency-optimal for small messages.
+//   per-peer chunkBytes >  sdmaThreshold: all-peers GIN puts (SDMA copy engine),
+//                                         bandwidth-optimal for large messages.
+//
+// sdmaThresholdOverride lets the AlltoAll-specific env var
+// NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL tune this LSA<->SDMA cutover
+// independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
+// value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+  const size_t size = count * sizeof(T);  // per-peer chunk bytes
+  const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
+                                   ? sdmaThresholdOverride
+                                   : AlltoAllGetSdmaThreshold(devComm);
+
+  if (size <= sdmaThreshold) {
+    /* small messages: direct LSA all-peers copy (all CTAs) */
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+    const int rank = devComm.rank, nRanks = devComm.nRanks;
+    const int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    const int nthreads = blockDim.x * gridDim.x;
+
+    AlltoAllVectorizedImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
+
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    return;
+  }
+
+  /* large messages: all-peers GIN puts (SDMA copy engine) */
   int ginContext = 0;
   unsigned int signalIndex = 0;
   ncclGin gin { devComm, ginContext };
@@ -249,7 +305,6 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
   int nthreads = blockDim.x * gridDim.x;
 
   /* send to all peers via GIN */
-  const size_t size = count * sizeof(T);
   for (int r=tid; r<devComm.nRanks; r+=nthreads) {
     gin.put(ncclTeamWorld(devComm), r,
         recvwin, recvoffset + devComm.rank * size,
@@ -380,9 +435,19 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         return testSuccess;
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-      case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      case 3: {
+        // AlltoAll-specific LSA<->SDMA threshold. Compared against the per-peer
+        // chunk (count*sizeof(T) = total/nRanks). Default = 256 KiB/peer: on 8x
+        // MI355X (NCCL_GIN_TYPE=6, -V 8) the direct LSA copy wins for a per-peer
+        // chunk <=256K (total <=2M: lower latency for small, ~2x busbw in the
+        // mid-range) and GIN/SDMA wins from 512K/peer (total >=4M: 102 vs 44
+        // GB/s, scaling to ~390) (measured 2026-07-26). Override with
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL, or the shared
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
+        static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", (size_t)262144);
+        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr));
         return testSuccess;
+      }
       case 4:
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
