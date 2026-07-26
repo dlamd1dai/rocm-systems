@@ -311,7 +311,7 @@ The shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` still controls the backend **`gin.put
 | Collective | Env var | Compared against | Default | Basis (8× MI355X, `NCCL_GIN_TYPE=6`) |
 |---|---|---|---|---|
 | Broadcast | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST` | full `msgBytes` | **262144 (256 KiB)** | (2026-07-24) LSA wins ≤256K (256K: 22.8 µs vs GIN 29.9); GIN wins ≥512K (512K: 34.0 µs vs LSA 39.2; 128M: 60.6 vs 17.0 GB/s) |
-| AllGather | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | per-rank `chunkBytes` (= total/nRanks) | **262144 (256 KiB/rank)** | (2026-07-24) LSA wins ≤256K/rank i.e. ≤2M total (2M: 22.6 µs vs GIN 32.3); GIN wins ≥512K/rank i.e. ≥4M total (4M: 36.5 µs vs LSA 38.0; 128M: 388 vs 129 GB/s) |
+| AllGather (`-D 3`) | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | per-rank `chunkBytes` (= total/nRanks) | **262144 (256 KiB/rank)** | (2026-07-24, reconfirmed 2026-07-26 at `-V 8`) LSA wins ≤256K/rank i.e. ≤2M total (2M busbw 82.5 vs SDMA 57.1 GB/s); GIN/SDMA wins ≥512K/rank i.e. ≥4M total (4M: 101.8 vs 98.4; 128M: 390 vs 128 GB/s). Like AlltoAll, the LSA branch needs `-V 8` (2M 82.5 @V8 vs 15.4 @V1); SDMA is CTA-insensitive |
 | AlltoAll (`-D 3`) | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL` | per-peer `chunkBytes` (= total/nRanks) | **262144 (256 KiB/peer)** | (2026-07-26, `-V 8`) LSA wins ≤256K/peer i.e. ≤2M total (small-msg 11 µs vs GIN 24.5; 2M busbw 61.7 vs 57.8 GB/s); GIN/SDMA wins ≥512K/peer i.e. ≥4M total (4M: 102.9 vs 44.3; 128M: 389.6 vs 56.4 GB/s) |
 
 Values are bytes with an optional `K`/`M`/`G` suffix. The Anvil backend is unchanged (no GIN ABI change): the per-collective value is read in `RunColl` and passed to the kernel as an extra launch argument (`testLaunchDeviceKernelThreshold`).

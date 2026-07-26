@@ -8,12 +8,14 @@
 #
 # Checks (order: AG-C1 → AG-C2 → AG-C3; AG-C1 runs first to avoid GPU state
 # contamination from rocSHMEM fcollect):
-#   AG-C1  Host-initiated ncclAllGather       (all_gather_perf -D 0, -R 0)
+#   AG-C1  Host-initiated ncclAllGather       (all_gather_perf -D 0)
 #          Full range by default (no 64M cap): earlier images faulted >64M only because the
 #          AllGather ring device kernel was absent (ncclDevFuncId not found for coll:2); the
-#          image now ships it via ONLY_FUNCS="...|AllGather". Note >64M no longer uses the
-#          rcclDirectAllGather fast path, so busbw drops to the ring kernel rate.
-#          Always NCCL_CUMEM_ENABLE=0 (matches docker-gin-gda-sdma-test.bash Test#1).
+#          image now ships it via ONLY_FUNCS="...|AllGather".
+#          AG_C1_MODE=hybrid (default) uses RING SM-copy (NCCL_CUMEM_ENABLE=0, -R 0) for
+#          <=64M and CE/SDMA (NCCL_CUMEM_ENABLE=1, -R 2, NCCL_CTA_POLICY=ZERO) for >64M:
+#          RING alone cliffs at 128M (~42 GB/s, RING* fallback) while CE/SDMA hits ~373.
+#          AG_C1_MODE=ring or ce force a single path. Mirrors a2a Test#1 host hybrid.
 #   AG-C2  GIN hybrid AllGather (-D 3, NCCL_GIN_TYPE=6)
 #   AG-C3  rocSHMEM team fcollect cross-check  (rocshmem_functional_tests -a teamfcollect)
 #
@@ -37,7 +39,11 @@ DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
 HOST_RANKS="${HOST_RANKS:-0}"
 GIN_RANKS="${GIN_RANKS:-2}"
-DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-1}"
+# AG-C2 runs the -D 3 size-hybrid at -V 8: the LSA branch (per-rank chunk <=
+# 256K, i.e. total <=2M) needs many CTAs for bandwidth (8x MI355X, 2026-07-26:
+# 2M busbw 82.5 GB/s @V8 vs 15.4 @V1; 128M LSA 128 vs 16), while the SDMA branch
+# is CTA-insensitive (128M ~390 GB/s at both V1 and V8). Mirrors AlltoAll Test#5.
+DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-8}"
 
 _HOST="$(hostname -s 2>/dev/null || hostname)"
 
@@ -99,7 +105,7 @@ FCOLLECT_MAX_MSG="${FCOLLECT_MAX_MSG:-$((FCOLLECT_MAX_VOL / NP / FCOLLECT_WGS))}
 
 RUN_HOST_BASELINE="${RUN_HOST_BASELINE:-1}"
 RUN_GIN_SDMA="${RUN_GIN_SDMA:-1}"
-RUN_FCOLLECT="${RUN_FCOLLECT:-1}"
+RUN_FCOLLECT="${RUN_FCOLLECT:-0}"
 
 # Optional GPU reset before gate (off by default). Enable with GPU_RESET_BEFORE_TEST=1
 # after hung GIN/fcollect runs leave GPUs in a bad state for AG-C1.
@@ -142,11 +148,11 @@ MPI_BASE_HOST=(
   -x NCCL_MSCCL_ENABLE=0
   -x HSA_NO_SCRATCH_RECLAIM=1
   -x NCCL_GIN_PLUGIN=none
-  -x NCCL_CUMEM_ENABLE=0
   -x ROCSHMEM_SDMA_ENABLED=0
   -x NCCL_GIN_ENABLE=0
   -x NCCL_GIN_TYPE=0
 )
+# NCCL_CUMEM_ENABLE is set per AG-C1 mode below (0 for RING/SM-copy, 1 for CE/SDMA).
 
 _run() {
   echo "=== $* ==="
@@ -216,7 +222,7 @@ AG_C1_STATUS="skipped"
 
 echo "AllGather gate: NP=${NP} host=${_HOST}"
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "  AG-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (NCCL_CUMEM_ENABLE=0)"
+  echo "  AG-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (mode=${AG_C1_MODE:-hybrid}: RING SM-copy + CE/SDMA)"
 else
   echo "  AG-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
@@ -239,11 +245,66 @@ _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
 
 # --- AG-C1: host-initiated ncclAllGather (-D 0, no GIN); runs first (hard gate) ---
-if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "AG-C1: host ncclAllGather -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS})"
+# Host AllGather perf paths (8x MI355X, NCCL_GIN_TYPE=0, 2026-07-26), out-of-place busbw:
+#   * RING (SM copy, NCCL_CUMEM_ENABLE=0, -R 0): best for small/mid, scales to
+#     ~363 GB/s @64M. BUT cliffs hard at 128M (the tuner falls back to RING*):
+#     ~42 GB/s at the default 4 channels; pinning MIN=MAX lifts 128M only
+#     partway (~116 @16, ~103 @32) and never recovers the 64M rate.
+#   * CE/SDMA (copy engines, NCCL_CUMEM_ENABLE=1 + symmetric reg -R 2 +
+#     NCCL_CTA_POLICY=ZERO): ~30 us floor so poor for small/mid (2M 23 vs RING
+#     142), but no cliff — scales to ~373 GB/s @128M. Best for the top size.
+# AG_C1_MODE selects: hybrid (default, RING<=split then CE>split) | ring | ce.
+_ag_host_ring() {  # $1=min $2=max
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE_HOST[@]}" \
-    "${ALL_GATHER_PERF}" -b "${MIN_BYTES}" -e "${HOST_MAX_BYTES_EFFECTIVE}" -f 2 -g 1 -R "${HOST_RANKS}" -D 0 -A 1 -V 1
+    -x NCCL_CUMEM_ENABLE=0 \
+    -x NCCL_MIN_NCHANNELS="${AG_C1_NCHANNELS}" \
+    -x NCCL_MAX_NCHANNELS="${AG_C1_NCHANNELS}" \
+    "${ALL_GATHER_PERF}" -b "$1" -e "$2" -f 2 -g 1 -R "${HOST_RANKS}" -D 0 -A 1 -V 1
+}
+_ag_host_ce() {  # $1=min $2=max
+  _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
+    "${MPI_BASE_HOST[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x NCCL_CTA_POLICY=ZERO \
+    "${ALL_GATHER_PERF}" -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
+}
+if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
+  AG_C1_MODE="${AG_C1_MODE:-hybrid}"
+  # RING channel pin (any 8..32 is equivalent <=64M; 16 gives the best 128M
+  # fallback if a RING-only run ever reaches the top size).
+  AG_C1_NCHANNELS="${AG_C1_NCHANNELS:-16}"
+  # RING<=split, CE/SDMA>split. Default split 64M (RING wins through 64M, CE
+  # wins at 128M). Override with AG_C1_HYBRID_SPLIT (bytes).
+  AG_C1_HYBRID_SPLIT="${AG_C1_HYBRID_SPLIT:-67108864}"
+  case "${AG_C1_MODE}" in
+    ring)
+      echo "AG-C1: host ncclAllGather RING -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS}, channels=${AG_C1_NCHANNELS})"
+      _ag_host_ring "${MIN_BYTES}" "${HOST_MAX_BYTES_EFFECTIVE}"
+      ;;
+    ce)
+      echo "AG-C1: host ncclAllGather CE/SDMA -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R 2)"
+      _ag_host_ce "${MIN_BYTES}" "${HOST_MAX_BYTES_EFFECTIVE}"
+      ;;
+    hybrid)
+      if [[ "${HOST_MAX_BYTES_EFFECTIVE_INT}" -le "${AG_C1_HYBRID_SPLIT}" ]]; then
+        echo "AG-C1: host ncclAllGather HYBRID/RING -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS}, channels=${AG_C1_NCHANNELS})"
+        _ag_host_ring "${MIN_BYTES}" "${HOST_MAX_BYTES_EFFECTIVE}"
+      else
+        _split_fmt="$(_format_bytes "${AG_C1_HYBRID_SPLIT}")"
+        _ce_min=$(( AG_C1_HYBRID_SPLIT * 2 ))
+        _ce_min_fmt="$(_format_bytes "${_ce_min}")"
+        echo "AG-C1a: host ncclAllGather HYBRID/RING -D 0, ${MIN_BYTES}..${_split_fmt} (-R ${HOST_RANKS}, channels=${AG_C1_NCHANNELS})"
+        _ag_host_ring "${MIN_BYTES}" "${_split_fmt}"
+        echo "AG-C1b: host ncclAllGather HYBRID/CE-SDMA -D 0, ${_ce_min_fmt}..${HOST_MAX_BYTES_EFFECTIVE} (-R 2)"
+        _ag_host_ce "${_ce_min_fmt}" "${HOST_MAX_BYTES_EFFECTIVE}"
+      fi
+      ;;
+    *)
+      echo "error: AG_C1_MODE must be hybrid, ring, or ce" >&2
+      exit 1
+      ;;
+  esac
   AG_C1_STATUS="passed"
   sleep "${TEST_GAP_SEC:-3}"
 fi
