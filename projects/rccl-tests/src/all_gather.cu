@@ -121,22 +121,100 @@ __device__ size_t AllGatherGetSdmaThreshold(struct ncclDevComm const& devComm) {
   return loadConst(&rsCtx->sdmaThreshold);
 }
 
+// Per-rank chunk size (bytes) at/below which the LSA branch collapses to a
+// single CTA. Tiny AllGather is barrier-bound, not bandwidth-bound: using all
+// deviceCtaCount CTAs multiplies the cross-rank LSA barrier traffic by the CTA
+// count for no copy-throughput gain. One CTA (blockDim.x threads) saturates the
+// local stores for chunks this small, so we drop the extra barriers. Tuned on
+// 8x MI355X (2026-07-26): the single-CTA latency floor (~13 us) holds up to
+// ~8 KiB/rank (64 KiB total); at 16 KiB/rank a single CTA turns
+// bandwidth-bound (131072 total: 17.1 us single-CTA vs 14.9 us at 262144 with
+// all CTAs), so hand off to the multi-CTA path there.
+static const size_t ALLGATHER_LSA_SINGLE_CTA_MAX = 8192;
+
+// Vectorized LSA AllGather copy: read the local send chunk once (wide vector +
+// unroll) and broadcast each value to every peer's recvbuff slot [rank*count].
+// Because AllGather has a single source chunk (unlike AllToAll's per-peer
+// chunks), we hoist the load out of the peer loop. Falls back to a scalar copy
+// when the buffers are not vector-aligned.
 template <typename T>
-__device__ void AllGatherLsaDirect(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
+__device__ void AllGatherLsaVectorized(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
+  using TN = typename VectorTypeMapping<T>::Type;
+  constexpr int VECTOR_FACTOR = sizeof(TN) / sizeof(T);
+  constexpr int UNROLL_FACTOR = 128/sizeof(TN);
+  constexpr int PEER_UNROLL = 2;
+
   T* src = (T*)ncclGetLocalPointer(sendwin, sendoffset);
   const size_t dstOff = (size_t)rank * count;
-  for (size_t i = tid; i < count; i += nthreads) {
-    T value = src[i];
-    for (int lp = 0; lp < nRanks; lp++) {
-      T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset, lp) + dstOff;
-      dst[i] = value;
+
+  // dstOff*sizeof(T) is a multiple of sizeof(TN) whenever count*sizeof(T) is,
+  // so per-peer dst pointers keep the same alignment as the recv base.
+  bool canVectorize = (sizeof(TN) > sizeof(T)) &&
+                      (reinterpret_cast<uintptr_t>(src) % sizeof(TN) == 0) &&
+                      ((count * sizeof(T)) % sizeof(TN) == 0);
+
+  if (canVectorize) {
+    size_t vector_count = count / VECTOR_FACTOR;
+    int elements_per_iteration = nthreads * UNROLL_FACTOR;
+    TN* srcVec = (TN*)src;
+
+    size_t aligned_vector_count = (vector_count / elements_per_iteration) * elements_per_iteration;
+    for (size_t base_offset = tid; base_offset < aligned_vector_count; base_offset += elements_per_iteration) {
+      // load the source vectors once; they are reused for every peer
+      TN values[UNROLL_FACTOR];
+      #pragma unroll
+      for (int i = 0; i < UNROLL_FACTOR; i++) {
+        values[i] = srcVec[base_offset + i * nthreads];
+      }
+      for (int peerBase = 0; peerBase < nRanks; peerBase += PEER_UNROLL) {
+        int peersInGroup = min(PEER_UNROLL, nRanks - peerBase);
+        #pragma unroll
+        for (int p = 0; p < peersInGroup; p++) {
+          int peer = peerBase + p;
+          TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + dstOff);
+          #pragma unroll
+          for (int i = 0; i < UNROLL_FACTOR; i++) {
+            size_t offset = base_offset + i * nthreads;
+            recvVecPtr[offset] = values[i];
+          }
+        }
+      }
+    }
+
+    // remaining vectorized elements outside the unrolled span
+    for (size_t base_offset = aligned_vector_count + tid; base_offset < vector_count; base_offset += nthreads) {
+      TN value = srcVec[base_offset];
+      for (int peer = 0; peer < nRanks; peer++) {
+        TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + dstOff);
+        recvVecPtr[base_offset] = value;
+      }
+    }
+
+    // scalar tail for counts not divisible by the vector factor
+    size_t scalar_start = vector_count * VECTOR_FACTOR;
+    for (size_t offset = scalar_start + tid; offset < count; offset += nthreads) {
+      T value = src[offset];
+      for (int peer = 0; peer < nRanks; peer++) {
+        T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + dstOff;
+        dst[offset] = value;
+      }
+    }
+  } else {
+    // scalar fallback for unaligned buffers
+    for (size_t i = tid; i < count; i += nthreads) {
+      T value = src[i];
+      for (int lp = 0; lp < nRanks; lp++) {
+        T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset, lp) + dstOff;
+        dst[i] = value;
+      }
     }
   }
 }
 
 // Single-node hybrid AllGather (-D 3):
-//   chunkBytes <= sdmaThreshold: direct LSA (all CTAs).
-//   chunkBytes >  sdmaThreshold: direct all-peers GIN puts (proven MI355X path).
+//   chunkBytes <= ALLGATHER_LSA_SINGLE_CTA_MAX: LSA on a single CTA (tiny, barrier-bound).
+//   chunkBytes <= sdmaThreshold:                vectorized LSA (all CTAs).
+//   chunkBytes >  sdmaThreshold:                direct all-peers GIN puts (proven MI355X path).
 //
 // sdmaThresholdOverride lets the AllGather-specific env var
 // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER tune this LSA<->GIN cutover
@@ -151,12 +229,28 @@ __global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset
 
   if (chunkBytes <= sdmaThreshold) {
     ncclTeam lsa = ncclTeamLsa(devComm);
+
+    // Tiny messages: collapse to a single CTA to avoid multiplying the
+    // cross-rank LSA barrier traffic by deviceCtaCount. All ranks take this
+    // path in lockstep (identical size), so CTA 0's barrier slot stays
+    // consistent across ranks; CTAs > 0 exit before touching any barrier.
+    if (chunkBytes <= ALLGATHER_LSA_SINGLE_CTA_MAX) {
+      if (blockIdx.x != 0) return;
+      const int tid = threadIdx.x;
+      const int nthreads = blockDim.x;
+      ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, 0 };
+      lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+      AllGatherLsaVectorized<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm.rank, devComm.nRanks, tid, nthreads);
+      lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+      return;
+    }
+
     const int tid = threadIdx.x + blockIdx.x * blockDim.x;
     const int nthreads = blockDim.x * gridDim.x;
 
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
-    AllGatherLsaDirect<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm.rank, devComm.nRanks, tid, nthreads);
+    AllGatherLsaVectorized<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm.rank, devComm.nRanks, tid, nthreads);
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
     return;
   }
