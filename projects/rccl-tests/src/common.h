@@ -476,6 +476,21 @@ testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t se
   return testSuccess;
 }
 
+// Variant that also forwards an LL (low-latency, packed data+flag) handle as the
+// last kernel argument. Used by the AllGather GIN kernel for its tiny-message
+// LL fast path; the handle is a small POD ({bufHandle, nSlots}) assigned during
+// ncclDevCommCreate.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -496,6 +511,10 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
 }
 template <typename F>
 testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr

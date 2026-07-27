@@ -14,6 +14,27 @@
 #include "rccl_vector_types.h"
 #endif
 
+// LL (low-latency, packed data+flag) small-message AllGather path. The device
+// types (ncclLLA2AHandle, ncclDevResourceRequirements) come from nccl_device.h,
+// which common.h includes whenever the device API is on (>=2.28) or on any
+// >=2.29 build. Gate the LL wiring on exactly that availability.
+#if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+#define AG_HAVE_LL 1
+// Per-rank chunk size (bytes) at/below which the small-message AllGather uses
+// the LL path. LL doubles wire volume (8 B data + 8 B epoch tags per 16 B line)
+// so it only pays off for tiny, latency-bound sizes; above this the vectorized
+// LSA path is used. The LL scratch is sized for this cap at devComm creation.
+// Tuned on 8x MI355X (2026-07-26): LL beats vectorized single-CTA LSA up to
+// 4 KiB/rank (32 KiB total: 12.1 vs 13.2 us) but loses badly at 8 KiB/rank
+// (64 KiB total: 19.0 vs 13.5 us) where the 2x volume dominates.
+#define ALLGATHER_LL_MAX_BYTES 4096
+// LL scratch handle: bufHandle is assigned during ncclDevCommCreate; nSlots is
+// set immediately by ncclLLA2ACreateRequirement. nSlots==0 means LL was not
+// configured, so the kernel falls back to the vectorized LSA path.
+static ncclLLA2AHandle g_agLLHandle = {};
+static ncclDevResourceRequirements g_agLLReq = {};
+#endif
+
 void AllGatherGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   size_t base = (count/nranks) & -(16/eltSize);
   *sendcount = base;
@@ -75,6 +96,16 @@ testResult_t AllGatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
       reqs->barrierCount = deviceCtaCount;
       reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
+      // LL scratch for the tiny-message fast path (single CTA => nBlocks=1).
+      // Sized for the LSA team broadcasting up to ALLGATHER_LL_MAX_BYTES/rank:
+      // a receiver holds nRanks chunks of (ALLGATHER_LL_MAX_BYTES/8) u64 slots.
+      {
+        int llMaxElts = commProperties->nRanks * (int)(ALLGATHER_LL_MAX_BYTES / 8);
+        int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
+        ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_agLLHandle, &g_agLLReq);
+        g_agLLReq.next = reqs->resourceRequirementsList;
+        reqs->resourceRequirementsList = &g_agLLReq;
+      }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -211,17 +242,52 @@ __device__ void AllGatherLsaVectorized(ncclWindow_t sendwin, size_t sendoffset, 
   }
 }
 
+// LL (low-latency) AllGather for tiny messages, single CTA. Each rank broadcasts
+// its chunk (as chunkU64 8-byte units) into the epoch-tagged LL scratch, then
+// polls every rank's chunk out of its own scratch and writes it to its local
+// recvbuff. There is NO cross-rank recvbuff write and NO barrier: cross-rank
+// traffic is confined to the LL scratch and ordered purely by the per-slot
+// epoch tag (ncclLLA2ASession), so it is immune to the initData recvbuff-memset
+// race that a barrier-free direct-LSA copy would suffer. Requires 8-byte-aligned
+// chunks (guaranteed by the test's 16/eltSize base alignment).
+__device__ void AllGatherLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+                                size_t chunkU64, struct ncclDevComm const& devComm, ncclTeam lsa,
+                                ncclLLA2AHandle llHandle) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int nR = lsa.nRanks;
+  const int myR = lsa.rank;
+  const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
+  uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
+
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+                                     /*maxElts=*/(int)((size_t)nR * chunkU64) };
+
+  // Broadcast my chunk into slot region [myR*chunkU64 ..].
+  for (size_t j = tid; j < chunkU64; j += nthreads) {
+    ll.bcast((int)((size_t)myR * chunkU64 + j), src[j]);
+  }
+  // Gather every rank's chunk (incl. my own bcast) into local recvbuff.
+  for (int r = 0; r < nR; r++) {
+    for (size_t j = tid; j < chunkU64; j += nthreads) {
+      dst[(size_t)r * chunkU64 + j] = ll.recv<uint64_t>((int)((size_t)r * chunkU64 + j));
+    }
+  }
+  ll.endEpoch(ncclCoopCta());
+}
+
 // Single-node hybrid AllGather (-D 3):
-//   chunkBytes <= ALLGATHER_LSA_SINGLE_CTA_MAX: LSA on a single CTA (tiny, barrier-bound).
-//   chunkBytes <= sdmaThreshold:                vectorized LSA (all CTAs).
-//   chunkBytes >  sdmaThreshold:                direct all-peers GIN puts (proven MI355X path).
+//   chunkBytes <= ALLGATHER_LL_MAX_BYTES:        LL packed data+flag, single CTA (tiny, no barrier).
+//   chunkBytes <= ALLGATHER_LSA_SINGLE_CTA_MAX:  LSA on a single CTA (small, barrier-bound).
+//   chunkBytes <= sdmaThreshold:                 vectorized LSA (all CTAs).
+//   chunkBytes >  sdmaThreshold:                 direct all-peers GIN puts (proven MI355X path).
 //
 // sdmaThresholdOverride lets the AllGather-specific env var
 // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER tune this LSA<->GIN cutover
 // independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
 // value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
   const size_t chunkBytes = count * sizeof(T);
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -229,6 +295,20 @@ __global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset
 
   if (chunkBytes <= sdmaThreshold) {
     ncclTeam lsa = ncclTeamLsa(devComm);
+
+    // Tiny messages: LL packed data+flag path (single CTA). Barrier-free and
+    // immune to the recvbuff-memset race (cross-rank traffic stays in the
+    // epoch-tagged LL scratch; only local recvbuff is written). Used when LL is
+    // configured (nSlots>0), the chunk is 8-byte aligned, and it fits the
+    // pre-sized slot count.
+    if (llHandle.nSlots != 0 && (chunkBytes % 8 == 0) && chunkBytes <= (size_t)ALLGATHER_LL_MAX_BYTES) {
+      const size_t chunkU64 = chunkBytes / 8;
+      if ((size_t)devComm.nRanks * chunkU64 <= (size_t)llHandle.nSlots) {
+        if (blockIdx.x != 0) return;  // single CTA
+        AllGatherLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, devComm, lsa, llHandle);
+        return;
+      }
+    }
 
     // Tiny messages: collapse to a single CTA to avoid multiplying the
     // cross-rank LSA barrier traffic by deviceCtaCount. All ranks take this
@@ -295,7 +375,11 @@ testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t agThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", (size_t)262144);
+#if defined(AG_HAVE_LL)
+        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr, g_agLLHandle));
+#else
         TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr));
+#endif
         return testSuccess;
       }
 #endif
