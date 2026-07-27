@@ -95,7 +95,9 @@ testResult_t BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
       }
       reqs->barrierCount = deviceCtaCount;
       reqs->lsaBarrierCount = deviceCtaCount;
-      reqs->ginSignalCount = deviceCtaCount;
+      // >=2 so the scatter+allgather large tier (§4.8) can use two independent
+      // signal indices (scatter=0, gather=1); the flat/LSA paths use only 0.
+      reqs->ginSignalCount = (deviceCtaCount < 2) ? 2 : deviceCtaCount;
       // LL scratch for the tiny-message fast path (single CTA => nBlocks=1),
       // on by default up to BROADCAST_LL_DEFAULT_MAX_BYTES, tunable via
       // NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES (bytes; 0 = disable). Broadcast carries
@@ -135,7 +137,8 @@ bool BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
     case 3: // GinHybridBroadcastKernel: LSA direct (small) + root GIN puts (large)
       reqs->barrierCount = deviceCtaCount;
       reqs->lsaBarrierCount = deviceCtaCount;
-      reqs->ginSignalCount = deviceCtaCount;
+      // >=2 for the scatter+allgather large tier's two signal indices (§4.8).
+      reqs->ginSignalCount = (deviceCtaCount < 2) ? 2 : deviceCtaCount;
       return true;
 #endif
     default:
@@ -322,6 +325,109 @@ __global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset
     gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + 1);
   }
 }
+
+// Large-message Broadcast via scatter + in-place allgather (van de Geijn). See
+// gin-anvil-sdma-broadcast-design-plan.md §4.8.
+//
+// The flat fan-out (GinHybridBroadcastKernel large path) is latency-optimal
+// (1 hop) but its bandwidth is capped by *root egress*: the root alone pushes
+// N-1 full copies of the message, so busBw = B_root_egress / N (measured
+// ~60 GB/s @128 MiB on 8x MI355X). This kernel breaks that ceiling by making
+// every rank forward data, the same way the AllGather GIN path reaches
+// ~388 GB/s:
+//
+//   Phase 1 (scatter): the root sends chunk r (= the r-th M/N slice) to rank r,
+//     so only M total bytes leave the root instead of (N-1)*M. Each non-root
+//     receives exactly one scatter put (signal 0) and waits base0+1; the root
+//     copies its own slice locally (its slot is never written by the allgather).
+//   Phase 2 (allgather): every rank puts its own slice into every peer's
+//     matching slot, so egress is distributed across all N ranks. Each rank
+//     receives exactly N-1 puts (signal 1) and waits base1+(N-1).
+//
+// Two distinct signal indices (scatter=0, gather=1) keep the per-phase completion
+// counts from interleaving, so NO inter-phase barrier is needed: a non-root only
+// begins forwarding after its waitSignal(0) (a CTA-wide op that also makes the
+// scatter data visible), and the root reads its own slice from the stable
+// sendwin (not the just-written recvwin), so its local copy needs no ordering
+// vs its allgather puts. Only the entry barrier is kept (recvbuff quiescent
+// before the root writes -- initData memset race, as in the flat path).
+//
+// Host-gated to large messages (NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES,
+// default 2 MiB) with count >= nRanks, where the egress ceiling dominates the
+// extra round + scatter setup. Requires ginSignalCount >= 2 (set in
+// BroadcastGetDevCommRequirements case 3).
+template <typename T>
+__global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+  const int N = devComm.nRanks;
+  const int rank = devComm.rank;
+  // Even split with the remainder folded into the last rank's slice. Host
+  // guarantees count >= N, so baseCount >= 1.
+  const size_t baseCount = count / (size_t)N;
+  const size_t tailCount = count - baseCount * (size_t)(N - 1);
+  const size_t myCount = (rank == N - 1) ? tailCount : baseCount;
+  const size_t myByteOff = (size_t)rank * baseCount * sizeof(T);
+  const size_t myBytes = myCount * sizeof(T);
+
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+
+  ncclGin gin { devComm, /*context=*/0 };
+  const unsigned int sigScatter = 0;
+  const unsigned int sigGather = 1;
+  const uint64_t baseScatter = gin.readSignal(sigScatter);
+  const uint64_t baseGather = gin.readSignal(sigGather);
+
+  // Entry barrier: every rank's recvbuff quiescent before the root scatters.
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  // --- Phase 1: scatter chunk r -> rank r (root only) ---
+  if (rank == root) {
+    // The root's own slot is never written by the allgather (peers only forward
+    // their own slice), so fill it locally from the source. Independent of the
+    // allgather puts below (which read the root slice from sendwin), so no
+    // intra-CTA ordering is required. No-op when in-place (local src == dst).
+    T* lsrc = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* ldst = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+    if (lsrc != ldst) {
+      const size_t myElt = (size_t)rank * baseCount;
+      BroadcastLocalCopy<T>(ldst + myElt, lsrc + myElt, myCount, tid, nthreads);
+    }
+    for (int r = tid; r < N; r += nthreads) {
+      if (r == root) continue;
+      const size_t rCount = (r == N - 1) ? tailCount : baseCount;
+      const size_t rOff = (size_t)r * baseCount * sizeof(T);
+      gin.put(ncclTeamWorld(devComm), r,
+          recvwin, recvoffset + rOff,
+          sendwin, sendoffset + rOff,
+          rCount * sizeof(T), ncclGin_SignalInc{sigScatter});
+    }
+    // No intermediate flush: the scatter and allgather sources are both the
+    // read-only sendwin, so there is no source-reuse hazard, and completion is
+    // signal-based. Skipping it lets the scatter and allgather puts pipeline;
+    // the single flush at the end drains all dirty queues.
+  } else {
+    // Wait (CTA-wide) for my scatter slice before I forward it in the allgather.
+    gin.waitSignal(ncclCoopCta(), sigScatter, baseScatter + 1);
+  }
+
+  // --- Phase 2: in-place allgather of the N slices ---
+  // My slice source: the root reads its stable sendwin (avoids a local-copy vs
+  // put ordering hazard); non-roots read the scatter result in their recvwin
+  // (made visible by the waitSignal above).
+  ncclWindow_t myWin = (rank == root) ? sendwin : recvwin;
+  const size_t myWinOff = (rank == root) ? (sendoffset + myByteOff) : (recvoffset + myByteOff);
+  for (int r = tid; r < N; r += nthreads) {
+    if (r == rank) continue;
+    gin.put(ncclTeamWorld(devComm), r,
+        recvwin, recvoffset + myByteOff,
+        myWin, myWinOff,
+        myBytes, ncclGin_SignalInc{sigGather});
+  }
+  // Every rank (root included) receives exactly N-1 allgather puts.
+  gin.waitSignal(ncclCoopCta(), sigGather, baseGather + (uint64_t)(N - 1));
+  gin.flush(ncclCoopCta());
+}
 #endif
 #endif
 
@@ -351,6 +457,29 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t bcastThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST", (size_t)262144);
+
+        // Large-message tier (§4.8): scatter + in-place allgather. Distributes
+        // egress across all ranks to beat the flat fan-out's root-egress ceiling
+        // (busBw = B_root_egress / N). Gated to large messages via
+        // NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES (bytes, optional K/M/G
+        // suffix; default 2 MiB; 0 = disable, keeping the proven flat path).
+        // Crossover measured on 8x MI355X (-V 32, in-place, 2026-07-27): SAG is a
+        // slight win at 2M (35.9 vs flat 33.4), decisive >=4M (4M 62 vs 42, 128M
+        // 224 vs 60), and loses <2M (1M 19.4 vs 23.7). So default 2 MiB.
+        static const size_t bcastSagMin = []() {
+          size_t v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES");
+          return (v == TEST_SDMA_THRESHOLD_UNSET) ? (size_t)(2ull * 1024 * 1024) : v;
+        }();
+        // In the -D 3 path `comm` is the ncclDevComm handle (testLaunchDeviceKernel*
+        // casts it), NOT a real ncclComm_t -- so read nRanks from the devComm
+        // struct rather than ncclCommCount (which would fault on a corrupted comm).
+        const int sagRanks = (int)((struct ncclDevComm*)comm)->nRanks;
+        const size_t msgBytes = count * wordSize(type);
+        if (bcastSagMin != 0 && sagRanks >= 2 && msgBytes >= bcastSagMin &&
+            count >= (size_t)sagRanks) {
+          TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinScatterAllgatherBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+          return testSuccess;
+        }
 #if defined(BC_HAVE_LL)
         TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr, g_bcastLLHandle));
 #else
