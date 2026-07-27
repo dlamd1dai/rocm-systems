@@ -1,0 +1,283 @@
+/*************************************************************************
+ * Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+ *
+ * See LICENSE.txt for license information
+ ************************************************************************/
+
+// Host unit tests for the pure GIN-SDMA collective policy logic shared by the
+// Broadcast / AllGather / AllToAll device kernels and their host dispatch
+// (projects/rccl-tests/src/gin_sdma_collective_policy.h). These cover the
+// tier-selection, threshold/env resolution, chunk/alignment and devComm
+// requirement decisions to high line+branch coverage WITHOUT a GPU: the header
+// is compiled as plain host C++, and the same functions are called by the
+// __global__ kernels on device, so exercising them here exercises the real
+// decision code. GPU data-movement correctness (the branch bodies) is covered
+// separately by the ctest `gpu_functional` matrix.
+
+#include <gtest/gtest.h>
+
+#include "gin_sdma_collective_policy.h"
+
+using namespace gin_sdma;
+
+namespace {
+
+constexpr size_t kUnset = kThresholdUnset;
+
+// --------------------------------- parseSize ---------------------------------
+
+TEST(ParseSize, NullAndEmptyAreUnset) {
+  EXPECT_EQ(parseSize(nullptr), kUnset);
+  EXPECT_EQ(parseSize(""), kUnset);
+}
+
+TEST(ParseSize, NonNumericIsUnset) {
+  EXPECT_EQ(parseSize("abc"), kUnset);  // no digits consumed
+  EXPECT_EQ(parseSize("K"), kUnset);    // suffix only, no digits
+}
+
+TEST(ParseSize, PlainDecimal) {
+  EXPECT_EQ(parseSize("0"), 0u);
+  EXPECT_EQ(parseSize("1024"), 1024u);
+  EXPECT_EQ(parseSize("262144"), 262144u);
+}
+
+TEST(ParseSize, BinarySuffixesBothCases) {
+  EXPECT_EQ(parseSize("4K"), 4u * 1024);
+  EXPECT_EQ(parseSize("4k"), 4u * 1024);
+  EXPECT_EQ(parseSize("2M"), 2u * 1024 * 1024);
+  EXPECT_EQ(parseSize("2m"), 2u * 1024 * 1024);
+  EXPECT_EQ(parseSize("1G"), 1024u * 1024 * 1024);
+  EXPECT_EQ(parseSize("1g"), 1024u * 1024 * 1024);
+}
+
+TEST(ParseSize, UnknownSuffixIgnored) {
+  EXPECT_EQ(parseSize("512B"), 512u);
+  EXPECT_EQ(parseSize("10X"), 10u);
+}
+
+// ------------------------------ resolveThreshold -----------------------------
+
+TEST(ResolveThreshold, CollectiveValueWins) {
+  EXPECT_EQ(resolveThreshold(4096, 8192, 262144), 4096u);
+}
+
+TEST(ResolveThreshold, SharedUsedWhenCollUnset) {
+  EXPECT_EQ(resolveThreshold(kUnset, 8192, 262144), 8192u);
+}
+
+TEST(ResolveThreshold, DefaultWhenBothUnset) {
+  EXPECT_EQ(resolveThreshold(kUnset, kUnset, 262144), 262144u);
+}
+
+TEST(ResolveThreshold, ExplicitZeroIsHonored) {
+  // Zero is a valid "force GIN/SDMA always" value, distinct from unset.
+  EXPECT_EQ(resolveThreshold(0, kUnset, 262144), 0u);
+  EXPECT_EQ(resolveThreshold(kUnset, 0, 262144), 0u);
+}
+
+// -------------------------------- resolveLLCap -------------------------------
+
+TEST(ResolveLLCap, UnsetUsesDefaultThenAligns) {
+  EXPECT_EQ(resolveLLCap(kUnset, kBroadcastLLDefaultMaxBytes, kBroadcastLLMaxBytes),
+            2048u);
+  // AllToAll default is 0 (LL off).
+  EXPECT_EQ(resolveLLCap(kUnset, kAllToAllLLDefaultMaxBytes, kAllToAllLLMaxBytes),
+            0u);
+}
+
+TEST(ResolveLLCap, ClampsToMax) {
+  EXPECT_EQ(resolveLLCap(1u << 20, kBroadcastLLDefaultMaxBytes, kBroadcastLLMaxBytes),
+            kBroadcastLLMaxBytes);
+}
+
+TEST(ResolveLLCap, RoundsDownToEightBytes) {
+  EXPECT_EQ(resolveLLCap(1001, 0, 65536), 1000u);  // 1001 -> 1000
+  EXPECT_EQ(resolveLLCap(1000, 0, 65536), 1000u);  // already aligned
+  EXPECT_EQ(resolveLLCap(7, 0, 65536), 0u);        // below one slot
+}
+
+// ------------------------------ alignChunkCount ------------------------------
+
+TEST(AlignChunkCount, GuardsInvalidInputs) {
+  EXPECT_EQ(alignChunkCount(1000, 0, 4), 0u);
+  EXPECT_EQ(alignChunkCount(1000, -1, 4), 0u);
+  EXPECT_EQ(alignChunkCount(1000, 8, 0), 0u);
+}
+
+TEST(AlignChunkCount, MasksPerElementSize) {
+  // eltSize 4 -> mask ~3: 1000/8=125 -> 124.
+  EXPECT_EQ(alignChunkCount(1000, 8, 4), 124u);
+  // eltSize 8 -> mask ~1: 125 -> 124.
+  EXPECT_EQ(alignChunkCount(1000, 8, 8), 124u);
+  // eltSize 1 -> mask ~15: 125 -> 112.
+  EXPECT_EQ(alignChunkCount(1000, 8, 1), 112u);
+  // eltSize 16 -> mask all ones: unchanged.
+  EXPECT_EQ(alignChunkCount(1000, 8, 16), 125u);
+  // eltSize 2 -> mask ~7: 125 -> 120.
+  EXPECT_EQ(alignChunkCount(1000, 8, 2), 120u);
+}
+
+// -------------------------- bcastUseScatterAllgather -------------------------
+
+TEST(BcastScatterAllgather, DisabledWhenSagMinZero) {
+  EXPECT_FALSE(bcastUseScatterAllgather(8u << 20, 1u << 20, 8, 0));
+}
+
+TEST(BcastScatterAllgather, RequiresAtLeastTwoRanks) {
+  EXPECT_FALSE(bcastUseScatterAllgather(8u << 20, 1u << 20, 1, 2u << 20));
+}
+
+TEST(BcastScatterAllgather, RequiresMessageAtOrAboveMin) {
+  const size_t sagMin = 2u << 20;
+  EXPECT_FALSE(bcastUseScatterAllgather(sagMin - 1, 1u << 20, 8, sagMin));
+  EXPECT_TRUE(bcastUseScatterAllgather(sagMin, 1u << 20, 8, sagMin));
+}
+
+TEST(BcastScatterAllgather, RequiresCountAtLeastNRanks) {
+  EXPECT_FALSE(bcastUseScatterAllgather(8u << 20, 7, 8, 1024));
+  EXPECT_TRUE(bcastUseScatterAllgather(8u << 20, 8, 8, 1024));
+}
+
+// ------------------------------ bcast LL / tier ------------------------------
+
+TEST(BcastLLEligible, AllGates) {
+  const size_t cap = kBroadcastLLMaxBytes;
+  EXPECT_FALSE(bcastLLEligible(64, 0, cap));        // no slots
+  EXPECT_FALSE(bcastLLEligible(60, 1000, cap));     // not 8-aligned
+  EXPECT_FALSE(bcastLLEligible(cap + 8, 100000, cap));  // above ceiling
+  EXPECT_FALSE(bcastLLEligible(800, 99, cap));      // 800/8=100 slots > 99
+  EXPECT_TRUE(bcastLLEligible(800, 100, cap));      // exactly fits
+  EXPECT_TRUE(bcastLLEligible(8, 1, cap));
+}
+
+TEST(BcastKernelTier, LadderSelection) {
+  const size_t thr = 262144;
+  const size_t cap = kBroadcastLLMaxBytes;
+  EXPECT_EQ(bcastKernelTier(thr + 1, thr, 100000, cap), BcastTier::Flat);
+  EXPECT_EQ(bcastKernelTier(800, thr, 100000, cap), BcastTier::LL);
+  // <=thr but LL not configured -> LSA direct.
+  EXPECT_EQ(bcastKernelTier(800, thr, 0, cap), BcastTier::LSADirect);
+  // <=thr, LL configured but message above LL ceiling -> LSA direct.
+  EXPECT_EQ(bcastKernelTier(cap + 8, thr, 1u << 20, cap), BcastTier::LSADirect);
+}
+
+TEST(BcastSignalCount, FloorOfTwo) {
+  EXPECT_EQ(bcastSignalCount(0), 2);
+  EXPECT_EQ(bcastSignalCount(1), 2);
+  EXPECT_EQ(bcastSignalCount(2), 2);
+  EXPECT_EQ(bcastSignalCount(8), 8);
+}
+
+// --------------------------------- sagChunk ----------------------------------
+
+TEST(SagChunk, GuardsNonPositiveRanks) {
+  Chunk c = sagChunk(800, 0, 0);
+  EXPECT_EQ(c.count, 0u);
+  EXPECT_EQ(c.eltOffset, 0u);
+}
+
+TEST(SagChunk, EvenSplit) {
+  Chunk r0 = sagChunk(800, 8, 0);
+  EXPECT_EQ(r0.count, 100u);
+  EXPECT_EQ(r0.eltOffset, 0u);
+  Chunk r3 = sagChunk(800, 8, 3);
+  EXPECT_EQ(r3.count, 100u);
+  EXPECT_EQ(r3.eltOffset, 300u);
+  Chunk r7 = sagChunk(800, 8, 7);
+  EXPECT_EQ(r7.count, 100u);
+  EXPECT_EQ(r7.eltOffset, 700u);
+}
+
+TEST(SagChunk, RemainderFoldedIntoLast) {
+  // 803 / 8 = base 100, last gets 803 - 700 = 103.
+  Chunk r0 = sagChunk(803, 8, 0);
+  EXPECT_EQ(r0.count, 100u);
+  Chunk r7 = sagChunk(803, 8, 7);
+  EXPECT_EQ(r7.count, 103u);
+  EXPECT_EQ(r7.eltOffset, 700u);
+  // Slices must exactly tile the whole message.
+  size_t total = 0;
+  for (int r = 0; r < 8; ++r) total += sagChunk(803, 8, r).count;
+  EXPECT_EQ(total, 803u);
+}
+
+// ------------------------------ AllGather policy -----------------------------
+
+TEST(AgLLEligible, AllGates) {
+  const size_t cap = kAllGatherLLMaxBytes;
+  EXPECT_FALSE(agLLEligible(64, 0, 8, cap));           // no slots
+  EXPECT_FALSE(agLLEligible(60, 1000, 8, cap));        // not 8-aligned
+  EXPECT_FALSE(agLLEligible(cap + 8, 100000, 8, cap)); // above ceiling
+  // nRanks * chunkU64 must fit: 8 * (800/8)=800 slots.
+  EXPECT_FALSE(agLLEligible(800, 799, 8, cap));
+  EXPECT_TRUE(agLLEligible(800, 800, 8, cap));
+}
+
+TEST(AgKernelTier, FullLadder) {
+  const size_t thr = 262144;
+  const size_t cap = kAllGatherLLMaxBytes;
+  const size_t single = kAllGatherLsaSingleCtaMax;
+  EXPECT_EQ(agKernelTier(thr + 1, thr, 100000, 8, cap, single), AGTier::Gin);
+  EXPECT_EQ(agKernelTier(800, thr, 1u << 20, 8, cap, single), AGTier::LL);
+  // <=thr, LL off, <= single-CTA max -> single CTA.
+  EXPECT_EQ(agKernelTier(single, thr, 0, 8, cap, single), AGTier::LSASingleCta);
+  // <=thr, LL off, > single-CTA max -> multi CTA.
+  EXPECT_EQ(agKernelTier(single + 1, thr, 0, 8, cap, single), AGTier::LSAMultiCta);
+}
+
+// ------------------------------ AllToAll policy ------------------------------
+
+TEST(A2aLLEligible, AllGates) {
+  const size_t cap = kAllToAllLLMaxBytes;
+  EXPECT_FALSE(a2aLLEligible(64, 0, 8, cap));           // no slots
+  EXPECT_FALSE(a2aLLEligible(60, 1000, 8, cap));        // not 8-aligned
+  EXPECT_FALSE(a2aLLEligible(cap + 8, 1u << 20, 8, cap)); // above ceiling
+  EXPECT_FALSE(a2aLLEligible(800, 799, 8, cap));        // 8*100 slots needed
+  EXPECT_TRUE(a2aLLEligible(800, 800, 8, cap));
+}
+
+TEST(A2aKernelTier, FullLadder) {
+  const size_t thr = 262144;
+  const size_t cap = kAllToAllLLMaxBytes;
+  EXPECT_EQ(a2aKernelTier(thr + 1, thr, 1u << 20, 8, cap), A2ATier::Gin);
+  EXPECT_EQ(a2aKernelTier(800, thr, 1u << 20, 8, cap), A2ATier::LL);
+  EXPECT_EQ(a2aKernelTier(800, thr, 0, 8, cap), A2ATier::LSA);  // LL off
+}
+
+TEST(A2aDevReqs, PerDeviceImpl) {
+  const int cta = 8;
+
+  DevReqs r1 = a2aDevReqs(1, cta);
+  EXPECT_TRUE(r1.supported);
+  EXPECT_FALSE(r1.needsGin);
+  EXPECT_EQ(r1.lsaBarrierCount, cta);
+  EXPECT_EQ(r1.barrierCount, 0);
+  EXPECT_EQ(r1.ginSignalCount, 0);
+
+  DevReqs r2 = a2aDevReqs(2, cta);
+  EXPECT_TRUE(r2.supported);
+  EXPECT_FALSE(r2.needsGin);
+  EXPECT_EQ(r2.lsaBarrierCount, cta);
+
+  DevReqs r3 = a2aDevReqs(3, cta);
+  EXPECT_TRUE(r3.supported);
+  EXPECT_TRUE(r3.needsGin);
+  EXPECT_EQ(r3.barrierCount, cta);
+  EXPECT_EQ(r3.lsaBarrierCount, cta);
+  EXPECT_EQ(r3.ginSignalCount, cta);
+
+  DevReqs r4 = a2aDevReqs(4, cta);
+  EXPECT_TRUE(r4.supported);
+  EXPECT_TRUE(r4.needsGin);
+  EXPECT_EQ(r4.barrierCount, 1);
+  EXPECT_EQ(r4.lsaBarrierCount, cta - 1);
+  EXPECT_EQ(r4.ginSignalCount, 1);
+
+  DevReqs r0 = a2aDevReqs(0, cta);
+  EXPECT_FALSE(r0.supported);
+  DevReqs r5 = a2aDevReqs(5, cta);
+  EXPECT_FALSE(r5.supported);
+}
+
+}  // namespace
