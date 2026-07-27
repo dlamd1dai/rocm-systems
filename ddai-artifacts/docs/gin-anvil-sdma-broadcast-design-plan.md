@@ -5,9 +5,11 @@
 A four-tier device-initiated broadcast (LL → LSA → flat GIN fan-out → scatter+allgather) is live
 in `projects/rccl-tests/src/broadcast.cu`; `#wrong == 0` across the full root sweep (0..N−1),
 in-place/OOP, float/int8/double, and non-divisible counts. See **"Current design (as implemented)"**
-below for the at-a-glance summary; §3–§4 give the reasoning and per-tier detail. The final build is
-baked into `rccl-gin-gda-sdma-713:latest` (§6). Sections 2 (host ring baseline) and §4.7 (inter-node
-tree) remain background/deferred.
+below for the at-a-glance summary; §3–§4 give the reasoning and per-tier detail. The tier logic is
+shared with the device kernels via `gin_sdma_collective_policy.h` and unit-tested to 100 % branch
+coverage (§6.1). The final build — plus the host policy unit tests, which gate the image at build
+time — is baked into `rccl-gin-gda-sdma-713:latest` (§6). Sections 2 (host ring baseline) and §4.7
+(inter-node tree) remain background/deferred.
 **Date:** 2026-07-22 (rev. 2026-07-24, 2026-07-27)
 **Location:** `work-plans/gin-sdma-backend/broadcast/` (not committed to git)
 **Branch:** `users/dondai/gin-stage2c-sdma-bcast-wip`
@@ -27,6 +29,16 @@ tree) remain background/deferred.
 > (Dockerfile ARG + `docker-gin-gda-sdma-build.bash`). `Broadcast` and `AllGather`
 > were added so the host baselines (`-D 0`) run the full range — without them the
 > host paths faulted above 64M (`ncclDevFuncId not found for coll:0`/`coll:2`).
+>
+> **Shared policy header + test suite (2026-07-27):** all tier-selection / threshold /
+> chunk-math / device-requirement decisions now live in one pure `__host__ __device__`
+> header, `projects/rccl-tests/src/gin_sdma_collective_policy.h` (`namespace gin_sdma`), so
+> the host launch path and the device kernels cannot drift on tier boundaries. A GoogleTest
+> host suite (`gin_sdma_policy_test`, **100 % line + branch coverage**), an opt-in GPU
+> functional CTest matrix, and a gcov coverage target back it; the host unit tests are baked
+> into `rccl-gin-gda-sdma-713:latest` as a `docker build`-time gate and run as a GPU-free
+> preflight in the `gin-sdma-*-test.bash` gates. This is a behavior-preserving refactor — same
+> thresholds, chunking and env knobs. See §6.1.
 
 ---
 
@@ -53,10 +65,12 @@ the matching kernel; `BroadcastGetDevCommRequirements` case 3 reserves the resou
 | **Flat / star** | 256 KiB … 2 MiB | root `gin.put × (N−1)` | one-round direct fan-out; Anvil picks SDMA (> 128 B/put); receiver-side `waitSignal(+1)` | — (between LSA and SAG cutoffs) | — |
 | **Scatter + allgather (SAG)** | ≥ 2 MiB (and `count ≥ N`) | `GinScatterAllgatherBroadcastKernel` | root scatters chunk `r`→rank `r`, then all ranks in-place allgather; two signal indices (scatter=0, gather=1) | `2097152` (2 MiB) | `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` (0 = disable, keep flat) |
 
-Thresholds resolve host-side (`testResolveSdmaThreshold` / `testParseSdmaThresholdEnv`): a
-collective-specific env var wins, else the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (if explicitly set,
-so global force-knobs still work), else the data-driven default above. Values accept a `K`/`M`/`G`
-suffix.
+Thresholds resolve host-side via the shared policy header (`gin_sdma::resolveThreshold` /
+`gin_sdma::parseSize` in `gin_sdma_collective_policy.h`; `common.h`'s `testResolveSdmaThreshold` /
+`testParseSdmaThresholdEnv` are thin `getenv()` wrappers over them): a collective-specific env var
+wins, else the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (if explicitly set, so global force-knobs
+still work), else the data-driven default above. Values accept a `K`/`M`/`G` suffix. This resolution
+(and the SAG-eligibility / chunk-split logic below) is unit-tested to 100 % branch coverage (§6.1).
 
 ### Sync / completion model
 
@@ -374,7 +388,7 @@ The shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` still controls the backend **`gin.put
 
 #### 4.3.1 Per-collective LSA↔GIN threshold and defaults (rccl-tests)
 
-`broadcast.cu`, `all_gather.cu`, and `alltoall.cu` resolve their kernel branch threshold host-side with the chain (`testResolveSdmaThreshold`, `common.h`):
+`broadcast.cu`, `all_gather.cu`, and `alltoall.cu` resolve their kernel branch threshold host-side with the chain (`gin_sdma::resolveThreshold` in `gin_sdma_collective_policy.h`, via `common.h`'s thin `testResolveSdmaThreshold` wrapper):
 
 1. the collective-specific env var, if set;
 2. the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD`, if explicitly set (keeps the global force knob — e.g. **BC-D4** `THRESHOLD=0` → all-GIN — working);
@@ -756,8 +770,13 @@ First three tiers are `GinHybridBroadcastKernel`; the ≥ 2 MiB tier is
 
 ## 6. Proposed test gate (`gin-anvil-broadcast-test.bash`)
 
+The implemented gate is `ddai-artifacts/scripts/gin-sdma-bcast-test.bash` (the `gin-anvil-broadcast-test.bash`
+name below is the original design placeholder). It now opens with a GPU-free unit-test preflight
+(**BC-UT**) before the GPU sections.
+
 | ID | Test | Config |
 |----|------|--------|
+| **BC-UT** | Host policy unit tests | `gin_sdma_policy_test` (no GPU) run as a **hard preflight** in `gin-sdma-bcast-test.bash`; validates the shared tier / threshold / chunk / requirement logic to 100 % line+branch. `RUN_POLICY_UT=0` to skip. Also enforced at `docker build` time (`ctest -L unit`). |
 | **BC-C1** | Host `ncclBroadcast` | `-D 0`, 128 B–`MAX_BYTES` (full range, no 64M cap — host broadcast validated to 256M on MI355X), `NCCL_CUMEM_ENABLE=0` — perf reference, **on by default**. Requires the broadcast host ring kernels, which the image now ships via `ONLY_FUNCS="…|Broadcast|AllGather"` (Dockerfile ARG + `docker-gin-gda-sdma-build.bash`). Earlier images omitted them (`ncclDevFuncId … not found for coll:0`); unlike AllGather, broadcast has no direct/copy fast path so it always needs the ring device func. The sibling AllGather gate (`gin-sdma-ag-test.bash`, AG-C1) had the same 64M host cap for the same reason and has likewise been lifted now that `AllGather` is in `ONLY_FUNCS`. |
 | **BC-C2** | GIN hybrid | `-D 3 -V 8`, 128 B–128 M, `NCCL_GIN_TYPE=6` |
 | **BC-C3** | rocSHMEM `team_broadcast` | optional cross-check |
@@ -783,6 +802,41 @@ NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RUN_HOST_BASELINE=0 ./gin-anvil-broadcast-test.b
 
 Default gate env (BC-C2): `NCCL_GIN_TYPE=6`, `THRESHOLD=128`, `NUM_CHANNELS=1`, `FUSED_SIGNAL=0`, `-V 8`.
 
+### 6.1 Implemented test suite: host policy unit tests + GPU functional + coverage (2026-07-27)
+
+The tier-selection / threshold / chunk-math / device-requirement logic that both the host launch
+path and the device kernels depend on was extracted into a single pure header,
+`projects/rccl-tests/src/gin_sdma_collective_policy.h` (`namespace gin_sdma`, `__host__ __device__`).
+`common.h` delegates to it (`testResolveSdmaThreshold` / `testParseSdmaThresholdEnv` are thin
+`getenv()` wrappers over `gin_sdma::resolveThreshold` / `gin_sdma::parseSize`), so host and device
+agree on every tier boundary by construction. No behavior change.
+
+Tests live under `projects/rccl-tests/test/` and are wired into CTest (opt-in `-DBUILD_TESTS=ON`;
+falls back to FetchContent when system GoogleTest is absent):
+
+| Target | Kind | Coverage |
+|---|---|---|
+| `gin_sdma_policy_test` (ctest label `unit`) | GoogleTest, host-only, no GPU | Every branch of the shared header — `parseSize`, `resolveThreshold`, `resolveLLCap`, `alignChunkCount`, and the per-collective tier / eligibility predicates incl. `bcastUseScatterAllgather`, `bcastLLEligible` and the Broadcast tier ladder. **100 % line and branch** (29 cases). |
+| `gin_sdma_gpu_{broadcast,all_gather,alltoall}` (label `gpu_functional`, `-DBUILD_GPU_FUNCTIONAL_TESTS=ON`) | CTest + MPI, needs GPUs | Drives the real device kernels through the `*_perf` binaries across every tier, root sweep, in-place/OOP, and tail/alignment, using the built-in `#wrong` correctness check. |
+
+- **Coverage target.** `-DENABLE_COVERAGE=ON` adds a `gin_sdma_coverage` make target
+  (`test/gin_sdma_coverage.sh`) that runs the unit tests and reports line+branch coverage of the
+  policy header, gating on `GIN_SDMA_COVERAGE_MIN_PCT` (default 95 %). It auto-selects
+  `llvm-cov gcov` for amdclang/hipcc builds and GNU `gcov` otherwise (so it works locally and in
+  the ROCm image).
+- **Image bake-in (build-time gate).** The canonical image installs `libgtest-dev` (dedicated late
+  layer, so it does not bust the RCCL/rocSHMEM build cache) and builds rccl-tests with
+  `-DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON`, then runs `ctest -L unit` during
+  `docker build` — a regression in the host policy fails the image build instead of surfacing on
+  the GPU gate.
+- **Gate-script preflight (BC-UT).** `gin-sdma-{bcast,ag,a2a}-test.bash` run the baked
+  `gin_sdma_policy_test` (GPU-free) as a hard preflight before the GPU sections
+  (`RUN_POLICY_UT=0` to skip).
+- **Validated end-to-end (8× MI355X, gfx950, 2026-07-27):** full `docker-gin-gda-sdma-build.bash`
+  rebuild passed the in-build unit gate (`100% tests passed, 0 failed out of 1`), the post-build
+  GIN Anvil-SDMA smoke assert (`NCCL_GIN_TYPE=6`, ~8.1 GB/s @1 MiB), and the baked binary running
+  29/29 green via the BC-UT preflight path.
+
 > **Build-hardening tie-in (2026-07-24):** the image build now runs a post-build GIN
 > Anvil-SDMA smoke assert (`RCCL_IMAGE_GIN_SMOKE` in `docker-gin-gda-sdma-build.bash`,
 > currently exercising the A2A Test#5 with `NCCL_GIN_TYPE=6`). When
@@ -791,15 +845,17 @@ Default gate env (BC-C2): `NCCL_GIN_TYPE=6`, `THRESHOLD=128`, `NUM_CHANNELS=1`, 
 > as a broadcast test error.
 >
 > **Canonical image bake-in (2026-07-27):** the final `broadcast.cu` (SCATTER_AG_MIN
-> default 2 MiB) is baked into `rccl-gin-gda-sdma-713:latest` (old image retained as
-> `:pre-2mib-YYYYMMDD`). A from-scratch `docker-gin-gda-sdma-build.bash` was **blocked by
-> Docker Hub's anonymous pull rate limit** on `FROM ubuntu:24.04` (no AMD dockerhub proxy
-> in `registry-sc-harbor.amd.com` / `compute-artifactory.amd.com`), so the image was
-> produced via a **clean Dockerfile relink** (`Dockerfile-rccl-gin-gda-sdma-bcast-relink`,
-> `FROM` the existing image + `COPY broadcast.cu` + `make broadcast_perf`) — reproducible,
-> not a `docker commit`. Validated fresh-container default tier selection with no env
-> override: 1 MiB 23.8 (flat) → 2 MiB 35.6 (SAG) → 4 MiB 57.2 → 128 MiB 216.6, `#wrong==0`.
-> Re-run the full from-scratch build once the rate limit resets (or `docker login`).
+> default 2 MiB) **plus the GIN-SDMA host policy unit tests** are baked into
+> `rccl-gin-gda-sdma-713:latest`. The Dockerfile now installs `libgtest-dev` (dedicated late
+> layer, preserving the RCCL/rocSHMEM build cache), builds rccl-tests with
+> `-DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON`, and runs `ctest -L unit` at `docker build`
+> time as a hard gate. A full `docker-gin-gda-sdma-build.bash` rebuild on 8× MI355X (gfx950)
+> passed end-to-end: the in-build unit gate (`100% tests passed, 0 failed`), the post-build GIN
+> Anvil-SDMA smoke assert (`NCCL_GIN_TYPE=6`, ~8.1 GB/s @1 MiB), and the baked `gin_sdma_policy_test`
+> running 29/29 green via the gate-script preflight. Earlier fresh-container default tier selection
+> (no env override) was also confirmed: 1 MiB 23.8 (flat) → 2 MiB 35.6 (SAG) → 4 MiB 57.2 →
+> 128 MiB 216.6, `#wrong==0`. Note: a **no-cache** from-scratch build can still hit Docker Hub's
+> anonymous pull limit on `FROM ubuntu:24.04`; use cached base layers or `docker login` if it recurs.
 
 ---
 
@@ -810,8 +866,12 @@ Default gate env (BC-C2): `NCCL_GIN_TYPE=6`, `THRESHOLD=128`, `NUM_CHANNELS=1`, 
 | `projects/rccl-tests/src/broadcast.cu` | `GinHybridBroadcastKernel` (-D 3), `BroadcastGetSdmaThreshold`, `BroadcastLsaDirect`, `BroadcastGetDevCommRequirements`, `BroadcastRunColl` case 3 |
 | `projects/rccl-tests/src/broadcast.cu` (§4.8) | **DONE & validated:** `GinScatterAllgatherBroadcastKernel` (scatter signal 0 + in-place allgather signal 1, entry barrier only), host gate in `BroadcastRunColl` case 3 via `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` (**default 2 MiB**, 0=disable), `ginSignalCount>=2` in `BroadcastGetDevCommRequirements`. Crossover measured (§4.8.5); robust across `-V 8..32` and SDMA channels. **Optional future:** chunked scatter/allgather pipeline for ≥512 MiB (§4.8.5), factor AllGather body into a shared device helper (§8 Q8) |
 | `ddai-artifacts/scripts/gin-sdma-bcast-test.bash` (§4.8) | **DONE (prototype):** `SCATTER_AG_MIN` env → `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` passthrough on BC-C2 (0 forces flat path for A/B) |
-| `projects/rccl-tests/src/CMakeLists.txt` | `broadcast_perf` links rocSHMEM (if needed, mirror `all_gather_perf`) |
-| `gin-anvil-broadcast-test.bash` | Gate harness (BC-C1/C2/C3) |
+| `projects/rccl-tests/src/CMakeLists.txt` | `broadcast_perf` links rocSHMEM (if needed, mirror `all_gather_perf`); adds `gin_sdma_collective_policy.h` to the hipify `COMMON_FILES` list |
+| `projects/rccl-tests/src/gin_sdma_collective_policy.h` | **DONE (2026-07-27):** new shared `__host__ __device__` policy header — the single source of truth for tier / threshold / chunk / device-requirement logic used by all three `.cu` kernels and `common.h` (which now delegates to it) |
+| `projects/rccl-tests/test/{gin_sdma_policy_test.cpp, gin_sdma_gpu_functional.sh, gin_sdma_coverage.sh, CMakeLists.txt}` + top-level `CMakeLists.txt` `BUILD_TESTS` | **DONE (2026-07-27):** host GoogleTest suite (100 % line/branch, ctest label `unit`), opt-in GPU functional ctest matrix (label `gpu_functional`), and the `gin_sdma_coverage` gcov/llvm-cov target. See §6.1 |
+| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | **DONE (2026-07-27):** `libgtest-dev` (late layer), `-DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON`, build-time `ctest -L unit` gate |
+| `ddai-artifacts/scripts/gin-sdma-{bcast,ag,a2a}-test.bash` | **DONE (2026-07-27):** GPU-free `gin_sdma_policy_test` preflight (BC-UT, hard gate, `RUN_POLICY_UT=0` to skip) |
+| `gin-anvil-broadcast-test.bash` | Gate harness (BC-C1/C2/C3). **Implemented as `gin-sdma-bcast-test.bash`** |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Extend the post-build GIN smoke assert to cover BC-C2 (see §6 build-hardening tie-in) |
 
 No changes to `gin_plugin_anvil_sdma.cc` or device templates unless a broadcast-specific bug is found.
