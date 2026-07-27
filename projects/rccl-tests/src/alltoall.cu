@@ -22,10 +22,10 @@
 // build. Gate the LL wiring on exactly that availability.
 #if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
 #define A2A_HAVE_LL 1
-// Compile-time ceiling on the per-peer chunk (bytes) that the LL path can
-// serve; the LL scratch is sized for this cap at devComm creation. The *actual*
-// LL<->LSA cutover is runtime-gated (see below): env NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES.
-#define ALLTOALL_LL_MAX_BYTES 65536
+// Compile ceiling on the per-peer chunk (bytes) the LL path can serve lives in
+// gin_sdma_collective_policy.h (kAllToAllLLMaxBytes, 64 KiB); the LL scratch is
+// sized for this cap at devComm creation. The *actual* LL<->LSA cutover is
+// runtime-gated (see below): env NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES.
 // LL scratch handle: bufHandle is assigned during ncclDevCommCreate; nSlots is
 // set by ncclLLA2ACreateRequirement only when the LL path is enabled. nSlots==0
 // means LL was not configured, so the kernel uses the vectorized LSA path.
@@ -48,7 +48,7 @@ static ncclDevResourceRequirements g_a2aLLReq = {};
 #endif
 
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
-  *paramcount = (count/nranks) & -(16/eltSize);
+  *paramcount = gin_sdma::alignChunkCount(count, nranks, eltSize);
   *sendcount = nranks*(*paramcount);
   *recvcount = *sendcount;
   *sendInplaceOffset = 0;
@@ -100,19 +100,21 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      reqs->barrierCount = deviceCtaCount;
-      reqs->lsaBarrierCount = deviceCtaCount;
-      reqs->ginSignalCount = deviceCtaCount;
+      {
+        gin_sdma::DevReqs dr = gin_sdma::a2aDevReqs(3, deviceCtaCount);
+        reqs->barrierCount = dr.barrierCount;
+        reqs->lsaBarrierCount = dr.lsaBarrierCount;
+        reqs->ginSignalCount = dr.ginSignalCount;
+      }
       // LL scratch for the tiny-message fast path (single CTA => nBlocks=1),
       // opt-in via NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES (per-peer bytes; 0/unset =
       // disabled, the measured-best default). Sized for the LSA team scattering
       // up to the requested cap: a receiver holds nRanks source-chunks of
       // (cap/8) u64 slots (same layout as AllGather).
       {
-        size_t llCap = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES");
-        if (llCap == TEST_SDMA_THRESHOLD_UNSET) llCap = 0;
-        if (llCap > (size_t)ALLTOALL_LL_MAX_BYTES) llCap = (size_t)ALLTOALL_LL_MAX_BYTES;
-        g_a2aLLMaxBytes = (llCap / 8) * 8;  // 8-byte aligned
+        g_a2aLLMaxBytes = gin_sdma::resolveLLCap(
+            testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES"),
+            gin_sdma::kAllToAllLLDefaultMaxBytes, gin_sdma::kAllToAllLLMaxBytes);
         if (g_a2aLLMaxBytes > 0) {
           int llMaxElts = commProperties->nRanks * (int)(g_a2aLLMaxBytes / 8);
           int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
@@ -377,13 +379,11 @@ __global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset,
     // epoch-tagged LL scratch; only local recvbuff is written). Used when LL is
     // configured (nSlots>0), the per-peer chunk is 8-byte aligned, and it fits
     // the pre-sized slot count.
-    if (llHandle.nSlots != 0 && (size % 8 == 0) && size <= (size_t)ALLTOALL_LL_MAX_BYTES) {
+    if (gin_sdma::a2aLLEligible(size, llHandle.nSlots, devComm.nRanks, gin_sdma::kAllToAllLLMaxBytes)) {
+      if (blockIdx.x != 0) return;  // single CTA
       const size_t chunkU64 = size / 8;
-      if ((size_t)devComm.nRanks * chunkU64 <= (size_t)llHandle.nSlots) {
-        if (blockIdx.x != 0) return;  // single CTA
-        AlltoAllLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, devComm, lsa, llHandle);
-        return;
-      }
+      AlltoAllLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, devComm, lsa, llHandle);
+      return;
     }
 
     /* small messages: direct LSA all-peers copy (all CTAs) */
@@ -556,7 +556,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         // GB/s, scaling to ~390) (measured 2026-07-26). Override with
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
-        static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", (size_t)262144);
+        static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", gin_sdma::kAllToAllSdmaThresholdDefault);
 #if defined(A2A_HAVE_LL)
         TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle));
 #else
