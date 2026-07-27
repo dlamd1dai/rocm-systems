@@ -1,0 +1,23 @@
+# Clean, reproducible relink of broadcast_perf onto the canonical GIN Anvil-SDMA image.
+#
+# Rationale: a from-scratch `docker-gin-gda-sdma-build.bash` is currently blocked by
+# Docker Hub's anonymous pull rate limit on `FROM ubuntu:24.04` (no AMD dockerhub
+# proxy is available). Since RCCL and rocSHMEM are unchanged and only
+# projects/rccl-tests/src/broadcast.cu changed (scatter+allgather SCATTER_AG_MIN
+# default 4->2 MiB, §4.8), this stage recompiles just rccl-tests from the updated
+# source using the exact cmake config already baked into /workspace/rccl-tests.
+# This is Dockerfile-based (reproducible), not a `docker commit` of an interactive
+# container. Build context = repo root.
+#
+#   docker build -f ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma-bcast-relink \
+#       -t rccl-gin-gda-sdma-713:latest .
+ARG BASE_IMAGE=rccl-gin-gda-sdma-713:latest
+FROM ${BASE_IMAGE}
+
+# Overlay only the changed source, then relink using the pre-configured build tree.
+COPY projects/rccl-tests/src/broadcast.cu /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu
+
+RUN set -eux; \
+    grep -n "2ull \* 1024 \* 1024) : v" /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu; \
+    cd /workspace/rccl-tests && make -j16 broadcast_perf; \
+    strings /workspace/rccl-tests/broadcast_perf | grep -c ScatterAllgather

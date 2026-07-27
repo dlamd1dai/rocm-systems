@@ -1,7 +1,13 @@
-# GIN-SDMA Broadcast on xGMI: Design Proposal
+# GIN-SDMA Broadcast on xGMI: Design & Implementation
 
-**Document type:** Internal AMD planning
-**Status:** Implemented & validated in `broadcast_perf -D 3` (rev. 2026-07-24) — see §3.2/§4.4 sync correction. Host baseline BC-C1 (`-D 0`) now runs the full size range (64M cap removed) since the image ships the Broadcast **and** AllGather host ring kernels. **2026-07-27:** added the small-message **LL fast path** (§4.3.4), default-on ≤ 2 KiB, ~13–16 % lower latency; see §4.3.2–§4.3.4 for the LL treatment across AllGather/AllToAll/Broadcast.
+**Document type:** Internal AMD design/implementation record
+**Status:** **Implemented & validated** in `broadcast_perf -D 3` on 8× MI355X (`NCCL_GIN_TYPE=6`).
+A four-tier device-initiated broadcast (LL → LSA → flat GIN fan-out → scatter+allgather) is live
+in `projects/rccl-tests/src/broadcast.cu`; `#wrong == 0` across the full root sweep (0..N−1),
+in-place/OOP, float/int8/double, and non-divisible counts. See **"Current design (as implemented)"**
+below for the at-a-glance summary; §3–§4 give the reasoning and per-tier detail. The final build is
+baked into `rccl-gin-gda-sdma-713:latest` (§6). Sections 2 (host ring baseline) and §4.7 (inter-node
+tree) remain background/deferred.
 **Date:** 2026-07-22 (rev. 2026-07-24, 2026-07-27)
 **Location:** `work-plans/gin-sdma-backend/broadcast/` (not committed to git)
 **Branch:** `users/dondai/gin-stage2c-sdma-bcast-wip`
@@ -21,6 +27,66 @@
 > (Dockerfile ARG + `docker-gin-gda-sdma-build.bash`). `Broadcast` and `AllGather`
 > were added so the host baselines (`-D 0`) run the full range — without them the
 > host paths faulted above 64M (`ncclDevFuncId not found for coll:0`/`coll:2`).
+
+---
+
+## Current design (as implemented)
+
+Device-initiated, **single-node xGMI** broadcast exposed as `broadcast_perf -D 3` with
+`NCCL_GIN_TYPE=6` (Anvil SDMA GIN backend). No backend/GIN-ABI changes — the design lives entirely
+in two rccl-tests kernels in `projects/rccl-tests/src/broadcast.cu`:
+
+- **`GinHybridBroadcastKernel`** — the small/medium tiers (LL, LSA, flat GIN fan-out). All ranks
+  launch; only the root moves data; non-roots hit barriers and a receiver-side `waitSignal`.
+- **`GinScatterAllgatherBroadcastKernel`** — the large tier: a root scatter followed by an in-place
+  allgather, so egress is spread across **all** ranks instead of the root alone.
+
+Host code (`BroadcastRunColl` case 3) picks the tier by full message size (`msgBytes`) and dispatches
+the matching kernel; `BroadcastGetDevCommRequirements` case 3 reserves the resources.
+
+### Tier ladder (by full `msgBytes`, `N` = nRanks)
+
+| Tier | Size range | Path | Mechanism | Default cutoff | Env override |
+|---|---|---|---|---|---|
+| **LL** | ≤ 2 KiB | `BroadcastLLImpl` (single CTA) | packed 8 B data + epoch flag in LL scratch; no LSA barrier | `2048` (cap 64 KiB) | `NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES` (0 = off) |
+| **LSA** | ≤ 256 KiB | `BroadcastLsaDirect` (root only) | root SM stores the source to every peer's `recvbuff` over LSA/IPC | `262144` | `NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST` (or shared `…_THRESHOLD`) |
+| **Flat / star** | 256 KiB … 2 MiB | root `gin.put × (N−1)` | one-round direct fan-out; Anvil picks SDMA (> 128 B/put); receiver-side `waitSignal(+1)` | — (between LSA and SAG cutoffs) | — |
+| **Scatter + allgather (SAG)** | ≥ 2 MiB (and `count ≥ N`) | `GinScatterAllgatherBroadcastKernel` | root scatters chunk `r`→rank `r`, then all ranks in-place allgather; two signal indices (scatter=0, gather=1) | `2097152` (2 MiB) | `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` (0 = disable, keep flat) |
+
+Thresholds resolve host-side (`testResolveSdmaThreshold` / `testParseSdmaThresholdEnv`): a
+collective-specific env var wins, else the shared `NCCL_GIN_ANVIL_SDMA_THRESHOLD` (if explicitly set,
+so global force-knobs still work), else the data-driven default above. Values accept a `K`/`M`/`G`
+suffix.
+
+### Sync / completion model
+
+- **Entry barrier only** (world barrier for GIN tiers, LSA barrier for the LSA tier): guarantees every
+  rank's `recvbuff` is past the rccl-tests `initData` memset before any peer writes it.
+- **Receiver-side signal completion, no exit barrier.** `ncclGin_SignalInc` is a *remote* action that
+  increments the **receiver's** signal. Flat: each non-root receives exactly one put and waits
+  `base+1`; the root receives none and only `flush`es. SAG: scatter completion is a non-root
+  `waitSignal(0, base0+1)`; gather completion is `waitSignal(1, base1+(N−1))` on every rank; a single
+  `flush` drains the queues. The two distinct signal indices let the phases run without an inter-phase
+  barrier.
+
+### DevComm requirements (`-D 3`, case 3)
+
+`barrierCount = lsaBarrierCount = deviceCtaCount`; `ginSignalCount = max(deviceCtaCount, 2)` (≥ 2 for
+the SAG two-signal scheme); `ginConnectionType = NCCL_GIN_CONNECTION_FULL`; plus an LL scratch
+resource (`ncclLLA2ACreateRequirement`, `nBlocks=1`) sized to the LL cap for the tiny tier.
+
+### Measured performance (8× MI355X, `NCCL_GIN_TYPE=6`, in-place)
+
+- **Small (LL tier):** 128 B–1 KiB ≈ **6.1–6.3 µs** (~13–16 % below the LSA path).
+- **Large:** flat fan-out plateaus at the root-egress ceiling (~60 GB/s @128 MiB); **SAG lifts
+  128 MiB to ~224 GB/s (≈3.7×)**. SAG sits at the AllGather roofline near the elbow (≤128 MiB) and
+  plateaus at ~229 GB/s for ≥ 256 MiB (serial scatter no longer hidden — see §4.8.5).
+- `#wrong == 0` across the full root sweep, in-place/OOP, float/int8/double, and non-divisible counts.
+- Not helped: extra SDMA channels; robust across `-V 8..32`.
+
+The remaining sections give the rationale (§3–§4.3), the flat-path detail (§3.2–§4.4), the LL fast
+path (§4.3.4), the large-message SAG tier and its measurements (§4.8), the gate/CI plan (§6), and the
+deferred inter-node tree (§4.7).
 
 ---
 
@@ -91,23 +157,29 @@ AllGather’s AG-C1 gate noted the same split: host path (`-D 0`) uses RCCL ring
 
 ---
 
-## 3. Proposed GIN-SDMA broadcast: `GinHybridBroadcastKernel`
+## 3. GIN-SDMA broadcast: `GinHybridBroadcastKernel` (implemented)
 
-Follow the **settled AllGather hybrid** (`GinHybridAllGatherKernel`): no transport/plugin changes, only a new collective kernel in `broadcast.cu`.
+Follows the **settled AllGather hybrid** (`GinHybridAllGatherKernel`): no transport/plugin changes,
+only collective kernels in `broadcast.cu`. This section covers the LL/LSA/flat tiers of
+`GinHybridBroadcastKernel`; the large **scatter+allgather** tier (`GinScatterAllgatherBroadcastKernel`)
+is §4.8. See "Current design (as implemented)" above for the full tier ladder at a glance.
 
 ### 3.1 High-level algorithm
 
-On single-node xGMI with `NCCL_GIN_TYPE=6`:
+On single-node xGMI with `NCCL_GIN_TYPE=6` (by full `msgBytes`):
 
 | Message size | Active rank(s) | Path |
 |--------------|----------------|------|
-| ≤ broadcast LSA↔GIN threshold (**256 KiB default**, see §4.3.1) | **root only** | LSA direct stores to every peer’s `recvbuff` |
-| > threshold | **root only** | One-round **`gin.put` to all non-self peers**; Anvil picks IPC (≤ threshold) or SDMA (> threshold) |
-| all ranks | all | Entry world/LSA barrier; **non-roots complete via receiver-side `waitSignal(+1)`** (see §4.4) |
+| ≤ LL cap (**2 KiB default**, §4.3.4) | **root + all** | LL packed data+flag fast path, single CTA (no LSA barrier) |
+| ≤ LSA↔GIN threshold (**256 KiB default**, §4.3.1) | **root only** | LSA direct stores to every peer’s `recvbuff` |
+| threshold … scatter-AG min (**2 MiB**, §4.8) | **root only** | One-round **`gin.put` to all non-self peers**; Anvil picks IPC (≤ 128 B/put) or SDMA (>) |
+| ≥ scatter-AG min (**2 MiB default**, §4.8) | **all ranks** | **scatter + in-place allgather** (`GinScatterAllgatherBroadcastKernel`) — distributes egress |
+| all ranks | all | Entry world/LSA barrier; **non-roots complete via receiver-side `waitSignal`** (see §4.4) |
 
-> **Validated 2026-07-24 (8× MI355X, `NCCL_GIN_TYPE=6`, `-V 8`):** `#wrong == 0` for
-> every root 0..7, 128 B–128 MB, in-place and OOP, at both `THRESHOLD=128` (hybrid) and
-> `THRESHOLD=0` (all-SDMA, BC-D4). Perf @128 MB: in-place ~60 GB/s, OOP ~41 GB/s.
+> **Validated (8× MI355X, `NCCL_GIN_TYPE=6`):** `#wrong == 0` for every root 0..N−1, 128 B–1 GiB,
+> in-place and OOP, float/int8/double and non-divisible counts, at `THRESHOLD=128` (hybrid),
+> `THRESHOLD=0` (all-SDMA, BC-D4), and with SAG on (default) and off. Perf @128 MiB in-place:
+> flat ~60 GB/s, SAG ~224 GB/s (≈3.7×); OOP flat ~41 GB/s.
 
 **Reject ring/tree** for the same reasons as AllGather: full xGMI mesh, one-round direct is native; ring adds steps and signal complexity with no topology benefit.
 
@@ -399,6 +471,11 @@ AllGather's entry barrier).
 > The OOP < in-place gap is the extra root-local `send → recv` copy that in-place skips.
 > Vectorizing that copy (16-byte stores) lifted OOP from ~24 → ~41 GB/s @128 MB with `-V 8`.
 > Further OOP gains would come from overlapping the local copy with the remote puts.
+>
+> **Large-message ceiling:** the ~60 GB/s in-place figure is the root-egress cap
+> (`busBw = B_root_egress / N`, §4.8.1), not an SDMA-engine limit. The **scatter + allgather**
+> tier (§4.8, default ≥ 2 MiB) lifts 128 MiB in-place to **~224 GB/s (≈3.7×)** — measured,
+> at the AllGather roofline for the `M/N` chunk size — by distributing egress across all N ranks.
 
 Bus bandwidth formula for the test harness:
 
@@ -414,28 +491,266 @@ Bus bandwidth formula for the test harness:
 - **rccl-tests first** — same staging as AllGather: `-D 3` in `broadcast.cu`, gate script, then optional production `ncclBroadcast` direct path later.
 - **No ring/tree variants** — consistent with AllGather v1 decision table.
 
+### 4.8 Large-message optimization: scatter + allgather
+
+**Status:** **implemented & validated on 8× MI355X** (`GinScatterAllgatherBroadcastKernel` in
+`broadcast.cu`, 2026-07-27): `#wrong == 0` across the full root sweep (in-place/OOP,
+float/int8/double, non-divisible counts), and **128 MiB in-place 60.5 → 223.9 GB/s (≈3.7×)** vs
+the flat path (same-build A/B). See §4.8.5 for the measured sweep. This adds a **third
+large-message tier** above the flat fan-out; it does not change the LL/LSA small tiers or the
+flat path.
+
+#### 4.8.1 Why the flat fan-out plateaus (root-egress ceiling)
+
+The flat/star path (§3.1.1, §4.1) is latency-optimal (1 hop) but its large-message bandwidth is
+**structurally capped by root egress**: only the root sends, so it pushes **N−1 full copies** of
+the message out over its own outbound xGMI/SDMA links. For the harness busbw definition
+(`busBw = algBw · (N−1)/N`, one copy delivered to N−1 receivers):
+
+```text
+flat broadcast:  T = (N-1)·M / B_root_egress
+                 algBw = M/T = B_root_egress / (N-1)
+                 busBw = algBw·(N-1)/N = B_root_egress / N
+```
+
+So flat busbw is **root egress ÷ N**, independent of how many SDMA queues are added once the
+root's links are saturated. Measured 128 MiB in-place ~60 GB/s on 8× MI355X ⇒ root egress
+≈ **480 GB/s fully saturated**. This is exactly why the same SDMA engines yield **388 GB/s for
+AllGather** (`allgather-host-sdma-vs-gin-sdma-benchmark.md`) but only ~60 for broadcast:
+AllGather spreads egress across all N ranks; flat broadcast concentrates it on one.
+
+> **Corollary — pull/`gin.get` does not fix this (revises §4.2's "future optimization" hope).**
+> A non-root `gin.get`-from-root variant still funnels N−1 copies through the *root's* HBM read
+> port and outbound links. Get-vs-put changes *who initiates*, not the total data leaving the
+> root, so the `B_root_egress / N` ceiling is unchanged. Only algorithms where **non-root ranks
+> also forward data** (ring, tree, or scatter+allgather) break the ceiling.
+
+#### 4.8.2 Algorithm: scatter → allgather (van de Geijn)
+
+Reformulate a large broadcast as the bandwidth-optimal two-phase pipeline, reusing the already
+validated **`GinHybridAllGatherKernel`** (388 GB/s @128 MiB):
+
+| Phase | Action | Data off the root | Egress distribution |
+|-------|--------|-------------------|---------------------|
+| **1. Scatter** | root partitions M into N chunks; sends chunk *i* to rank *i* (`gin.put` of M/N per peer) | **M total** (not (N−1)·M) | root only, but 1/(N−1) the volume of flat |
+| **2. AllGather** | all ranks run the existing hybrid AllGather over the M/N-per-rank chunks | (N−1)/N · M **per rank** | **across all N ranks** |
+
+After phase 2 every rank holds all N chunks = the full message. This is the standard
+scatter+allgather (a.k.a. "split") broadcast; MPI/NCCL use it (or a scatter + ring-allgather)
+for exactly this reason on large messages.
+
+#### 4.8.3 Placement in the tier ladder
+
+A new host-resolved threshold `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` selects the tier;
+below it, the proven flat path is retained (lower latency, no scatter setup):
+
+| Message size | Path | Rationale |
+|---|---|---|
+| ≤ LL cap (§4.3.4) | LL packed data+flag | latency floor |
+| ≤ 256 KiB | `BroadcastLsaDirect` (LSA) | latency-bound |
+| 256 KiB … scatter-AG min | **flat fan-out** (`gin.put × (N−1)`) | 1-hop latency still beats 2-phase setup |
+| ≥ scatter-AG min (**2 MiB**, measured) | **scatter + allgather** | root-egress ceiling dominates; distribute egress |
+
+The crossover is data-driven and was measured (§4.8.5): SAG becomes a win at **2 MiB** and
+decisive ≥ 4 MiB, so the default `SCATTER_AG_MIN` is **2 MiB**.
+
+#### 4.8.4 Pseudocode (as implemented)
+
+The prototype uses **two distinct signal indices** (scatter=0, gather=1) instead of a single
+signal split by an inter-phase barrier. This removes the extra global barrier entirely: the
+per-phase completion counts can never interleave, so the only synchronization is the entry
+barrier plus receiver-side `waitSignal`s.
+
+```text
+msgBytes = count * sizeof(T)
+scatterAgMin = env NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES (default 2 MiB, host-resolved)
+
+// Host gate (BroadcastRunColl): fall through to the flat/LSA/LL tiers unless
+if scatterAgMin != 0 and nRanks >= 2 and msgBytes >= scatterAgMin and count >= nRanks:
+  launch GinScatterAllgatherBroadcastKernel   // else launch GinHybridBroadcastKernel
+
+// --- GinScatterAllgatherBroadcastKernel ---
+N          = devComm.nRanks
+baseCount  = count / N                  // remainder folded into rank N-1's slice
+myCount    = (rank == N-1) ? count - baseCount*(N-1) : baseCount
+myByteOff  = rank * baseCount * sizeof(T)
+gin        = ncclGin(devComm, 0)
+base0      = gin.readSignal(0)           // scatter signal
+base1      = gin.readSignal(1)           // gather signal
+
+worldBar.sync(relaxed)                   // entry: recv buffers quiescent before root writes
+
+// Phase 1: scatter chunk r -> rank r (root only)
+if rank == root:
+  if send != recv:                       // own slice stays local (no-op in-place)
+    BroadcastLocalCopy(recv+myByteOff, send+myByteOff, myCount)
+  for r = tid; r < N; r += nthreads:
+    if r == root: continue
+    gin.put(world, r, recvwin, recvoffset + r*baseCount*sizeof(T),
+                      sendwin, sendoffset + r*baseCount*sizeof(T),
+                      chunkBytes(r), SignalInc{0})       // increments peer r's signal 0
+  // no intermediate flush: scatter+allgather both read the read-only sendwin
+else:
+  gin.waitSignal(Cta, 0, base0 + 1)      // my scatter slice landed (CTA-wide => visible)
+
+// Phase 2: in-place allgather of the N slices (every rank forwards its own slice)
+srcWin = (rank == root) ? sendwin : recvwin   // root reads stable sendwin; no copy-vs-put order
+for r = tid; r < N; r += nthreads:
+  if r == rank: continue
+  gin.put(world, r, recvwin, recvoffset + myByteOff,
+                    srcWin, srcOff + myByteOff,
+                    myCount*sizeof(T), SignalInc{1})     // increments peer r's signal 1
+gin.waitSignal(Cta, 1, base1 + (N-1))    // every rank receives exactly N-1 gather puts
+gin.flush(Cta)
+```
+
+Notes on the implementation choices:
+
+- **Two signals, no inter-phase barrier.** Scatter puts hit signal 0, gather puts hit signal 1,
+  so a laggard's gather put can never be mistaken for its scatter put. A non-root forwards only
+  after `waitSignal(0, base0+1)` (a CTA-wide op that also makes the scatter data visible); the
+  root reads its own slice from the stable `sendwin` (never the just-written `recvwin`), so its
+  local copy needs no ordering versus its gather puts. Requires **`ginSignalCount >= 2`** (set in
+  `BroadcastGetDevCommRequirements` case 3; the flat/LSA paths still use only signal 0).
+- **Uniform completion.** Every rank (root included) receives exactly `N-1` gather puts, so the
+  final wait is the same on all ranks — `base1 + (N-1)`.
+- **Composition, not a call.** Phase 2 reimplements the AllGather large-path put shape inline
+  (in-place on `recvbuff`) rather than calling `GinHybridAllGatherKernel`; §8 Q8 tracks factoring
+  the shared body into a device helper.
+
+#### 4.8.5 Performance — measured (8× MI355X, `NCCL_GIN_TYPE=6`, `-V 32`, 2026-07-27)
+
+Validated in the dev container (incremental `broadcast_perf` rebuild on the `rccl-gin-gda-sdma-713`
+image). `#wrong == 0` across the full root sweep (0..7), in-place and OOP, for float/int8/double
+and for a deliberately non-8-divisible `int8` count (tail-chunk path). A/B is a same-build toggle
+via `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES=0` (forces the flat path).
+
+| Total size | Flat busbw (GB/s) | Scatter+AG busbw (GB/s) | Speedup |
+|---|---:|---:|---:|
+| 4 MiB   | 44.0  | 60.9  | 1.4× |
+| 8 MiB   | 51.6  | 97.2  | 1.9× |
+| 16 MiB  | 56.0  | 140.3 | 2.5× |
+| 32 MiB  | 58.4  | 177.6 | 3.0× |
+| 64 MiB  | 59.6  | 206.4 | 3.5× |
+| **128 MiB** | **60.5** | **223.9** | **3.7×** |
+
+(in-place; OOP tracks within ~2–3 %, e.g. 128 MiB 216 GB/s.) The measured 128 MiB result
+(**~224 GB/s**) beats the §4.8.5 projection (~210) and matches the model:
+
+```text
+T_scatter = (N-1)/N · M / B_root_egress ≈ (7/8)·M/480 = M/548
+T_ag      = M / algBw_ag                ≈ M/443
+busBw     = (M/(T_scatter+T_ag))·(N-1)/N ≈ 214 GB/s   (measured 224)
+```
+
+Root sweep is flat across ranks (128 MiB in-place: 215.4–224.8 GB/s over roots 0..7).
+
+##### Crossover sweep and default (2026-07-27, `-V 32`, in-place, root 0)
+
+Same-build A/B (`NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES=0` = flat) across the small-large
+transition:
+
+| Total size | Flat busbw | Scatter+AG busbw | Winner |
+|---|---:|---:|---|
+| 256 KiB | 20.8 (LSA) | 5.4 | flat/LSA |
+| 512 KiB | 14.8 | 10.4 | flat |
+| 1 MiB   | 23.7 | 19.4 | flat |
+| **2 MiB** | **33.4** | **35.9** | SAG (slight) |
+| 4 MiB   | 42.2 | 62.1 | **SAG** |
+| 8 MiB   | 48.5 | 97.8 | **SAG** |
+
+SAG loses below 2 MiB (its unconditional SDMA `gin.put` allgather is inefficient for the tiny
+`M/N` sub-chunks there, where the flat path's LSA/direct stores win), is a wash at 2 MiB, and
+wins decisively ≥ 4 MiB. **Default set to `SCATTER_AG_MIN = 2 MiB`** (was 4 MiB) — captures the
+2 MiB crossover with no regression below it.
+
+##### Ceiling analysis: SAG is at the AllGather roofline near the elbow, but plateaus at large M
+
+A broadcast of `M` bytes runs an allgather with **per-rank chunk `M/N`**, so SAG sits on the
+AllGather bandwidth curve *at that chunk size*, not at the 1 GiB operating point where AllGather
+peaks. Measured side-by-side (`-D 3`, 8× MI355X):
+
+| Broadcast M | per-rank `M/8` | AllGather roofline @ `M/8` | SAG broadcast busbw |
+|---|---:|---:|---:|
+| 128 MiB | 16 MiB | 204 | **212** (at roofline) |
+| 256 MiB | 32 MiB | 279 | 221 |
+| 512 MiB | 64 MiB | 335 | 226 |
+| 1 GiB   | 128 MiB | 376 | 229 |
+
+Near the elbow (≤ ~128 MiB) the per-rank chunk is small, so the allgather is relatively slow and
+`T_scatter` is proportionally hidden — SAG **matches (even slightly beats) the AllGather roofline**
+(212 vs 204) and is essentially optimal. At larger M the allgather roofline keeps climbing
+(→ 376 at `M/8 = 128 MiB`, the source of the "~388" figure) but SAG **plateaus at ~229 GB/s**:
+the serial `T_scatter` (root egress ≈ `(N-1)/N·M/B`) stops being hidden and dominates. So the
+"~388 ceiling" is a *different operating point* (1 GiB per-rank allgather), not headroom the
+current kernel leaves on the table at 128 MiB.
+
+##### Knobs that don't help, and the remaining headroom
+
+- **SDMA channels** (`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS` 1/2/4) — no effect (128 MiB: 216.7 /
+  217.1 / 216.4). SAG is not SDMA-queue bound.
+- **CTA count `-V`** (8/16/24/32) — robust and correct at all counts; ~flat perf (8 MiB:
+  101.8 / 103.8 / 98.9 / 97.2), a slight edge to fewer CTAs. (An early full-matrix sweep hit a
+  transient hang at `-V 16` that did **not** reproduce in isolation — orphaned MPI/GPU state
+  between back-to-back launches, not a kernel deadlock.)
+- **Remaining headroom is only at large M (≥ 512 MiB)** and requires a genuinely more complex
+  **chunked software pipeline**: split `M/N` into `K` sub-chunks and overlap scatter of sub-chunk
+  `k+1` with the allgather of sub-chunk `k`, so `T_scatter` is hidden behind the allgather rather
+  than serialized ahead of it. Projected upside ~1.6× at 1 GiB (229 → ~376). This is a scoped
+  future rewrite (per-sub-chunk signal accounting across both phases); the current kernel is
+  optimal at the elbow and is the right default now.
+
+#### 4.8.6 Correctness / edge cases
+
+- **In-place** (`sendbuff == recvbuff`): the root's own slice is already in place (skip its
+  self-copy); non-root scatter targets are distinct `recvbuff` slots, and the in-place AllGather
+  is the same one the AllGather gate already validates.
+- **Non-divisible M**: give the remainder bytes to the last rank's chunk (standard uneven
+  AllGather handling); the AllGather kernel already supports per-rank counts.
+- **Root sweep 0..N−1**: symmetric — chunk *r* always goes to rank *r*; only the source offset
+  on the root differs by root.
+- **Completion**: scatter completion is the receiver-side `waitSignal(0, base0+1)` (non-roots
+  only); gather completion is `waitSignal(1, base1+(N-1))` on every rank. `flush` runs once at
+  the end. No exit barrier (the gather `waitSignal` is the completion primitive, as in the flat
+  path and AllGather).
+- **DevComm requirement delta**: the two-signal scheme needs `ginSignalCount >= 2`; case 3 now
+  sets `ginSignalCount = max(deviceCtaCount, 2)`. Everything else (barrier, LSA barrier, LL
+  scratch) is unchanged, so no new resource *types* are requested.
+
+#### 4.8.7 Relationship to the deferred inter-node tree (§4.7)
+
+Scatter+allgather is the natural **intra-node** building block for the deferred multi-node
+design: a cross-node k-ary/binomial **tree** carrying M/N-sized chunks, with a **flat scatter +
+allgather within each node**, generalizes cleanly. Landing intra-node scatter+allgather now de-
+risks that extension.
+
 ---
 
 ## 5. Architecture sketch
 
 ```text
-  broadcast_perf (-D 3, NCCL_GIN_TYPE=6, -V 8)
+  broadcast_perf (-D 3, NCCL_GIN_TYPE=6)
            │
-  GinHybridBroadcastKernel (all ranks launch)
+  BroadcastRunColl case 3 — tier select by msgBytes
            │
-     rank == root?
-           │
-     ┌─────┴──────────────────────────────┐
-     │ msgBytes ≤ threshold               │ msgBytes > threshold
-     ▼                                    ▼
-  BroadcastLsaDirect                   gin.put × (N−1)
-  (LSA peer stores)                         │
-                                       IPC or SDMA
-                                            │
-                                     xGMI P2P mesh
-           │
-     non-root ranks: barriers only
+   ┌───────┬────────────────┬────────────────────┬───────────────────────────┐
+   │ ≤2 KiB│ ≤256 KiB       │ 256 KiB … 2 MiB    │ ≥2 MiB (count ≥ N)        │
+   ▼       ▼                ▼                    ▼
+ LL fast   LSA direct       flat GIN fan-out     scatter + allgather
+ path      (root SM stores  (root gin.put×(N−1)) (GinScatterAllgatherBroadcastKernel)
+ (1 CTA,   to every peer)   IPC/SDMA per put     ├─ root scatter: chunk r → rank r (sig 0)
+ no LSA    │                │                    └─ all ranks in-place allgather (sig 1)
+ barrier)  │                │                          egress spread across all N ranks
+   └───────┴──────┬─────────┴────────────────────┴───────────────────────────┘
+                  ▼
+           xGMI P2P mesh (LSA/IPC + SDMA copy engines)
+                  │
+   completion: entry barrier + receiver-side waitSignal (no exit barrier); single flush
+   non-root ranks in flat/LSA tiers: barriers + waitSignal only
 ```
+
+First three tiers are `GinHybridBroadcastKernel`; the ≥ 2 MiB tier is
+`GinScatterAllgatherBroadcastKernel`. See "Current design (as implemented)" for cutoffs/env vars.
 
 ---
 
@@ -447,7 +762,9 @@ Bus bandwidth formula for the test harness:
 | **BC-C2** | GIN hybrid | `-D 3 -V 8`, 128 B–128 M, `NCCL_GIN_TYPE=6` |
 | **BC-C3** | rocSHMEM `team_broadcast` | optional cross-check |
 | **BC-D4** | All-SDMA gate | `THRESHOLD=0` |
+| **BC-C5** | Scatter+AG large tier (§4.8) | `-D 3 -V 8`, ≥ `SCATTER_AG_MIN`–128 M, `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` swept; correctness parity with BC-C1 |
 | **BC-P1** | Perf vs host @ 128 M, all roots | |
+| **BC-P2** | Flat vs scatter+AG crossover sweep (§4.8.3) | `-D 3 -V 8`, 1 M–128 M; locate data-driven `SCATTER_AG_MIN` and confirm ≈3.5× @128 M |
 
 Pass: `#wrong == 0`, sweep roots 0..N−1, in-place and OOP.
 
@@ -472,6 +789,17 @@ Default gate env (BC-C2): `NCCL_GIN_TYPE=6`, `THRESHOLD=128`, `NUM_CHANNELS=1`, 
 > `gin-anvil-broadcast-test.bash` lands, add a BC-C2 bring-up case to that assert so a
 > broken image (communicator `ginType=NONE`) fails the build instead of surfacing later
 > as a broadcast test error.
+>
+> **Canonical image bake-in (2026-07-27):** the final `broadcast.cu` (SCATTER_AG_MIN
+> default 2 MiB) is baked into `rccl-gin-gda-sdma-713:latest` (old image retained as
+> `:pre-2mib-YYYYMMDD`). A from-scratch `docker-gin-gda-sdma-build.bash` was **blocked by
+> Docker Hub's anonymous pull rate limit** on `FROM ubuntu:24.04` (no AMD dockerhub proxy
+> in `registry-sc-harbor.amd.com` / `compute-artifactory.amd.com`), so the image was
+> produced via a **clean Dockerfile relink** (`Dockerfile-rccl-gin-gda-sdma-bcast-relink`,
+> `FROM` the existing image + `COPY broadcast.cu` + `make broadcast_perf`) — reproducible,
+> not a `docker commit`. Validated fresh-container default tier selection with no env
+> override: 1 MiB 23.8 (flat) → 2 MiB 35.6 (SAG) → 4 MiB 57.2 → 128 MiB 216.6, `#wrong==0`.
+> Re-run the full from-scratch build once the rate limit resets (or `docker login`).
 
 ---
 
@@ -480,6 +808,8 @@ Default gate env (BC-C2): `NCCL_GIN_TYPE=6`, `THRESHOLD=128`, `NUM_CHANNELS=1`, 
 | File | Change |
 |------|--------|
 | `projects/rccl-tests/src/broadcast.cu` | `GinHybridBroadcastKernel` (-D 3), `BroadcastGetSdmaThreshold`, `BroadcastLsaDirect`, `BroadcastGetDevCommRequirements`, `BroadcastRunColl` case 3 |
+| `projects/rccl-tests/src/broadcast.cu` (§4.8) | **DONE & validated:** `GinScatterAllgatherBroadcastKernel` (scatter signal 0 + in-place allgather signal 1, entry barrier only), host gate in `BroadcastRunColl` case 3 via `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` (**default 2 MiB**, 0=disable), `ginSignalCount>=2` in `BroadcastGetDevCommRequirements`. Crossover measured (§4.8.5); robust across `-V 8..32` and SDMA channels. **Optional future:** chunked scatter/allgather pipeline for ≥512 MiB (§4.8.5), factor AllGather body into a shared device helper (§8 Q8) |
+| `ddai-artifacts/scripts/gin-sdma-bcast-test.bash` (§4.8) | **DONE (prototype):** `SCATTER_AG_MIN` env → `NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES` passthrough on BC-C2 (0 forces flat path for A/B) |
 | `projects/rccl-tests/src/CMakeLists.txt` | `broadcast_perf` links rocSHMEM (if needed, mirror `all_gather_perf`) |
 | `gin-anvil-broadcast-test.bash` | Gate harness (BC-C1/C2/C3) |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Extend the post-build GIN smoke assert to cover BC-C2 (see §6 build-hardening tie-in) |
@@ -512,6 +842,17 @@ No changes to `gin_plugin_anvil_sdma.cc` or device templates unless a broadcast-
 
 6. **Inter-node extension** — When the deferred rail stage is added (§4.7), confirm the
   cross-node schedule is a **k-ary/binomial tree** with a flat fan-out within each node.
+
+7. ~~**Scatter+AG crossover (§4.8)**~~ — **Resolved (2026-07-27, §4.8.5):** crossover measured;
+  `SCATTER_AG_MIN` default set to **2 MiB**. Plain scatter + linear allgather is at the AllGather
+  roofline near the elbow (≤128 MiB: 212 vs 204) and is the right v1. The "~388 ceiling" is a
+  *different operating point* (1 GiB per-rank allgather); SAG plateaus at ~229 for ≥256 MiB.
+  **Still open (deferred):** a chunked/pipelined scatter⇄allgather kernel to recover ~1.6× at
+  ≥512 MiB — worth it only if very-large broadcasts matter. Awaiting go/no-go.
+
+8. **Reuse mechanics** — Can `GinHybridAllGatherKernel`'s body be factored into a
+  `__device__` helper callable from both `all_gather.cu` and `broadcast.cu` (shared header),
+  or should broadcast inline an in-place AllGather to avoid a cross-TU device dependency?
 
 ---
 

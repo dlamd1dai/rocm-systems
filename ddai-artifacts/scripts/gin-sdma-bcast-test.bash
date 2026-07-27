@@ -7,16 +7,22 @@
 #   MAX_BYTES  default 128M (max broadcast size for BC-C2)
 #
 # Checks (order: BC-C1 -> BC-C2; BC-C1 host baseline runs first):
-#   BC-C1  Host-initiated ncclBroadcast          (broadcast_perf -D 0, -R 0)
-#          Always NCCL_CUMEM_ENABLE=0 (matches AllGather AG-C1 / docker Test#1).
+#   BC-C1  Host-initiated ncclBroadcast          (broadcast_perf -D 0)
+#          Size-tuned for best perf (BC_C1_MODE=hybrid, see the BC_C1_* block below):
+#          default tuner <=64K, Ring/LL128 x32ch for mid, Ring/Simple x32ch for large.
 #          Requires broadcast host device kernels: the image includes them via
 #          ONLY_FUNCS="...|Broadcast" (Dockerfile / docker-gin-gda-sdma-build.bash). On an RCCL
 #          build without them it fails "ncclDevFuncId ... not found for coll:0"; disable with
 #          RUN_HOST_BASELINE=0 in that case.
-#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=6), root sweep (-r all by default)
+#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=6, -V 32), root sweep (-r all by default)
 #
-# Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4):
-#   flat/star fan-out from root; non-roots complete via receiver-side waitSignal(+1).
+# Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4, §4.8):
+#   Small/medium: flat/star fan-out from root; non-roots complete via receiver-side
+#   waitSignal(+1). Large (>= SCATTER_AG_MIN, default 2 MiB): scatter + in-place
+#   allgather (§4.8) so egress is distributed across all ranks instead of capped at
+#   the root (busBw = B_root_egress / N). Tune/disable the large tier with
+#   SCATTER_AG_MIN (-> NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES; 0 disables, falling
+#   back to the flat fan-out for all sizes).
 #
 # Full gate (default): BC-C1 + BC-C2 (both fatal on failure).
 # Skip sections:   RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0
@@ -37,9 +43,32 @@ DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
 HOST_RANKS="${HOST_RANKS:-0}"     # -R register mode for host path (0 = none)
 GIN_RANKS="${GIN_RANKS:-2}"       # -R register mode for GIN path (2 = symmetric, REQUIRED for -D 3)
-DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-8}"
+# BC-C2 runs the -D 3 hybrid at -V 32: both the LSA branch (small/mid) and the SDMA branch
+# scale with CTAs for broadcast (8x MI355X, 2026-07-27, OOP): 131K 15.8us@V8 -> 10.1@V32,
+# 128M 41.8 GB/s@V8 -> 54.1@V32; V16 already recovers most of it (49.4), V24/V32 add the top
+# end. Extra SDMA channels (NUM_CHANNELS 2/4) did not help. Mirrors AllGather AG-C2 rationale.
+DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-32}"
 ROOT="${ROOT:-all}"               # broadcast root: 'all' sweeps 0..NP-1, or pin an integer
 FACTOR="${FACTOR:-2}"
+# Large-message tier (§4.8): scatter + in-place allgather, auto-selected inside
+# broadcast_perf -D 3 for msgBytes >= SCATTER_AG_MIN. Empty = kernel default
+# (2 MiB). Set SCATTER_AG_MIN=0 to force the flat fan-out at all sizes (isolates
+# the §4.8 tier for A/B perf), or e.g. 8M to raise the crossover.
+SCATTER_AG_MIN="${SCATTER_AG_MIN:-}"
+
+# BC-C1 host baseline is size-tuned (8x MI355X, 2026-07-27, out-of-place). The stock tuner
+# cliffs badly at large sizes (128M ~38 GB/s), so BC_C1_MODE=hybrid (default) picks the best
+# path per regime:
+#   <= BC_C1_SPLIT1            default tuner (CUMEM=0, -R 0)         best small latency (~8-10us @128B)
+#   BC_C1_SPLIT1..BC_C1_SPLIT2 Ring/LL128, BC_C1_NCHANNELS channels best mid (2M 40us vs 93 default)
+#   >  BC_C1_SPLIT2            Ring/Simple, BC_C1_NCHANNELS channels best top (128M 110 vs 38 GB/s)
+# Force a single path with BC_C1_MODE=default|ll128|simple|ce (ce = copy-engine SDMA:
+# CUMEM=1 -R 2 CTA_POLICY=ZERO, best in-place BW but poor OOP small/mid). Splits are in bytes;
+# they assume FACTOR=2 (the default) so segment boundaries land on measured sizes.
+BC_C1_MODE="${BC_C1_MODE:-hybrid}"
+BC_C1_NCHANNELS="${BC_C1_NCHANNELS:-32}"
+BC_C1_SPLIT1="${BC_C1_SPLIT1:-65536}"      # 64 KiB: default tuner <=, Ring/LL128 >
+BC_C1_SPLIT2="${BC_C1_SPLIT2:-16777216}"   # 16 MiB: Ring/LL128 <=, Ring/Simple >
 
 _HOST="$(hostname -s 2>/dev/null || hostname)"
 
@@ -64,6 +93,7 @@ _parse_size_to_bytes() {
 
 MAX_BYTES_INT="$(_parse_size_to_bytes "${MAX_BYTES}")"
 HOST_MAX_BYTES_INT="$(_parse_size_to_bytes "${HOST_MAX_BYTES}")"
+MIN_BYTES_INT="$(_parse_size_to_bytes "${MIN_BYTES}")"
 
 # BC-C1 sweep: min(HOST_MAX_BYTES, MAX_BYTES).
 HOST_MAX_BYTES_EFFECTIVE_INT="${HOST_MAX_BYTES_INT}"
@@ -209,7 +239,7 @@ BC_C1_STATUS="skipped"
 
 echo "Broadcast gate: NP=${NP} host=${_HOST} root=${ROOT}"
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "  BC-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (NCCL_CUMEM_ENABLE=0)"
+  echo "  BC-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (mode=${BC_C1_MODE}: default<=$(_format_bytes "${BC_C1_SPLIT1}") | Ring/LL128 | Ring/Simple>$(_format_bytes "${BC_C1_SPLIT2}"), ${BC_C1_NCHANNELS}ch)"
 else
   echo "  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
@@ -227,18 +257,78 @@ _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
 
 # --- BC-C1: host-initiated ncclBroadcast (-D 0, no GIN); runs first (hard gate) ---
-if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
-  echo "BC-C1: host ncclBroadcast -D 0, ${MIN_BYTES}..${HOST_MAX_BYTES_EFFECTIVE} (-R ${HOST_RANKS}, -r ${ROOT})"
+# Host broadcast perf paths (8x MI355X, NCCL_GIN_TYPE=0, 2026-07-27), out-of-place time/busbw:
+#   * default (tuner, CUMEM=0, -R 0): best small latency (128B ~10us, 512B ~8.2us) but the
+#     tuner picks a poor large-size path and cliffs at 128M (~38 GB/s).
+#   * Ring/LL128 + pinned channels (CUMEM=0, -R 0): best mid range (524K 22us vs 47 default,
+#     2M 40us vs 93); scales to ~96 GB/s @128M.
+#   * Ring/Simple + pinned channels: best top end (32M 96.7, 128M 110 GB/s) but weaker at mid.
+#   * ce (copy engine: CUMEM=1, -R 2, NCCL_CTA_POLICY=ZERO): best *in-place* BW (128M 84 GB/s)
+#     but ~30us floor makes OOP small/mid poor; kept as an opt-in single mode only.
+# BC_C1_MODE=hybrid (default) stitches default(<=SPLIT1) + LL128(..SPLIT2) + Simple(>SPLIT2).
+_bc_host_default() {  # $1=min $2=max  (tuner-picked; best for small)
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE_HOST[@]}" \
-    "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${HOST_MAX_BYTES_EFFECTIVE}" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 -r "${ROOT}"
+    -x NCCL_CUMEM_ENABLE=0 \
+    "${BROADCAST_PERF}" -b "$1" -e "$2" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 -r "${ROOT}"
+}
+_bc_host_ring() {  # $1=min $2=max $3=proto (LL128|Simple)
+  _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
+    "${MPI_BASE_HOST[@]}" \
+    -x NCCL_CUMEM_ENABLE=0 \
+    -x NCCL_ALGO=Ring \
+    -x NCCL_PROTO="$3" \
+    -x NCCL_MIN_NCHANNELS="${BC_C1_NCHANNELS}" \
+    -x NCCL_MAX_NCHANNELS="${BC_C1_NCHANNELS}" \
+    "${BROADCAST_PERF}" -b "$1" -e "$2" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 -r "${ROOT}"
+}
+_bc_host_ce() {  # $1=min $2=max  (copy-engine SDMA; best in-place BW)
+  _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
+    "${MPI_BASE_HOST[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x NCCL_CTA_POLICY=ZERO \
+    "${BROADCAST_PERF}" -b "$1" -e "$2" -f "${FACTOR}" -g 1 -R 2 -D 0 -r "${ROOT}"
+}
+if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
+  _lo="${MIN_BYTES}"
+  _hi="${HOST_MAX_BYTES_EFFECTIVE}"
+  case "${BC_C1_MODE}" in
+    default) echo "BC-C1: host ncclBroadcast DEFAULT -D 0, ${_lo}..${_hi} (-R ${HOST_RANKS}, -r ${ROOT})"; _bc_host_default "${_lo}" "${_hi}" ;;
+    ll128)   echo "BC-C1: host ncclBroadcast Ring/LL128 -D 0, ${_lo}..${_hi} (-R ${HOST_RANKS}, ${BC_C1_NCHANNELS}ch, -r ${ROOT})"; _bc_host_ring "${_lo}" "${_hi}" LL128 ;;
+    simple)  echo "BC-C1: host ncclBroadcast Ring/Simple -D 0, ${_lo}..${_hi} (-R ${HOST_RANKS}, ${BC_C1_NCHANNELS}ch, -r ${ROOT})"; _bc_host_ring "${_lo}" "${_hi}" Simple ;;
+    ce)      echo "BC-C1: host ncclBroadcast CE/SDMA -D 0, ${_lo}..${_hi} (-R 2, CTA_POLICY=ZERO, -r ${ROOT})"; _bc_host_ce "${_lo}" "${_hi}" ;;
+    hybrid)
+      # Segment the sweep on SPLIT1/SPLIT2 (assumes FACTOR=2 so boundaries fall on real sizes).
+      _s1="$(_format_bytes "${BC_C1_SPLIT1}")"
+      _s2="$(_format_bytes "${BC_C1_SPLIT2}")"
+      _ll_min="$(_format_bytes $(( BC_C1_SPLIT1 * 2 )))"
+      _si_min="$(_format_bytes $(( BC_C1_SPLIT2 * 2 )))"
+      if [[ "${HOST_MAX_BYTES_EFFECTIVE_INT}" -le "${BC_C1_SPLIT1}" ]]; then
+        echo "BC-C1: host HYBRID/default -D 0, ${_lo}..${_hi}"
+        _bc_host_default "${_lo}" "${_hi}"
+      elif [[ "${HOST_MAX_BYTES_EFFECTIVE_INT}" -le "${BC_C1_SPLIT2}" ]]; then
+        echo "BC-C1a: host HYBRID/default -D 0, ${_lo}..${_s1}"
+        _bc_host_default "${_lo}" "${_s1}"
+        echo "BC-C1b: host HYBRID/Ring-LL128 -D 0, ${_ll_min}..${_hi} (${BC_C1_NCHANNELS}ch)"
+        _bc_host_ring "${_ll_min}" "${_hi}" LL128
+      else
+        echo "BC-C1a: host HYBRID/default -D 0, ${_lo}..${_s1}"
+        _bc_host_default "${_lo}" "${_s1}"
+        echo "BC-C1b: host HYBRID/Ring-LL128 -D 0, ${_ll_min}..${_s2} (${BC_C1_NCHANNELS}ch)"
+        _bc_host_ring "${_ll_min}" "${_s2}" LL128
+        echo "BC-C1c: host HYBRID/Ring-Simple -D 0, ${_si_min}..${_hi} (${BC_C1_NCHANNELS}ch)"
+        _bc_host_ring "${_si_min}" "${_hi}" Simple
+      fi
+      ;;
+    *) echo "error: BC_C1_MODE must be hybrid, default, ll128, simple, or ce" >&2; exit 1 ;;
+  esac
   BC_C1_STATUS="passed"
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
 # --- BC-C2: GIN hybrid Broadcast kernel (-D 3, NCCL_GIN_TYPE=6) ---
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, -r ${ROOT})"
+  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none \
@@ -250,6 +340,7 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS:-1}" \
     ${NCCL_GIN_ANVIL_SDMA_THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"} \
     ${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST="${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST}"} \
+    ${SCATTER_AG_MIN:+-x NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES="${SCATTER_AG_MIN}"} \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -r "${ROOT}"
   sleep "${TEST_GAP_SEC:-3}"
