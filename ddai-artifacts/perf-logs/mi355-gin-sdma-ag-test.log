@@ -1,0 +1,137 @@
+AllGather gate: NP=8 host=smci355-ccs-aus-m03-17
+  AG-C1 host:  128 .. 128M (mode=hybrid: RING SM-copy + CE/SDMA)
+  AG-C2 gin:   128 .. 128M (hybrid -D 3, CTAs=8)
+  AG-C3 fcol:  skipped (RUN_FCOLLECT=0)
+AG-C1a: host ncclAllGather HYBRID/RING -D 0, 128..64M (-R 0, channels=16)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=0 -x NCCL_GIN_TYPE=0 -x NCCL_CUMEM_ENABLE=0 -x NCCL_MIN_NCHANNELS=16 -x NCCL_MAX_NCHANNELS=16 rccl-tests/all_gather_perf -b 128 -e 64M -f 2 -g 1 -R 0 -D 0 -A 1 -V 1 ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23007 rccl-library=23007
+# Collective test starting: all_gather_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 67108864 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.7-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong algo      proto      nchannels 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)                                      
+         128             4     float    none      -1     6.10    0.02    0.02       0     6.94    0.02    0.02       0    RING        LL          16
+         256             8     float    none      -1     6.13    0.04    0.04       0     6.24    0.04    0.04       0    RING        LL          16
+         512            16     float    none      -1     6.80    0.08    0.07       0     6.22    0.08    0.07       0    RING        LL          16
+        1024            32     float    none      -1     6.20    0.17    0.14       0     6.38    0.16    0.14       0    RING        LL          16
+        2048            64     float    none      -1     6.27    0.33    0.29       0     6.12    0.33    0.29       0    RING        LL          16
+        4096           128     float    none      -1     6.21    0.66    0.58       0     6.20    0.66    0.58       0    RING        LL          16
+        8192           256     float    none      -1     6.22    1.32    1.15       0     6.19    1.32    1.16       0    RING        LL          16
+       16384           512     float    none      -1     6.39    2.57    2.24       0     6.31    2.60    2.27       0    RING        LL          16
+       32768          1024     float    none      -1     7.03    4.66    4.08       0     6.83    4.80    4.20       0    RING        LL          16
+       65536          2048     float    none      -1     7.93    8.26    7.23       0     7.76    8.45    7.39       0    RING        LL          16
+      131072          4096     float    none      -1     7.97   16.44   14.39       0     7.87   16.65   14.57       0    RING        LL          16
+      262144          8192     float    none      -1     8.22   31.91   27.92       0     8.19   32.02   28.02       0    RING        LL          16
+      524288         16384     float    none      -1     8.35   62.76   54.91       0     8.27   63.38   55.46       0    RING        LL          16
+     1048576         32768     float    none      -1     9.05  115.92  101.43       0     9.12  114.94  100.57       0    RING    SIMPLE          16
+     2097152         65536     float    none      -1    13.01  161.26  141.10       0    12.71  164.95  144.34       0    RING    SIMPLE          16
+     4194304        131072     float    none      -1    17.44  240.44  210.38       0    17.36  241.58  211.38       0    RING    SIMPLE          16
+     8388608        262144     float    none      -1    27.91  300.60  263.02       0    27.84  301.34  263.67       0    RING    SIMPLE          16
+    16777216        524288     float    none      -1    46.90  357.71  313.00       0    46.65  359.64  314.68       0    RING    SIMPLE          16
+    33554432       1048576     float    none      -1    86.55  387.68  339.22       0    86.69  387.08  338.69       0    RING    SIMPLE          16
+    67108864       2097152     float    none      -1   161.75  414.90  363.04       0   161.55  415.41  363.48       0    RING    SIMPLE          16
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 92.3819 
+#
+# Collective test concluded: all_gather_perf
+#
+
+AG-C1b: host ncclAllGather HYBRID/CE-SDMA -D 0, 128M..128M (-R 2)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=0 -x NCCL_GIN_TYPE=0 -x NCCL_CUMEM_ENABLE=1 -x NCCL_CTA_POLICY=ZERO rccl-tests/all_gather_perf -b 128M -e 128M -f 2 -g 1 -R 2 -D 0 -A 1 -V 1 ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23007 rccl-library=23007
+# Collective test starting: all_gather_perf
+# nThread 1 nGpus 1 minBytes 134217728 maxBytes 134217728 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.7-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong algo      proto      nchannels 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)                                      
+   134217728       4194304     float    none      -1   314.86  426.28  372.99       0   315.04  426.03  372.78       0     SYM    SIMPLE          64
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 372.886 
+#
+# Collective test concluded: all_gather_perf
+#
+
+AG-C2: GIN hybrid AllGather -D 3, 128..128M (-R 2, -V 8)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=6 -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 -x HSA_FORCE_FINE_GRAIN_PCIE=1 rccl-tests/all_gather_perf -b 128 -e 128M -f 2 -g 1 -R 2 -V 8 -D 3 -A 1 -C 0 ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23007 rccl-library=23007
+# Collective test starting: all_gather_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 134217728 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.7-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong algo      proto      nchannels 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)                                      
+         128             4     float    none      -1    10.30    0.01    0.01       0    10.70    0.01    0.01       0     SYM        LL           1
+         256             8     float    none      -1    10.33    0.02    0.02       0    10.38    0.02    0.02       0     SYM        LL           1
+         512            16     float    none      -1    11.15    0.05    0.04       0    10.94    0.05    0.04       0     SYM        LL           1
+        1024            32     float    none      -1    10.76    0.10    0.08       0    10.90    0.09    0.08       0     SYM        LL           1
+        2048            64     float    none      -1    11.03    0.19    0.16       0    10.91    0.19    0.16       0     SYM        LL           1
+        4096           128     float    none      -1    10.95    0.37    0.33       0    10.90    0.38    0.33       0     SYM        LL           2
+        8192           256     float    none      -1    10.61    0.77    0.68       0    10.83    0.76    0.66       0     SYM        LL           4
+       16384           512     float    none      -1    11.12    1.47    1.29       0    11.18    1.47    1.28       0     SYM        LL           7
+       32768          1024     float    none      -1    12.36    2.65    2.32       0    12.77    2.57    2.25       0     SYM        LL          12
+       65536          2048     float    none      -1    13.86    4.73    4.14       0    13.77    4.76    4.16       0     SYM        LL          20
+      131072          4096     float    none      -1    14.42    9.09    7.95       0    14.17    9.25    8.10       0     SYM        LL          30
+      262144          8192     float    none      -1    14.68   17.86   15.63       0    14.10   18.59   16.27       0     SYM        LL          41
+      524288         16384     float    none      -1    15.20   34.50   30.19       0    14.94   35.08   30.70       0     SYM        LL          49
+     1048576         32768     float    none      -1    20.51   51.13   44.74       0    20.31   51.62   45.16       0     SYM        LL          52
+     2097152         65536     float    none      -1    31.68   66.19   57.92       0    31.40   66.79   58.44       0     SYM        LL          54
+     4194304        131072     float    none      -1    37.41  112.13   98.11       0    37.04  113.24   99.09       0     SYM        LL          54
+     8388608        262144     float    none      -1    45.87  182.88  160.02       0    45.83  183.02  160.14       0     SYM        LL          54
+    16777216        524288     float    none      -1    62.94  266.54  233.22       0    62.96  266.46  233.15       0     SYM        LL          55
+    33554432       1048576     float    none      -1    97.33  344.76  301.67       0    97.37  344.62  301.54       0     SYM    SIMPLE          63
+    67108864       2097152     float    none      -1   165.93  404.44  353.88       0   166.30  403.55  353.11       0     SYM    SIMPLE          63
+   134217728       4194304     float    none      -1   303.62  442.05  386.79       0   303.68  441.98  386.73       0     SYM    SIMPLE          64
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 80.9672 
+#
+# Collective test concluded: all_gather_perf
+#
+
+PASS: gin-anvil-allgather-test np=8 AG-C1=passed AG-C2/C3=128..128M
