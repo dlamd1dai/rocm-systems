@@ -275,6 +275,12 @@ RUN RCCL_BUILD_DIR=$([ "${DEBUG_BUILD}" = "1" ] && echo "debug" || echo "release
  && ln -sf ../hipify/src/include/nccl_tuner.h ${WORKDIR}/rccl/src/projects/rccl/build/${RCCL_BUILD_DIR}/include/nccl_tuner.h \
  && cp -r ${WORKDIR}/rccl/src/projects/rccl/build/${RCCL_BUILD_DIR}/include/* ${RCCL_INSTALL_PREFIX}/include/
 
+# Test-only deps for the GIN-SDMA host policy unit tests (GoogleTest). Kept in a
+# dedicated late layer so it does not invalidate the RCCL/rocSHMEM build cache.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgtest-dev \
+ && rm -rf /var/lib/apt/lists/*
+
 ## building RCCL-Tests
 RUN if [ "${USE_LOCAL_SRC}" != "1" ]; then \
       cd rccl/src && \
@@ -284,8 +290,12 @@ RUN if [ "${USE_LOCAL_SRC}" != "1" ]; then \
 ARG RCCL_GIN_ALLTOALL_DEVICE_TRACE=0
 RUN mkdir rccl-tests \
     && cd rccl-tests \
-    && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} $( [ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" = "1" ] && echo '-DCMAKE_CXX_FLAGS=-DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1' ) ${WORKDIR}/rccl/src/projects/rccl-tests \
-    && make -j16
+    && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM=ON -DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} $( [ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" = "1" ] && echo '-DCMAKE_CXX_FLAGS=-DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1' ) ${WORKDIR}/rccl/src/projects/rccl-tests \
+    && make -j16 \
+    # Build-time gate: the GIN-SDMA host policy unit tests (no GPU needed) must
+    # pass for the image to be considered good. GPU functional (label
+    # gpu_functional) is exercised post-build by the gin-sdma-*-test.bash gates.
+    && ctest --output-on-failure -L unit
 
 # ---------------------------------------------------------------------------
 # Build hardening (static): fail the build if GIN plumbing is missing from the

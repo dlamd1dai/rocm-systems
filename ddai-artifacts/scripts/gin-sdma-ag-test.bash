@@ -244,6 +244,14 @@ fi
 _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
 
+# --- UT: GIN-SDMA host policy unit tests (no GPU); hard preflight gate ---
+# Validates the shared tier-selection / threshold / chunk logic that the device
+# kernels rely on. Fast, GPU-free; set RUN_POLICY_UT=0 to skip.
+POLICY_UT="${POLICY_UT:-rccl-tests/gin_sdma_policy_test}"
+if [[ "${RUN_POLICY_UT:-1}" != "0" ]]; then
+  _run "${POLICY_UT}" || { echo "FATAL: GIN-SDMA policy unit tests failed"; exit 1; }
+fi
+
 # --- AG-C1: host-initiated ncclAllGather (-D 0, no GIN); runs first (hard gate) ---
 # Host AllGather perf paths (8x MI355X, NCCL_GIN_TYPE=0, 2026-07-26), out-of-place busbw:
 #   * RING (SM copy, NCCL_CUMEM_ENABLE=0, -R 0): best for small/mid, scales to

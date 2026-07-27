@@ -357,6 +357,16 @@ _a2a_host_ce() {  # $1=min $2=max
     rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
 }
 
+# --- UT: GIN-SDMA host policy unit tests (no GPU); hard preflight gate ---
+# Validates the shared tier-selection / threshold / chunk logic that the device
+# kernels rely on. Fast, GPU-free; set RUN_POLICY_UT=0 to skip.
+POLICY_UT="${POLICY_UT:-rccl-tests/gin_sdma_policy_test}"
+if [[ "${RUN_POLICY_UT:-1}" != "0" ]]; then
+  echo "=== UT: host policy unit tests (${POLICY_UT}) ==="
+  ${DOCKER_CMD} run --rm --init "${DOCKER_IMAGE}" "${POLICY_UT}" \
+    || { echo "FATAL: GIN-SDMA policy unit tests failed"; exit 1; }
+fi
+
 if _run_test 1; then
   _trace_on
   TEST1_NCHANNELS="${TEST1_NCHANNELS:-32}"
