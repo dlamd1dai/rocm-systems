@@ -13,6 +13,40 @@
 #include "rccl_vector_types.h"
 #endif
 
+// LL (low-latency, packed data+flag) small-message AllToAll path. Mirrors the
+// AllGather LL fast path, but uses the LL A2A session's point-to-point send()
+// (scatter) instead of bcast(): AllToAll delivers a *distinct* per-peer chunk,
+// whereas AllGather broadcasts one chunk to all peers. The device types
+// (ncclLLA2AHandle, ncclDevResourceRequirements) come from nccl_device.h, which
+// common.h includes whenever the device API is on (>=2.28) or on any >=2.29
+// build. Gate the LL wiring on exactly that availability.
+#if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+#define A2A_HAVE_LL 1
+// Compile-time ceiling on the per-peer chunk (bytes) that the LL path can
+// serve; the LL scratch is sized for this cap at devComm creation. The *actual*
+// LL<->LSA cutover is runtime-gated (see below): env NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES.
+#define ALLTOALL_LL_MAX_BYTES 65536
+// LL scratch handle: bufHandle is assigned during ncclDevCommCreate; nSlots is
+// set by ncclLLA2ACreateRequirement only when the LL path is enabled. nSlots==0
+// means LL was not configured, so the kernel uses the vectorized LSA path.
+//
+// Unlike AllGather (where LL robustly wins ~7-23% for tiny messages by removing
+// both LSA barriers), the A2A direct-LSA all-CTA scatter is already at a ~11 us
+// fixed-overhead floor on 8x MI355X that LL cannot beat: LL still needs every
+// rank to poll all nRanks source slots (an implicit all-to-all sync) and moves
+// 2x the wire volume. A careful A/B (50 iters x 3 reps, 2026-07-27) put LL at
+// best a marginal, within-noise ~2-3% faster at the very smallest sizes
+// (<=32 B/peer) and neutral-to-slightly-worse above that; run-to-run variance is
+// itself ~2-3%. So the LL path is OFF by default and opt-in via
+// NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=<per-peer bytes> (0/unset = disabled), kept for
+// experimentation and future tuning. The env value is clamped to
+// ALLTOALL_LL_MAX_BYTES and only enables LL for per-peer chunks at or below it
+// (and only when the chunk fits the pre-sized slot count).
+static size_t g_a2aLLMaxBytes = 0;  // resolved from env at requirements time
+static ncclLLA2AHandle g_a2aLLHandle = {};
+static ncclDevResourceRequirements g_a2aLLReq = {};
+#endif
+
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *paramcount = (count/nranks) & -(16/eltSize);
   *sendcount = nranks*(*paramcount);
@@ -61,7 +95,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
     case 2: // NvlAlltoAllKernelOptimized
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
-    case 3: // GinHybridAlltoAllKernel: LSA direct (small) + all-peers GIN puts (large)
+    case 3: { // GinHybridAlltoAllKernel: LSA direct (small) + all-peers GIN puts (large)
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
@@ -69,12 +103,31 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->barrierCount = deviceCtaCount;
       reqs->lsaBarrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
+      // LL scratch for the tiny-message fast path (single CTA => nBlocks=1),
+      // opt-in via NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES (per-peer bytes; 0/unset =
+      // disabled, the measured-best default). Sized for the LSA team scattering
+      // up to the requested cap: a receiver holds nRanks source-chunks of
+      // (cap/8) u64 slots (same layout as AllGather).
+      {
+        size_t llCap = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES");
+        if (llCap == TEST_SDMA_THRESHOLD_UNSET) llCap = 0;
+        if (llCap > (size_t)ALLTOALL_LL_MAX_BYTES) llCap = (size_t)ALLTOALL_LL_MAX_BYTES;
+        g_a2aLLMaxBytes = (llCap / 8) * 8;  // 8-byte aligned
+        if (g_a2aLLMaxBytes > 0) {
+          int llMaxElts = commProperties->nRanks * (int)(g_a2aLLMaxBytes / 8);
+          int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
+          ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_a2aLLHandle, &g_a2aLLReq);
+          g_a2aLLReq.next = reqs->resourceRequirementsList;
+          reqs->resourceRequirementsList = &g_a2aLLReq;
+        }
+      }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
       reqs->ginForceEnable = true;
 #endif
       return testSuccess;
+    }
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
       if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
@@ -256,26 +309,85 @@ __device__ size_t AlltoAllGetSdmaThreshold(struct ncclDevComm const& devComm) {
   return loadConst(&rsCtx->sdmaThreshold);
 }
 
+// LL (low-latency) AllToAll for tiny messages, single CTA. Unlike AllGather
+// (one chunk broadcast to all peers), AllToAll scatters a distinct chunk to
+// each peer, so this uses the LL A2A session's point-to-point send(): rank myR
+// sends its chunk destined for peer p into peer p's epoch-tagged scratch at the
+// slot region [myR*chunkU64 ..], i.e. keyed by the *source* rank. Each rank then
+// polls all nRanks source regions out of its own scratch and writes them to its
+// local recvbuff at [s*chunkU64 ..]. There is NO cross-rank recvbuff write and
+// NO barrier: cross-rank traffic is confined to the LL scratch and ordered
+// purely by the per-slot epoch tag (ncclLLA2ASession), so it is immune to the
+// initData recvbuff-memset race that a barrier-free direct-LSA copy would
+// suffer. Requires 8-byte-aligned per-peer chunks (guaranteed by the test's
+// 16/eltSize base alignment).
+__device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+                               size_t chunkU64, struct ncclDevComm const& devComm, ncclTeam lsa,
+                               ncclLLA2AHandle llHandle) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int nR = lsa.nRanks;
+  const int myR = lsa.rank;
+  const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
+  uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
+
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+                                     /*maxElts=*/(int)((size_t)nR * chunkU64) };
+
+  // Scatter: send my per-peer chunk to peer p, keyed by my (source) rank.
+  for (int p = 0; p < nR; p++) {
+    for (size_t j = tid; j < chunkU64; j += nthreads) {
+      ll.send(p, (int)((size_t)myR * chunkU64 + j), src[(size_t)p * chunkU64 + j]);
+    }
+  }
+  // Gather every source rank's chunk-for-me out of my scratch into recvbuff.
+  for (int s = 0; s < nR; s++) {
+    for (size_t j = tid; j < chunkU64; j += nthreads) {
+      dst[(size_t)s * chunkU64 + j] = ll.recv<uint64_t>((int)((size_t)s * chunkU64 + j));
+    }
+  }
+  ll.endEpoch(ncclCoopCta());
+}
+
 // Single-node size-hybrid AlltoAll (-D 3):
-//   per-peer chunkBytes <= sdmaThreshold: direct LSA all-peers copy (all CTAs),
-//                                         latency-optimal for small messages.
-//   per-peer chunkBytes >  sdmaThreshold: all-peers GIN puts (SDMA copy engine),
-//                                         bandwidth-optimal for large messages.
+//   per-peer chunkBytes <= LL cap (opt-in):       LL packed data+flag, single CTA (tiny, no barrier).
+//   per-peer chunkBytes <= sdmaThreshold:         direct LSA all-peers copy (all CTAs),
+//                                                 latency-optimal for small messages.
+//   per-peer chunkBytes >  sdmaThreshold:         all-peers GIN puts (SDMA copy engine),
+//                                                 bandwidth-optimal for large messages.
+// The LL tier is OFF unless NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES>0 (llHandle.nSlots
+// stays 0 otherwise); on 8x MI355X it did not beat the direct-LSA copy.
 //
 // sdmaThresholdOverride lets the AlltoAll-specific env var
 // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL tune this LSA<->SDMA cutover
 // independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
 // value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
   const size_t size = count * sizeof(T);  // per-peer chunk bytes
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
                                    : AlltoAllGetSdmaThreshold(devComm);
 
   if (size <= sdmaThreshold) {
+    ncclTeam lsa = ncclTeamLsa(devComm);
+
+    // Tiny messages: LL packed data+flag path (single CTA). Barrier-free and
+    // immune to the recvbuff-memset race (cross-rank traffic stays in the
+    // epoch-tagged LL scratch; only local recvbuff is written). Used when LL is
+    // configured (nSlots>0), the per-peer chunk is 8-byte aligned, and it fits
+    // the pre-sized slot count.
+    if (llHandle.nSlots != 0 && (size % 8 == 0) && size <= (size_t)ALLTOALL_LL_MAX_BYTES) {
+      const size_t chunkU64 = size / 8;
+      if ((size_t)devComm.nRanks * chunkU64 <= (size_t)llHandle.nSlots) {
+        if (blockIdx.x != 0) return;  // single CTA
+        AlltoAllLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, devComm, lsa, llHandle);
+        return;
+      }
+    }
+
     /* small messages: direct LSA all-peers copy (all CTAs) */
-    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, ncclTeamLsa(devComm), devComm.lsaBarrier, blockIdx.x };
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     const int rank = devComm.rank, nRanks = devComm.nRanks;
@@ -445,7 +557,11 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", (size_t)262144);
+#if defined(A2A_HAVE_LL)
+        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle));
+#else
         TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr));
+#endif
         return testSuccess;
       }
       case 4:
