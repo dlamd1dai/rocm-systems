@@ -21,6 +21,7 @@ option(USE_MPI                     "Build RCCL-tests with MPI support."         
 option(ENABLE_DEVICE_API           "Build with NCCL Device API support (GIN)."    OFF)
 option(ENABLE_ROCSHMEM             "Build with rocshmem GIN backend support."     OFF)
 option(BUILD_LOCAL_GPU_TARGET_ONLY "Build only for GPUs detected on this machine" OFF)
+option(BUILD_TESTS                 "Build the GIN-SDMA unit/functional test suite" OFF)
 
 if (NOT CMAKE_BUILD_TYPE)
   message(WARNING "CMAKE_BUILD_TYPE is not defined. Setting to Release")
@@ -115,7 +116,7 @@ set(CMAKE_CXX_STANDARD   17)   # rocshmem GIN QP device headers require C++17
 set(CMAKE_CXX_EXTENSIONS OFF)  # Without this line, it will add -std=gnu++14 instead, which has some issues.
 set(CPACK_PACKAGING_INSTALL_PREFIX "${ROCM_PATH}" CACHE PATH "Path to install to when packaged.")
 if(ROCM_PATH)
-  #list(APPEND CMAKE_PREFIX_PATH  # Temporary workaround 
+  #list(APPEND CMAKE_PREFIX_PATH  # Temporary workaround
   list(PREPEND CMAKE_PREFIX_PATH  # Add ROCM_PATH to CMake search paths (for finding HIP / HSA
               ${ROCM_PATH}
               ${ROCM_PATH}/hip
@@ -262,6 +263,12 @@ set(ROCM_USE_DEV_COMPONENT OFF)  # This repo doesn't have a dev component
 
 # Add all of the tests
 add_subdirectory(src)
+
+# GIN-SDMA unit + functional test suite (opt-in via -DBUILD_TESTS=ON)
+if (BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(test)
+endif()
 
 rocm_setup_version(VERSION "2.14.1")
 
