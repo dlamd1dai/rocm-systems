@@ -318,6 +318,18 @@ Values are bytes with an optional `K`/`M`/`G` suffix. The Anvil backend is uncha
 
 **AlltoAll `-D 3` is a size-hybrid** (`GinHybridAlltoAllKernel`): a per-peer chunk ≤ threshold uses a direct all-peers **LSA** copy across all CTAs (latency-optimal for small, ~2× mid-range busbw); above the threshold it uses all-peers **GIN puts** over SDMA copy engines (bandwidth-optimal, scaling to ~390 GB/s @128M). The LSA branch needs enough CTAs, so Test#5 runs `-V 8` (SDMA is CTA-insensitive: `-V 1` ≈ `-V 8` at ~390 GB/s). This supersedes the earlier topology-only note and the shell-level `-D 4`/`-D 3` two-phase split; `-D 4` (`HybridAlltoAllKernel`, topology-based intra-node LSA vs inter-node GIN) is retained for debugging.
 
+#### 4.3.2 AllGather small-message LSA branch: single-CTA + LL fast path
+
+The AllGather LSA branch (`GinHybridAllGatherKernel`, `all_gather.cu`) is tiered for latency-bound sizes (all measured on 8× MI355X `NCCL_GIN_TYPE=6`, `-V 8`):
+
+- **Fix A — vectorized LSA copy** (`AllGatherLsaVectorized`): the single source chunk is loaded once (wide vector + unroll) and broadcast to every peer's `recvbuff[rank*count]` slot, hoisting the load out of the peer loop. Falls back to scalar for unaligned buffers.
+- **Fix B — single-CTA collapse** (`chunkBytes ≤ ALLGATHER_LSA_SINGLE_CTA_MAX = 8 KiB/rank`): tiny AllGather is barrier-bound, not bandwidth-bound. Using all `deviceCtaCount` CTAs multiplies the per-CTA cross-rank LSA barrier traffic for no copy-throughput gain, so the copy collapses to one CTA (CTAs > 0 return before touching a barrier).
+- **Fix C — LL packed data+flag fast path** (`chunkBytes ≤ ALLGATHER_LL_MAX_BYTES = 4 KiB/rank`, single CTA, `AllGatherLLImpl` on `ncclLLA2ASession`): each rank `bcast`s its chunk (as 8-byte units) into an epoch-tagged LL scratch buffer and `recv`s every rank's chunk out of its **own** scratch into its **local** `recvbuff`. This removes **both** LSA barriers: cross-rank traffic lives entirely in the LL scratch and is ordered by the per-slot epoch tag, and each rank writes only its own `recvbuff`.
+  - **Why the naive "drop a barrier" fix C is wrong.** The two LSA barriers are *not* both removable. rccl-tests' datacheck loop `Barrier`s (host/MPI only, no device sync) *before* `initData` but not between `initData` (which `cudaMemset`s `recvbuff`) and `startColl`. The in-kernel **entry** barrier is what guarantees all ranks are past their memset before any peer writes their `recvbuff`; dropping it lets a fast rank's direct-LSA write get clobbered by a slow rank's memset (reproduced on MI355 as intermittent ~3.5K wrong elts). LL sidesteps this entirely because cross-rank writes never touch `recvbuff`.
+  - **Requirement wiring.** An LL scratch resource is requested in `AllGatherGetDevCommRequirements` via `ncclLLA2ACreateRequirement(nBlocks=1, nSlots = nRanks·ALLGATHER_LL_MAX_BYTES/8)`; the returned `ncclLLA2AHandle` (a `{bufHandle, nSlots}` POD, `bufHandle` assigned by `ncclDevCommCreate`, buffer zero-initialized) is passed to the kernel via `testLaunchDeviceKernelThresholdLL`. `nSlots==0` (LL not configured) makes the kernel fall back to the vectorized LSA path.
+  - **Cutoff.** LL doubles wire volume (16-byte line = 8 B data + 2× epoch words). Tuned 2026-07-26: LL beats vectorized single-CTA LSA up to **4 KiB/rank** (32 KiB total: 12.2 vs 13.2 µs) but loses at 8 KiB/rank (64 KiB total: 19.0 vs 13.5 µs).
+  - **Result (small-message latency, out-of-place):** 128 B 13.3→**10.2 µs**, 2 KiB 13.7→**10.6**, 8 KiB ~13→**10.6**, 16 KiB ~13→**11.4**, 32 KiB 13.2→**12.2** (≈7–23 % lower); ≥64 KiB unchanged. `#wrong=0` across repeated runs.
+
 ### 4.4 Synchronization model
 
 **Signal semantics (the key fact).** `ncclGin::put`'s `ncclGin_SignalInc` is the template's

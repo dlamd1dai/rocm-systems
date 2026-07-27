@@ -63,6 +63,35 @@ collapses to 44 GB/s at 128 MiB; host CE/SDMA (copy engines) trails at every siz
 - **Hybrid default validated:** it matches force-GIN at ≥4 MiB and adds LSA wins in the
   512 KiB–2 MiB band (1 MiB: 59 vs 31).
 
+## Small-message latency: the three-tier LSA design (gin-sdma `-D 3`)
+
+The bandwidth table above (2026-07-24) predates the small-message latency work. `GinHybridAllGatherKernel` now tiers the sub-threshold (LSA) regime into three paths, selected by per-rank `chunkBytes` (all on 8× MI355X `NCCL_GIN_TYPE=6`, `-V 8`):
+
+| Per-rank chunk | Total (NP=8) | Path | Transport | Sync |
+|---|---|---|---|---|
+| ≤ 4 KiB | ≤ 32 KiB | **LL** packed data+flag (`AllGatherLLImpl`, single CTA) | xGMI GPU store into epoch-tagged LL scratch | per-slot epoch tag, **no barrier** |
+| ≤ 8 KiB | ≤ 64 KiB | vectorized LSA, **single CTA** | xGMI GPU store → peer recvbuff | 2 LSA barriers |
+| ≤ 256 KiB | ≤ 2 MiB | vectorized LSA, all CTAs | xGMI GPU store → peer recvbuff | 2 LSA barriers |
+| > 256 KiB | > 2 MiB | GIN puts | SDMA copy engines over xGMI | receiver `waitSignal` |
+
+**LL (low-latency) fast path (fix C).** Each rank `bcast`s its chunk (as 8-byte units) into an epoch-tagged LL scratch buffer (`ncclLLA2ASession`) and `recv`s every rank's chunk out of its **own** scratch into its **local** `recvbuff`. This removes **both** LSA barriers: cross-rank traffic lives entirely in the LL scratch, ordered by the per-slot epoch tag, and no rank ever writes a peer's `recvbuff`.
+
+- **Why not just drop a barrier from the LSA copy.** The two LSA barriers are not both removable. rccl-tests' datacheck loop `Barrier`s (host/MPI only) *before* `initData` but not between `initData`'s `cudaMemset(recvbuff)` and the kernel launch, so the in-kernel **entry** barrier is what guarantees all ranks are past their memset before any peer writes their `recvbuff`. Dropping it lets a fast rank's direct-LSA write get clobbered by a slow rank's memset — reproduced on MI355X as intermittent ~3.5K wrong elements. LL sidesteps this because cross-rank writes never touch `recvbuff`.
+- **Cutoff = 4 KiB/rank.** LL doubles wire volume (16-byte line = 8 B data + 2× epoch words), so it only wins while latency-bound: LL beats the single-CTA vectorized LSA up to 4 KiB/rank (32 KiB total: 12.2 vs 13.2 µs) but loses at 8 KiB/rank (64 KiB total: 19.0 vs 13.5 µs). Tunable via `ALLGATHER_LL_MAX_BYTES`.
+
+### Latency (out-of-place, µs; lower is better), 2026-07-26
+
+| Total (NP=8) | Per-rank | LSA baseline (A+B) | LL fix C | Δ | Path |
+|---|---|---:|---:|---:|---|
+| 128 B | 16 B | 13.3 | **10.2** | −23% | LL |
+| 2 KiB | 256 B | 13.7 | **10.6** | −22% | LL |
+| 8 KiB | 1 KiB | ~13 | **10.6** | −18% | LL |
+| 16 KiB | 2 KiB | ~13 | **11.4** | −13% | LL |
+| 32 KiB | 4 KiB | 13.2 | **12.2** | −7% | LL (last) |
+| 64 KiB | 8 KiB | ~13.7 | 13.7 | 0 | vectorized LSA |
+
+Correctness `#wrong=0` across repeated runs (LL is race-free by construction). All three tiers use **GPU + xGMI only** — no host proxy during the operation (`needsProxyProgress=0` for Anvil-SDMA; the SDMA path is GPU-initiated: the shader rings the SDMA-queue doorbell, the on-die copy engines DMA over xGMI, completion via GPU atomic signal).
+
 ## Compute units (CUs) used per GPU
 
 All paths use persistent 1-workgroup-per-CU kernels, so **CUs ≈ CTAs (thread blocks) launched**.
