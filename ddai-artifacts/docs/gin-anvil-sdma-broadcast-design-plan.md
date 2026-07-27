@@ -1,8 +1,8 @@
 # GIN-SDMA Broadcast on xGMI: Design Proposal
 
 **Document type:** Internal AMD planning
-**Status:** Implemented & validated in `broadcast_perf -D 3` (rev. 2026-07-24) — see §3.2/§4.4 sync correction. Host baseline BC-C1 (`-D 0`) now runs the full size range (64M cap removed) since the image ships the Broadcast **and** AllGather host ring kernels.
-**Date:** 2026-07-22 (rev. 2026-07-24)
+**Status:** Implemented & validated in `broadcast_perf -D 3` (rev. 2026-07-24) — see §3.2/§4.4 sync correction. Host baseline BC-C1 (`-D 0`) now runs the full size range (64M cap removed) since the image ships the Broadcast **and** AllGather host ring kernels. **2026-07-27:** added the small-message **LL fast path** (§4.3.4), default-on ≤ 2 KiB, ~13–16 % lower latency; see §4.3.2–§4.3.4 for the LL treatment across AllGather/AllToAll/Broadcast.
+**Date:** 2026-07-22 (rev. 2026-07-24, 2026-07-27)
 **Location:** `work-plans/gin-sdma-backend/broadcast/` (not committed to git)
 **Branch:** `users/dondai/gin-stage2c-sdma-bcast-wip`
 **Related:** PR #7826 (Anvil SDMA backend), AllGather plan (`allgather/gin-anvil-sdma-allgather-design-plan.md`)
@@ -339,6 +339,17 @@ The same LL idea was ported to the AllToAll LSA branch (`GinHybridAlltoAllKernel
 - **Measurement (careful same-build A/B, 50 iters × 3 reps, 2026-07-27).** LL is at best a **marginal, within-noise ~2–3 % faster at the very smallest sizes (≤ 32 B/peer)** and neutral-to-slightly-worse above that; run-to-run variance is itself ~2–3 % (a control row using the *same* path in both arms differed by 2.3 %). An earlier single-shot A/B that looked like a 5–10 % win was an inflated (~12 µs) baseline moment, corrected by the repeats. `#wrong=0` in every arm.
 - **Decision + wiring.** The LL path defaults **OFF** (no regression to the proven direct-LSA copy) and is **opt-in / runtime-tunable** via `NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=<per-peer bytes>` (0/unset = disabled, no recompile needed for future tuning). When enabled, `AlltoAllGetDevCommRequirements` requests the LL scratch (`ncclLLA2ACreateRequirement`, sized to `nRanks · cap/8` slots, capped at a compile-time `ALLTOALL_LL_MAX_BYTES = 64 KiB/peer` ceiling); when disabled the requirement is skipped so `nSlots==0` and the kernel takes the direct-LSA path. The handle rides the shared `testLaunchDeviceKernelThresholdLL` launcher.
 
+#### 4.3.4 Broadcast LL small-message fast path: default-on, ~16 % faster
+
+Broadcast is the case where the LL idea pays off cleanly, because its small-message LSA path (`BroadcastLsaDirect`) is genuinely two-barrier-bound: only the root writes, so almost all of the ~7 µs floor is the entry+exit LSA barriers, not copy work. LL replaces one of them.
+
+- **Mechanism** (`BroadcastLLImpl` on `ncclLLA2ASession`, single CTA). Broadcast is one-to-all, so it maps straight onto the session's `bcast()` primitive: only the root `bcast`s its message (as 8-byte units) into every peer's epoch-tagged scratch, and every rank (root included) `recv`s it out of its **own** scratch into its **local** `recvbuff`. Only `msgBytes/8` slots are needed (one message), versus `nRanks·chunk/8` for AllGather/AllToAll.
+- **Why one barrier stays (the deadlock that AllGather LL doesn't have).** The session double-buffers by epoch parity (`(epoch&1)·nSlots`), tolerating only a **< 2-epoch** writer/reader skew. AllGather's mutual `recv` self-throttles every rank to within one epoch, so it needs **no** barrier. Broadcast has **no backpressure** — only the root writes — so across the perf loop's back-to-back kernel launches a fast root can run ≥ 2 epochs ahead of a lagging non-root and overwrite a slot region that rank is still polling with a newer tag → the tag never matches → **hang** (reproduced on MI355). Keeping a single **entry** LSA barrier bounds the skew to < 1 epoch and makes the double-buffer safe; the **exit** barrier stays removed (the `recv` epoch-tag match *is* the completion signal). Net: two barriers → one.
+- **Result (small-message latency, out-of-place, 8× MI355X, 50 iters × 3 reps, 2026-07-27):** 128 B 7.27→**6.28 µs**, 256 B 7.23→**6.11**, 512 B 7.23→**6.07**, 1 KiB 7.22→**6.09** (≈ **13–16 % lower**), 2 KiB 7.25→**6.64** (≈ 8 %); crossover at 4 KiB (+3 %). Consistent across all reps; `#wrong=0` across the full root sweep (0..N−1) and for int8/double.
+- **Decision + wiring.** Because the win is robust, the LL path is **on by default up to `BROADCAST_LL_DEFAULT_MAX_BYTES = 2 KiB`** and tunable via `NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES=<bytes>` (`0` = disable, unset = 2 KiB), clamped to a compile-time `BROADCAST_LL_MAX_BYTES = 64 KiB` ceiling. `BroadcastGetDevCommRequirements` requests `cap/8` slots via `ncclLLA2ACreateRequirement`; the handle rides the shared `testLaunchDeviceKernelThresholdLL` launcher. The pre-sized slot count is what enforces the effective cutoff (`chunkU64 ≤ nSlots`).
+
+**LL across the three collectives.** AllGather: robust 7–23 % win, no barrier (default-on). Broadcast: robust 13–16 % win, one entry barrier retained for backpressure (default-on ≤ 2 KiB). AllToAll: within-noise, direct-LSA already at its floor (default-off, opt-in). The differentiator is how barrier-bound the baseline small path is and whether the collective supplies its own backpressure.
+
 ### 4.4 Synchronization model
 
 **Signal semantics (the key fact).** `ncclGin::put`'s `ncclGin_SignalInc` is the template's
@@ -381,7 +392,7 @@ AllGather's entry barrier).
 
 | Regime | Expectation | Measured (8× MI355X, 2026-07-24) |
 |--------|-------------|-----------------------------------|
-| ≤128 B | ~7–8 µs (LSA), similar to AllGather LSA | ~7.2 µs @128 B (LSA); ~23 µs when forced to GIN (`THRESHOLD=0`) |
+| ≤128 B | ~7–8 µs (LSA); ~6 µs with the LL fast path (§4.3.4) | ~7.2 µs @128 B (LSA), **~6.2 µs with LL (default ≤ 2 KiB, −16 %)**; ~23 µs when forced to GIN (`THRESHOLD=0`) |
 | Medium | GIN setup floor ~21–22 µs | ~23 µs @1–8 KB |
 | 128 MiB | Root fan-out (N−1) puts; busbw ≈ `(N-1)/N × link_BW` | **in-place ~60 GB/s**, **OOP ~41 GB/s** (OOP bounded by the root's local send→recv copy; 16B-vectorized) |
 
