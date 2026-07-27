@@ -10,6 +10,10 @@
 
 #define NCCL_TESTS_VERSION "2.18.3"
 
+// Pure (no-GPU) policy logic shared by the GIN-SDMA collective designs and their
+// host unit tests. Included first so the threshold/tier helpers below can
+// delegate to it.
+#include "gin_sdma_collective_policy.h"
 #include "rccl/rccl.h"
 // nccl_device.h provides the device-API public types referenced below
 // (ncclCommProperties_t, full ncclDevCommRequirements, NCCL_GIN_TYPE_NONE, ...).
@@ -414,26 +418,14 @@ extern thread_local int is_main_thread;
 
 // Sentinel meaning "no per-collective override; use the device/backend value
 // (i.e. rsCtx->sdmaThreshold, populated from NCCL_GIN_ANVIL_SDMA_THRESHOLD)".
-#define TEST_SDMA_THRESHOLD_UNSET ((size_t)-1)
+#define TEST_SDMA_THRESHOLD_UNSET (gin_sdma::kThresholdUnset)
 
 // Parse a per-collective LSA<->GIN threshold env var (bytes; optional K/M/G
 // suffix). Returns TEST_SDMA_THRESHOLD_UNSET when unset/empty/unparseable so
 // the kernel falls back to the shared NCCL_GIN_ANVIL_SDMA_THRESHOLD value.
+// Thin getenv() wrapper over the pure, unit-tested gin_sdma::parseSize().
 static inline size_t testParseSdmaThresholdEnv(const char* name) {
-  const char* v = getenv(name);
-  if (v == NULL || v[0] == '\0') return TEST_SDMA_THRESHOLD_UNSET;
-  char* end = NULL;
-  unsigned long long val = strtoull(v, &end, 10);
-  if (end == v) return TEST_SDMA_THRESHOLD_UNSET;
-  if (end && *end) {
-    switch (*end) {
-      case 'k': case 'K': val *= 1024ULL; break;
-      case 'm': case 'M': val *= 1024ULL * 1024ULL; break;
-      case 'g': case 'G': val *= 1024ULL * 1024ULL * 1024ULL; break;
-      default: break;
-    }
-  }
-  return (size_t)val;
+  return gin_sdma::parseSize(getenv(name));
 }
 
 // Resolve a collective's LSA<->GIN threshold with the fallback chain:
@@ -443,11 +435,9 @@ static inline size_t testParseSdmaThresholdEnv(const char* name) {
 //   3. the collective's data-driven default (collDefault).
 // Always returns a concrete value, so callers pass it straight to the kernel.
 static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDefault) {
-  size_t v = testParseSdmaThresholdEnv(collVar);
-  if (v != TEST_SDMA_THRESHOLD_UNSET) return v;
-  v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
-  if (v != TEST_SDMA_THRESHOLD_UNSET) return v;
-  return collDefault;
+  return gin_sdma::resolveThreshold(gin_sdma::parseSize(getenv(collVar)),
+                                    gin_sdma::parseSize(getenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD")),
+                                    collDefault);
 }
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)

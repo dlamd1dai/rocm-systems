@@ -25,15 +25,14 @@
 // API (>=2.28) or any >=2.29 build; gate on that.
 #if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
 #define BC_HAVE_LL 1
-// Compile-time ceiling on the message (bytes) the LL path can serve; the LL
-// scratch is sized for this cap at devComm creation. The actual LL<->LSA cutover
-// is runtime-gated via env NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES (see below).
-#define BROADCAST_LL_MAX_BYTES 65536
-// Default LL<->LSA cutover (message bytes). LL wins for tiny broadcasts by
-// dropping one of the two LSA barriers: on 8x MI355X (50 iters x 3 reps,
-// 2026-07-27) it cut small-message latency a robust 13-16% at <=1 KiB and ~8%
-// at 2 KiB, crossing over (~+3%) at 4 KiB. So enable by default up to 2 KiB.
-#define BROADCAST_LL_DEFAULT_MAX_BYTES 2048
+// The compile ceiling (gin_sdma::kBroadcastLLMaxBytes, 64 KiB) and default
+// LL<->LSA cutover (gin_sdma::kBroadcastLLDefaultMaxBytes, 2 KiB) live in
+// gin_sdma_collective_policy.h so the kernel branch, the requirements sizing and
+// the host unit tests all share one source. The actual cutover is runtime-gated
+// via env NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES (0 = disable). LL wins for tiny
+// broadcasts by dropping one of the two LSA barriers: on 8x MI355X (50 iters x 3
+// reps, 2026-07-27) it cut small-message latency a robust 13-16% at <=1 KiB and
+// ~8% at 2 KiB, crossing over (~+3%) at 4 KiB, hence the 2 KiB default.
 // LL scratch handle: bufHandle assigned during ncclDevCommCreate; nSlots set by
 // ncclLLA2ACreateRequirement when the LL path is enabled. nSlots==0 => LL not
 // configured, so the kernel uses the direct-LSA fan-out. The cutover is tunable
@@ -97,17 +96,16 @@ testResult_t BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
       reqs->lsaBarrierCount = deviceCtaCount;
       // >=2 so the scatter+allgather large tier (§4.8) can use two independent
       // signal indices (scatter=0, gather=1); the flat/LSA paths use only 0.
-      reqs->ginSignalCount = (deviceCtaCount < 2) ? 2 : deviceCtaCount;
+      reqs->ginSignalCount = gin_sdma::bcastSignalCount(deviceCtaCount);
       // LL scratch for the tiny-message fast path (single CTA => nBlocks=1),
       // on by default up to BROADCAST_LL_DEFAULT_MAX_BYTES, tunable via
       // NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES (bytes; 0 = disable). Broadcast carries
       // a single message (only the root sends), so a receiver needs just cap/8
       // u64 slots -- unlike AllGather/AllToAll which need nRanks*cap/8.
       {
-        size_t llCap = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES");
-        if (llCap == TEST_SDMA_THRESHOLD_UNSET) llCap = (size_t)BROADCAST_LL_DEFAULT_MAX_BYTES;
-        if (llCap > (size_t)BROADCAST_LL_MAX_BYTES) llCap = (size_t)BROADCAST_LL_MAX_BYTES;
-        g_bcastLLMaxBytes = (llCap / 8) * 8;  // 8-byte aligned
+        g_bcastLLMaxBytes = gin_sdma::resolveLLCap(
+            testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_LL_MAX_BYTES"),
+            gin_sdma::kBroadcastLLDefaultMaxBytes, gin_sdma::kBroadcastLLMaxBytes);
         if (g_bcastLLMaxBytes > 0) {
           int llMaxElts = (int)(g_bcastLLMaxBytes / 8);
           int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
@@ -138,7 +136,7 @@ bool BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
       reqs->barrierCount = deviceCtaCount;
       reqs->lsaBarrierCount = deviceCtaCount;
       // >=2 for the scatter+allgather large tier's two signal indices (§4.8).
-      reqs->ginSignalCount = (deviceCtaCount < 2) ? 2 : deviceCtaCount;
+      reqs->ginSignalCount = gin_sdma::bcastSignalCount(deviceCtaCount);
       return true;
 #endif
     default:
@@ -268,13 +266,11 @@ __global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset
     // Tiny messages: LL packed data+flag path (single CTA), barrier-free and
     // memset-race-immune. Used when LL is configured (nSlots>0), the message is
     // 8-byte aligned, and it fits the pre-sized slot count.
-    if (llHandle.nSlots != 0 && (msgBytes % 8 == 0) && msgBytes <= (size_t)BROADCAST_LL_MAX_BYTES) {
+    if (gin_sdma::bcastLLEligible(msgBytes, llHandle.nSlots, gin_sdma::kBroadcastLLMaxBytes)) {
+      if (blockIdx.x != 0) return;  // single CTA
       const size_t chunkU64 = msgBytes / 8;
-      if (chunkU64 <= (size_t)llHandle.nSlots) {
-        if (blockIdx.x != 0) return;  // single CTA
-        BroadcastLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, root, devComm, lsa, llHandle);
-        return;
-      }
+      BroadcastLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, root, devComm, lsa, llHandle);
+      return;
     }
 
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
@@ -360,12 +356,12 @@ template <typename T>
 __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
   const int N = devComm.nRanks;
   const int rank = devComm.rank;
-  // Even split with the remainder folded into the last rank's slice. Host
-  // guarantees count >= N, so baseCount >= 1.
+  // Even split with the remainder folded into the last rank's slice (shared with
+  // the host unit tests via gin_sdma::sagChunk). Host guarantees count >= N.
   const size_t baseCount = count / (size_t)N;
-  const size_t tailCount = count - baseCount * (size_t)(N - 1);
-  const size_t myCount = (rank == N - 1) ? tailCount : baseCount;
-  const size_t myByteOff = (size_t)rank * baseCount * sizeof(T);
+  const gin_sdma::Chunk myChunk = gin_sdma::sagChunk(count, N, rank);
+  const size_t myCount = myChunk.count;
+  const size_t myByteOff = myChunk.eltOffset * sizeof(T);
   const size_t myBytes = myCount * sizeof(T);
 
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -395,12 +391,12 @@ __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t 
     }
     for (int r = tid; r < N; r += nthreads) {
       if (r == root) continue;
-      const size_t rCount = (r == N - 1) ? tailCount : baseCount;
-      const size_t rOff = (size_t)r * baseCount * sizeof(T);
+      const gin_sdma::Chunk rChunk = gin_sdma::sagChunk(count, N, r);
+      const size_t rOff = rChunk.eltOffset * sizeof(T);
       gin.put(ncclTeamWorld(devComm), r,
           recvwin, recvoffset + rOff,
           sendwin, sendoffset + rOff,
-          rCount * sizeof(T), ncclGin_SignalInc{sigScatter});
+          rChunk.count * sizeof(T), ncclGin_SignalInc{sigScatter});
     }
     // No intermediate flush: the scatter and allgather sources are both the
     // read-only sendwin, so there is no source-reuse hazard, and completion is
@@ -456,7 +452,7 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // >=512K (measured 2026-07-24). Override with
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
-        static const size_t bcastThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST", (size_t)262144);
+        static const size_t bcastThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST", gin_sdma::kBroadcastSdmaThresholdDefault);
 
         // Large-message tier (§4.8): scatter + in-place allgather. Distributes
         // egress across all ranks to beat the flat fan-out's root-egress ceiling
@@ -468,15 +464,14 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // 224 vs 60), and loses <2M (1M 19.4 vs 23.7). So default 2 MiB.
         static const size_t bcastSagMin = []() {
           size_t v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES");
-          return (v == TEST_SDMA_THRESHOLD_UNSET) ? (size_t)(2ull * 1024 * 1024) : v;
+          return (v == TEST_SDMA_THRESHOLD_UNSET) ? gin_sdma::kBroadcastScatterAgMinDefault : v;
         }();
         // In the -D 3 path `comm` is the ncclDevComm handle (testLaunchDeviceKernel*
         // casts it), NOT a real ncclComm_t -- so read nRanks from the devComm
         // struct rather than ncclCommCount (which would fault on a corrupted comm).
         const int sagRanks = (int)((struct ncclDevComm*)comm)->nRanks;
         const size_t msgBytes = count * wordSize(type);
-        if (bcastSagMin != 0 && sagRanks >= 2 && msgBytes >= bcastSagMin &&
-            count >= (size_t)sagRanks) {
+        if (gin_sdma::bcastUseScatterAllgather(msgBytes, count, sagRanks, bcastSagMin)) {
           TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinScatterAllgatherBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
           return testSuccess;
         }
