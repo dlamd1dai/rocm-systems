@@ -7,6 +7,11 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+#include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
+#include "rccl_vector_types.h"
+#endif
 
 void GatherGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *sendcount = (count/nranks) & -(16/eltSize);
@@ -44,6 +49,140 @@ void GatherGetBw(size_t count, int typesize, double sec, double* algBw, double* 
   *busBw = baseBw * factor;
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t GatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
+  if (!reqs || !commProperties) return testInternalError;
+  switch(deviceImpl) {
+    case 3: { // GinGatherKernel: each rank LSA stores / GIN puts its chunk to root
+      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+        fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
+        return testInternalError;
+      }
+      gin_sdma::DevReqs dr = gin_sdma::moveDevReqs(deviceCtaCount);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
+      reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+#else
+      reqs->ginForceEnable = true;
+#endif
+      return testSuccess;
+    }
+    default:
+      return testNotImplemented;
+  }
+}
+#elif defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+bool GatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs) {
+  if (!reqs) return false;
+  memset(reqs, 0, sizeof(*reqs));
+  switch(deviceImpl) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+    case 3: {
+      gin_sdma::DevReqs dr = gin_sdma::moveDevReqs(deviceCtaCount);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+      return true;
+    }
+#endif
+    default:
+      return false;
+  }
+}
+#endif
+
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+__device__ size_t GatherGetSdmaThreshold(struct ncclDevComm const& devComm) {
+  using nccl::utility::loadConst;
+  if (devComm.ginConnectionCount == 0 || devComm.ginHandles[0] == nullptr) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[0];
+  if (rsCtx == nullptr ||
+      loadConst(&rsCtx->layoutMagic) != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  return loadConst(&rsCtx->sdmaThreshold);
+}
+
+template <typename T>
+__device__ void GatherLocalCopy(T* dst, const T* src, size_t count, int tid, int nthreads) {
+  const size_t bytes = count * sizeof(T);
+  const uintptr_t da = (uintptr_t)dst, sa = (uintptr_t)src;
+  if ((bytes % sizeof(uint4)) == 0 && (da % sizeof(uint4)) == 0 && (sa % sizeof(uint4)) == 0) {
+    uint4* d4 = (uint4*)dst; const uint4* s4 = (const uint4*)src;
+    const size_t n4 = bytes / sizeof(uint4);
+    for (size_t i = tid; i < n4; i += nthreads) d4[i] = s4[i];
+  } else {
+    for (size_t i = tid; i < count; i += nthreads) dst[i] = src[i];
+  }
+}
+
+// Single-node hybrid Gather (-D 3): every rank sends its per-rank chunk to the
+// root's recvbuff slot [rank*count]. The root's recv slot offset is uniform
+// across ranks (recvInplaceOffset == 0), so a rank addresses the root at its own
+// recvoffset + rank*chunk with no reconstruction; in-place works unchanged.
+//   chunkBytes <= sdmaThreshold: each rank LSA-stores its chunk into root's slot.
+//   chunkBytes >  sdmaThreshold: each non-root issues one GIN put to root.
+// Completion is receiver-side and inverted vs Scatter: the root receives N-1
+// puts and waits base+(N-1); non-roots receive none and only flush. The root
+// fills its own slice with a local copy (no-op in-place).
+template <typename T>
+__global__ void GinGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+  const size_t chunkBytes = count * sizeof(T);
+  const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
+                                   ? sdmaThresholdOverride
+                                   : GatherGetSdmaThreshold(devComm);
+  const int rank = devComm.rank, nRanks = devComm.nRanks;
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+  const size_t myDstOff = recvoffset + (size_t)rank * chunkBytes;
+
+  if (chunkBytes <= sdmaThreshold) {
+    ncclTeam lsa = ncclTeamLsa(devComm);
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+    const T* src = (const T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* dst = (T*)ncclGetLsaPointer(recvwin, myDstOff, root);  // root's slot for me
+    for (size_t i = tid; i < count; i += nthreads) dst[i] = src[i];
+
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    return;
+  }
+
+  const unsigned int signalIndex = 0;
+  ncclGin gin { devComm, /*context=*/0 };
+  const uint64_t signalValue = gin.readSignal(signalIndex);
+
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  if (rank == root) {
+    // Root fills its own slice locally (no-op in-place: local src == local dst).
+    T* lsrc = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* ldst = (T*)ncclGetLocalPointer(recvwin, myDstOff);
+    if (lsrc != ldst) {
+      GatherLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
+    }
+    // Root receives exactly one put from each non-root.
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)(nRanks - 1));
+  } else {
+    // One put of my chunk into root's slot [rank*chunk] (issued once).
+    if (tid == 0) {
+      gin.put(ncclTeamWorld(devComm), root,
+          recvwin, myDstOff,
+          sendwin, sendoffset,
+          chunkBytes, ncclGin_SignalInc{signalIndex});
+    }
+    gin.flush(ncclCoopCta());
+  }
+}
+#endif
+
 testResult_t GatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
   if (deviceImpl == 0) {
     int nRanks;
@@ -71,7 +210,22 @@ testResult_t GatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, si
     return testNcclError;
 #endif
   } else {
-    return testNotImplemented;
+    switch(deviceImpl) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+      case 3: {
+        // Gather-specific LSA<->GIN threshold (compared against the per-rank
+        // chunk). Default 1 GiB (LSA-always): every rank writes its own slice so
+        // parallel LSA beats GIN/SDMA at all measured sizes to 512 MiB (8x
+        // MI355X, 2026-07-27; 432 vs 419 GB/s). Set
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_GATHER=0 to force the GIN tier.
+        static const size_t gaThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_GATHER", gin_sdma::kGatherSdmaThresholdDefault);
+        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, gaThr));
+        return testSuccess;
+      }
+#endif
+      default:
+        return testNotImplemented;
+    }
   }
   return testSuccess;
 }
@@ -125,5 +279,8 @@ testResult_t GatherRunTest(struct threadArgs* args, int root, ncclDataType_t typ
 
 struct testEngine ncclTestEngine = {
   .getBuffSize = GatherGetBuffSize,
-  .runTest = GatherRunTest
+  .runTest = GatherRunTest,
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+  .getDevCommRequirements = GatherGetDevCommRequirements
+#endif
 };
