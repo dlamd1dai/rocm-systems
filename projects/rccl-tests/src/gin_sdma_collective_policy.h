@@ -251,6 +251,48 @@ GIN_SDMA_HD inline DevReqs a2aDevReqs(int deviceImpl, int deviceCtaCount) {
   }
 }
 
+// ---------------- Scatter / Gather / SendRecv (pure movement) ----------------
+//
+// Phase-1 single-phase movement collectives. They share one tier predicate and
+// one devComm-requirement shape: a size-hybrid LSA(small) / GIN-SDMA(large) split
+// at a per-collective LSA<->GIN threshold (default 256 KiB, retuned by
+// measurement per the design plan), and barrier = lsaBarrier = ginSignal =
+// deviceCtaCount with needsGin. No scratch, no LL (movement only; Phase 1).
+
+// Compared against the transfer bytes (Scatter/Gather: per-rank chunk; SendRecv:
+// full message). Tuned on 8x MI355X (gfx950, NCCL_GIN_TYPE=6, -V 32, 2026-07-27;
+// LSA-forced vs GIN-forced sweeps, gin-sdma-phase1-tune.bash):
+//
+//   * Scatter LSA is root-egress-bound (only the root SM-stores all N-1 peer
+//     chunks, ~64 GB/s ceiling), so GIN/SDMA wins decisively once the per-rank
+//     chunk is large: crossover at a 256 KiB chunk (2 MiB total), and by 512 MiB
+//     GIN is 390 vs 64 GB/s. Default 128 KiB puts the cutover just below the
+//     measured crossover (<=128 KiB chunk -> LSA, >=256 KiB -> GIN).
+//   * Gather and SendRecv distribute the writes across all ranks (every rank
+//     stores its own slice), so direct LSA beats GIN/SDMA at *every* measured
+//     size up to 512 MiB (Gather 432 vs 419, SendRecv 62.4 vs 61.1 GB/s at
+//     512 MiB). Their default is set high so LSA is used across all practical
+//     sizes; the GIN tier remains available as an env-tunable escape hatch
+//     (NCCL_GIN_ANVIL_SDMA_THRESHOLD_{GATHER,SENDRECV}=0 forces it).
+static constexpr size_t kScatterSdmaThresholdDefault  = 131072;      // 128 KiB/rank chunk
+static constexpr size_t kGatherSdmaThresholdDefault   = 1073741824;  // 1 GiB: LSA-always
+static constexpr size_t kSendRecvSdmaThresholdDefault = 1073741824;  // 1 GiB: LSA-always
+
+enum class MoveTier { LSA, Gin };
+
+// Tier chosen by the single-phase movement kernels: LSA below/at the threshold,
+// GIN/SDMA above it.
+GIN_SDMA_HD inline MoveTier moveKernelTier(size_t bytes, size_t sdmaThreshold) {
+  return (bytes <= sdmaThreshold) ? MoveTier::LSA : MoveTier::Gin;
+}
+
+// devComm requirements for the -D 3 movement kernels (scatter/gather/sendrecv):
+// one barrier + one lsaBarrier + one signal per CTA, GIN required.
+GIN_SDMA_HD inline DevReqs moveDevReqs(int deviceCtaCount) {
+  DevReqs r{deviceCtaCount, deviceCtaCount, deviceCtaCount, true, true};
+  return r;
+}
+
 }  // namespace gin_sdma
 
 #endif  // GIN_SDMA_COLLECTIVE_POLICY_H_
