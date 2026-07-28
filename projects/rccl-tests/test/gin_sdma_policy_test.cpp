@@ -280,4 +280,34 @@ TEST(A2aDevReqs, PerDeviceImpl) {
   EXPECT_FALSE(r5.supported);
 }
 
+// -------------------- Scatter/Gather/SendRecv (movement) --------------------
+
+TEST(MoveKernelTier, ThresholdSplit) {
+  const size_t thr = 262144;
+  EXPECT_EQ(moveKernelTier(thr, thr), MoveTier::LSA);      // at threshold -> LSA
+  EXPECT_EQ(moveKernelTier(thr - 1, thr), MoveTier::LSA);
+  EXPECT_EQ(moveKernelTier(thr + 1, thr), MoveTier::Gin);  // above -> GIN
+  EXPECT_EQ(moveKernelTier(0, thr), MoveTier::LSA);
+  EXPECT_EQ(moveKernelTier(1, 0), MoveTier::Gin);          // threshold 0 -> always GIN
+}
+
+TEST(MoveDevReqs, UniformCtaCountsAndGin) {
+  const int cta = 8;
+  DevReqs r = moveDevReqs(cta);
+  EXPECT_TRUE(r.supported);
+  EXPECT_TRUE(r.needsGin);
+  EXPECT_EQ(r.barrierCount, cta);
+  EXPECT_EQ(r.lsaBarrierCount, cta);
+  EXPECT_EQ(r.ginSignalCount, cta);
+}
+
+TEST(MoveThresholdDefaults, TunedPerCollective) {
+  // Tuned on 8x MI355X (2026-07-27): Scatter LSA is root-egress-bound so GIN
+  // wins for chunks >=256 KiB (cutover 128 KiB); Gather/SendRecv distribute
+  // writes so LSA wins to 512 MiB (LSA-always via a 1 GiB cutover).
+  EXPECT_EQ(kScatterSdmaThresholdDefault, 131072u);        // 128 KiB
+  EXPECT_EQ(kGatherSdmaThresholdDefault, 1073741824u);     // 1 GiB (LSA-always)
+  EXPECT_EQ(kSendRecvSdmaThresholdDefault, 1073741824u);   // 1 GiB (LSA-always)
+}
+
 }  // namespace

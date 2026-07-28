@@ -3,7 +3,8 @@
 #
 # Purpose: drive the real device kernels (GinHybridBroadcastKernel /
 # GinScatterAllgatherBroadcastKernel / GinHybridAllGatherKernel /
-# GinHybridAlltoAllKernel) across a size/root/in-place matrix that crosses every
+# GinHybridAlltoAllKernel / GinScatterKernel / GinGatherKernel /
+# GinSendRecvKernel) across a size/root/in-place matrix that crosses every
 # tier boundary, with the built-in correctness check (-c 1). rccl-tests' main
 # returns non-zero when any element is wrong, so a clean exit == all exercised
 # branches produced correct data. This is the "device branch checklist" half of
@@ -20,11 +21,14 @@
 #   Broadcast : LL (<=2 KiB) -> LSA (<=256 KiB) -> flat GIN (<2 MiB) -> scatter+AG (>=2 MiB)
 #   AllGather : LL (<=4 KiB/rank) -> LSA single-CTA (<=8 KiB) -> LSA multi-CTA (<=256 KiB) -> GIN
 #   AllToAll  : LSA (<=256 KiB/peer) -> GIN ; LL tier is opt-in and exercised via env
+#   Scatter   : LSA (<=256 KiB/rank chunk) -> GIN   (root fan-out; OOP + in-place)
+#   Gather    : LSA (<=256 KiB/rank chunk) -> GIN   (root fan-in;  OOP + in-place)
+#   SendRecv  : LSA (<=256 KiB message)    -> GIN   (ring; OOP only)
 #
-# Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall> <bin_dir> <np> [launcher]
+# Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall|scatter|gather|sendrecv> <bin_dir> <np> [launcher]
 set -euo pipefail
 
-COLL="${1:?collective (broadcast|all_gather|alltoall)}"
+COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv)}"
 BIN_DIR="${2:?build dir containing *_perf}"
 NP="${3:-8}"
 LAUNCHER="${4:-mpirun}"
@@ -33,6 +37,9 @@ case "$COLL" in
   broadcast)  BIN="broadcast_perf" ;;
   all_gather) BIN="all_gather_perf" ;;
   alltoall)   BIN="alltoall_perf" ;;
+  scatter)    BIN="scatter_perf" ;;
+  gather)     BIN="gather_perf" ;;
+  sendrecv)   BIN="sendrecv_perf" ;;
   *) echo "unknown collective: $COLL" >&2; exit 2 ;;
 esac
 
@@ -117,6 +124,39 @@ case "$COLL" in
       "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=4096 \
       "$EXE" -b "$MIN_BYTES" -e 8K -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP"
+    set +x
+    ;;
+  scatter|gather)
+    # Root fan-out/fan-in: exercise rank==root and non-root paths on root 0 and
+    # the last rank, across the LSA (small chunk) and GIN (large chunk) tiers,
+    # out-of-place and in-place.
+    for root in 0 $((NP - 1)); do
+      run "sweep root=$root out-of-place" -r "$root" -z 0
+      run "sweep root=$root in-place"     -r "$root" -z 1
+    done
+    # Gather defaults to LSA at all sizes (tuned); force the GIN tier so its
+    # kernel path stays covered. Scatter already crosses into GIN by 2 MiB, but a
+    # forced pass is cheap and keeps both collectives symmetric here.
+    THRENV="NCCL_GIN_ANVIL_SDMA_THRESHOLD_$(echo "$COLL" | tr a-z A-Z)"
+    echo "=== [$COLL] GIN-tier forced (${THRENV}=0) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x "${THRENV}=0" \
+      "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
+    set +x
+    ;;
+  sendrecv)
+    # Ring send/recv; in-place is not validated for sendrecv (OOP only).
+    run "sweep out-of-place" -z 0
+    # SendRecv defaults to LSA at all sizes (tuned); force the GIN tier so its
+    # kernel path stays covered.
+    echo "=== [$COLL] GIN-tier forced (NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV=0) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV=0 \
+      "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -z 0
     set +x
     ;;
 esac

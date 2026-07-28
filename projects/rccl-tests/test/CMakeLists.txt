@@ -2,7 +2,8 @@
 # Copyright 2026 Advanced Micro Devices, Inc.
 #
 # Unit + functional tests for the GIN-SDMA collective designs
-# (Broadcast / AllGather / AllToAll, deviceImpl == 3).
+# (Broadcast / AllGather / AllToAll / Scatter / Gather / SendRecv,
+#  deviceImpl == 3).
 #
 #   * gin_sdma_policy_test  - host-only GoogleTest binary covering the pure
 #                             tier-selection / threshold / chunk / requirement
@@ -89,7 +90,7 @@ option(BUILD_GPU_FUNCTIONAL_TESTS
 if (BUILD_GPU_FUNCTIONAL_TESTS)
   set(GIN_SDMA_TEST_NP "8" CACHE STRING "MPI ranks for GIN-SDMA GPU functional tests")
   set(GIN_SDMA_MPI_LAUNCHER "mpirun" CACHE STRING "MPI launcher for GPU functional tests")
-  foreach(coll broadcast all_gather alltoall)
+  foreach(coll broadcast all_gather alltoall scatter gather sendrecv)
     add_test(NAME gin_sdma_gpu_${coll}
       COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/gin_sdma_gpu_functional.sh
               ${coll} ${CMAKE_BINARY_DIR} ${GIN_SDMA_TEST_NP} ${GIN_SDMA_MPI_LAUNCHER})
