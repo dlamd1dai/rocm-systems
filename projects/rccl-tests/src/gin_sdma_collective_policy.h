@@ -73,6 +73,17 @@ static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
 static constexpr size_t kSendRecvLLMaxBytes            = 65536;         // 64 KiB
 static constexpr size_t kSendRecvLLDefaultMaxBytes     = 2048;          // 2 KiB
 
+// Scatter LL fast path: compile ceiling + default runtime cutover. Scatter is
+// one-to-all with a DISTINCT per-rank chunk, but each receiver still takes a
+// single incoming message (its own chunk from the root), so a receiver needs
+// just chunk/8 u64 slots -- the same single-message sizing as Broadcast/SendRecv
+// (not the nRanks*... AllGather/AllToAll form). The LL cap is compared against
+// the per-rank chunk bytes (matching the Scatter LSA<->GIN threshold). On by
+// default (2 KiB) since tiny scatters are barrier-bound and LL drops the exit
+// barrier; tune/disable via NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES (0 = disable).
+static constexpr size_t kScatterLLMaxBytes             = 65536;         // 64 KiB/chunk
+static constexpr size_t kScatterLLDefaultMaxBytes      = 2048;          // 2 KiB/chunk
+
 // Max bytes per single gin.put() on the Anvil-SDMA backend. The SDMA linear-copy
 // descriptor count field is 30 bits and 1-based (HW encodes count = bytes - 1,
 // see rocr-runtime amd_blit_sdma.cpp / sdma_registers.h), so the largest single
@@ -340,6 +351,33 @@ GIN_SDMA_HD inline SendRecvTier sendRecvKernelTier(size_t msgBytes,
     return SendRecvTier::LSA;
   }
   return SendRecvTier::Gin;
+}
+
+// Scatter LL eligibility (inside the chunkBytes<=sdmaThreshold branch): LL
+// configured (nSlots>0), 8-byte aligned, within the compile ceiling, and it
+// fits the pre-sized slot count. Each receiver takes ONE chunk from the root, so
+// the slot demand is chunkBytes/8 (mirrors bcast/sendRecvLLEligible, not the
+// nRanks*... forms). Compared against the per-rank chunk bytes.
+GIN_SDMA_HD inline bool scatterLLEligible(size_t chunkBytes, int llSlots,
+                                          size_t llMaxBytes) {
+  return llSlots != 0 && (chunkBytes % 8 == 0) && chunkBytes <= llMaxBytes &&
+         (chunkBytes / 8) <= (size_t)llSlots;
+}
+
+enum class ScatterTier { LL, LSA, Gin };
+
+// Tier chosen by GinScatterKernel: LL (tiny, exit barrier removed) below the LL
+// cap, else LSA below/at the SDMA threshold, else GIN/SDMA. Compared against the
+// per-rank chunk bytes. Shared by the kernel and the host unit tests.
+GIN_SDMA_HD inline ScatterTier scatterKernelTier(size_t chunkBytes,
+                                                 size_t sdmaThreshold,
+                                                 int llSlots,
+                                                 size_t llMaxBytes) {
+  if (chunkBytes <= sdmaThreshold) {
+    if (scatterLLEligible(chunkBytes, llSlots, llMaxBytes)) return ScatterTier::LL;
+    return ScatterTier::LSA;
+  }
+  return ScatterTier::Gin;
 }
 
 }  // namespace gin_sdma

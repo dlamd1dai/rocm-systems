@@ -13,6 +13,28 @@
 #include "rccl_vector_types.h"
 #endif
 
+// LL (low-latency, packed data+flag) tiny-message Scatter fast path. Scatter is
+// one-to-all with a DISTINCT per-rank chunk: the root writes each peer's chunk
+// (as 8-byte units) into that peer's epoch-tagged LL scratch (including its own,
+// so its slice arrives uniformly), and every rank polls its OWN scratch into
+// recvbuff. The recv's epoch tag replaces the EXIT barrier; a single ENTRY LSA
+// barrier is kept because -- like Broadcast/SendRecv, unlike AllGather -- only
+// the root writes, so the ring lacks mutual-recv backpressure and a fast root
+// could otherwise run >=2 epochs ahead of a laggard and deadlock the
+// double-buffered LL scratch. Each rank writes only its own recvbuff, so it is
+// immune to the initData recvbuff-memset race. On by default up to
+// SCATTER_LL_DEFAULT_MAX_BYTES; tune/disable via
+// NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES (0 = disable). Constants live in
+// gin_sdma_collective_policy.h so the kernel branch, the requirements sizing and
+// the host unit tests share one source. nSlots==0 => LL not configured => the
+// kernel uses the direct-LSA store.
+#if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+#define SC_HAVE_LL 1
+static size_t g_scLLMaxBytes = 0;  // resolved from env at requirements time
+static ncclLLA2AHandle g_scLLHandle = {};
+static ncclDevResourceRequirements g_scLLReq = {};
+#endif
+
 void ScatterGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *recvcount = (count/nranks) & -(16/eltSize);
   *sendcount = (*recvcount)*nranks;
@@ -58,6 +80,21 @@ testResult_t ScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequiremen
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
+      // LL scratch for the tiny-message fast path (single CTA => nBlocks=1), on
+      // by default up to SCATTER_LL_DEFAULT_MAX_BYTES, tunable via
+      // NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES (bytes; 0 = disable). Each receiver
+      // takes one chunk, so a receiver needs just cap/8 u64 slots (like
+      // Broadcast/SendRecv, not the nRanks*... AllGather form).
+      g_scLLMaxBytes = gin_sdma::resolveLLCap(
+          testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES"),
+          gin_sdma::kScatterLLDefaultMaxBytes, gin_sdma::kScatterLLMaxBytes);
+      if (g_scLLMaxBytes > 0) {
+        int llMaxElts = (int)(g_scLLMaxBytes / 8);
+        int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
+        ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_scLLHandle, &g_scLLReq);
+        g_scLLReq.next = reqs->resourceRequirementsList;
+        reqs->resourceRequirementsList = &g_scLLReq;
+      }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -119,8 +156,119 @@ __device__ void ScatterLocalCopy(T* dst, const T* src, size_t count, int tid, in
   }
 }
 
+#if defined(SC_HAVE_LL)
+// LL Scatter for tiny messages, single CTA. The root sends each peer r its
+// distinct chunk (as 8-byte units) into peer r's epoch-tagged LL scratch --
+// including its OWN chunk, so every rank (root included) uniformly polls its own
+// scratch into recvbuff. A single entry LSA barrier bounds the epoch skew (only
+// the root writes, so like Broadcast/SendRecv the ring lacks mutual-recv
+// backpressure; see file header note); the recv's epoch tag replaces the exit
+// barrier, and each rank writes only its own recvbuff, so it is immune to the
+// initData recvbuff-memset race. In-place uses the same per-rank recv slot as
+// the LSA path (recvoffset = dstBase + rank*chunk), and the root reconstructs
+// the shared base to read chunk r.
+__device__ void ScatterLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+                              size_t chunkU64, int root, struct ncclDevComm const& devComm, ncclTeam lsa,
+                              ncclLLA2AHandle llHandle) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int rank = devComm.rank, nRanks = devComm.nRanks;
+  const bool inPlace = (sendwin == recvwin);
+  const size_t chunkBytes = chunkU64 * 8;
+  // Shared source base on the root (bytes): OOP reads sendoffset + r*chunk;
+  // in-place reads its own recvbuff base (dstBase) + r*chunk, where
+  // dstBase = recvoffset - root*chunk (recvoffset is this root's own slot).
+  const size_t dstBase = inPlace ? (recvoffset - (size_t)rank * chunkBytes) : recvoffset;
+  const size_t srcBase = inPlace ? dstBase : sendoffset;
+
+  uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
+
+  // Entry barrier: bounds root-vs-laggard epoch skew (see file header note).
+  ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, /*block=*/0 };
+  lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+                                     /*maxElts=*/(int)chunkU64 };
+
+  // Root sends each peer its distinct chunk into that peer's scratch [0..chunkU64).
+  // Flatten the (peer, slot) fan-out across all threads with a PEER-MAJOR stride
+  // (r = w % nRanks) so consecutive threads target DISTINCT peers -- i.e. all
+  // xGMI egress links fire concurrently instead of one peer at a time. The old
+  // "for r { for j=tid }" nesting left only chunkU64 threads active and walked
+  // the peers serially, so the root's ~nRanks back-to-back remote stores were
+  // the dominant term in scatter LL latency; this turns them into one concurrent
+  // burst. Semantically identical (same slot, same epoch tag per (peer,slot)).
+  if (rank == root) {
+    const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, srcBase);
+    const int totalSends = nRanks * (int)chunkU64;
+    for (int w = tid; w < totalSends; w += nthreads) {
+      const int r = w % nRanks;        // peer-major: distinct peers fire first
+      const int j = w / nRanks;        // slot index within this peer's chunk
+      ll.send(r, j, src[(size_t)r * chunkU64 + j]);
+    }
+  }
+  // Every rank gathers its own chunk out of its own scratch.
+  for (size_t j = tid; j < chunkU64; j += nthreads) {
+    dst[j] = ll.recv<uint64_t>((int)j);
+  }
+  ll.endEpoch(ncclCoopCta());
+}
+#endif
+
+// Root fan-out for the LSA tier, A/B-selectable via the lsaInterleave flag
+// (env NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE, default on). The root alone stores
+// all N per-rank chunks over xGMI, so its layout decides how well the root's
+// egress links are used:
+//   interleave==0 (sequential, historical): every CTA/thread walks the peers in
+//     order (peer loop outer, chunk stride inner over the global tid), so all
+//     SMs write ONE peer -- i.e. one xGMI link -- at a time, then the next. Root
+//     egress is single-link-limited.
+//   interleave!=0 (peer-interleaved): map each CTA to a peer slot
+//     (blockIdx % nSlots, nSlots = min(gridDim, nRanks)) so all peers' links are
+//     driven concurrently. Extra CTAs beyond nRanks become sub-blocks that split
+//     a peer's chunk for more threads/link; when there are fewer CTAs than peers
+//     each slot rotates over several peers. Every element is written exactly
+//     once for any gridDim/nRanks combination.
+template <typename T>
+__device__ void ScatterLsaFanout(ncclWindow_t sendwin, size_t sendoffset,
+                                 ncclWindow_t recvwin, size_t recvoffset,
+                                 size_t count, size_t chunkBytes, int root,
+                                 int nRanks, bool inPlace, size_t dstBase,
+                                 bool interleave) {
+  const T* src = (const T*)ncclGetLocalPointer(sendwin, sendoffset);
+  if (!interleave) {
+    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const int nthreads = blockDim.x * gridDim.x;
+    for (int r = 0; r < nRanks; r++) {
+      if (inPlace && r == root) continue;  // own chunk already in place
+      const size_t dstOff = inPlace ? (dstBase + (size_t)r * chunkBytes) : recvoffset;
+      T* dst = (T*)ncclGetLsaPointer(recvwin, dstOff, r);
+      const T* s = src + (size_t)r * count;
+      for (size_t i = tid; i < count; i += nthreads) dst[i] = s[i];
+    }
+    return;
+  }
+  const int grid = (int)gridDim.x;
+  const int blk = (int)blockIdx.x;
+  const int nSlots = (grid < nRanks) ? grid : nRanks;   // active peer-slots
+  const int peerSlot = blk % nSlots;
+  const int subBlk = blk / nSlots;                       // sub-block within a slot
+  const int nSub = (grid - peerSlot - 1) / nSlots + 1;   // sub-blocks for THIS slot
+  const int localTid = subBlk * (int)blockDim.x + (int)threadIdx.x;
+  const int localNthreads = nSub * (int)blockDim.x;
+  for (int r = peerSlot; r < nRanks; r += nSlots) {
+    if (inPlace && r == root) continue;
+    const size_t dstOff = inPlace ? (dstBase + (size_t)r * chunkBytes) : recvoffset;
+    T* dst = (T*)ncclGetLsaPointer(recvwin, dstOff, r);
+    const T* s = src + (size_t)r * count;
+    for (size_t i = localTid; i < count; i += localNthreads) dst[i] = s[i];
+  }
+}
+
 // Single-node hybrid Scatter (-D 3): the root distributes a distinct per-rank
 // chunk r (elements [r*count .. (r+1)*count) of its send buffer) to rank r.
+//   chunkBytes <= LL cap (opt-out): LL packed data+flag, single CTA (tiny, exit
+//                                   barrier removed vs LSA).
 //   chunkBytes <= sdmaThreshold: root LSA-stores each peer's chunk (all CTAs).
 //   chunkBytes >  sdmaThreshold: root issues one GIN put per non-self peer.
 // Completion is receiver-side: each non-root receives exactly one put and waits
@@ -133,7 +281,7 @@ __device__ void ScatterLocalCopy(T* dst, const T* src, size_t count, int tid, in
 // passes recvwin as the send window when in-place); the root reconstructs the
 // shared base offset from its own recvoffset (= base + root*chunk).
 template <typename T>
-__global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+__global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int lsaInterleave) {
   const size_t chunkBytes = count * sizeof(T);
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -150,17 +298,28 @@ __global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWi
 
   if (chunkBytes <= sdmaThreshold) {
     ncclTeam lsa = ncclTeamLsa(devComm);
+
+#if defined(SC_HAVE_LL)
+    // Tiny messages: LL packed data+flag path (single CTA). Keeps one entry
+    // barrier (only the root writes, so the fan-out is not mutually
+    // back-pressured) and drops the exit barrier; memset-race-immune (cross-rank
+    // traffic stays in the LL scratch). Used when LL is configured (nSlots>0),
+    // the per-rank chunk is 8-byte aligned, and it fits the pre-sized slots.
+    if (gin_sdma::scatterLLEligible(chunkBytes, llHandle.nSlots, gin_sdma::kScatterLLMaxBytes)) {
+      if (blockIdx.x != 0) return;  // single CTA
+      ScatterLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkBytes / 8, root, devComm, lsa, llHandle);
+      return;
+    }
+#endif
+
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
     if (rank == root) {
-      const T* src = (const T*)ncclGetLocalPointer(sendwin, sendoffset);
-      for (int r = 0; r < nRanks; r++) {
-        if (inPlace && r == root) continue;  // own chunk already in place
-        const size_t dstOff = inPlace ? (dstBase + (size_t)r * chunkBytes) : recvoffset;
-        T* dst = (T*)ncclGetLsaPointer(recvwin, dstOff, r);
-        const T* s = src + (size_t)r * count;
-        for (size_t i = tid; i < count; i += nthreads) dst[i] = s[i];
-      }
+      // Root fan-out: peer-interleaved (all xGMI links concurrent) or the
+      // historical sequential loop (one link at a time), A/B via lsaInterleave.
+      ScatterLsaFanout<T>(sendwin, sendoffset, recvwin, recvoffset, count,
+                          chunkBytes, root, nRanks, inPlace, dstBase,
+                          lsaInterleave != 0);
     }
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
     return;
@@ -181,7 +340,16 @@ __global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWi
       T* ldst = (T*)ncclGetLocalPointer(recvwin, recvoffset);
       ScatterLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
     }
-    // Flat scatter: one put per non-self peer (issued once, by the thread tid=r).
+    // Flat scatter: one put per non-self peer, each issued by a distinct thread
+    // (tid=r). Unlike the LSA tier (whose sequential per-peer store loop needed
+    // explicit peer-interleaving to light up all xGMI links), this GIN fan-out is
+    // *already* peer-concurrent by construction: the Anvil-SDMA backend routes
+    // each peer's put to its own per-peer queue (handles[r*numChannels + ch]), so
+    // the N-1 copies run concurrently on independent SDMA engines. Adding SDMA
+    // channels (NUM_CHANNELS>1) is a second, per-peer parallelism axis that a
+    // 1-chunk-per-peer scatter never exercises -- measured perf-neutral (and
+    // deadlock-free) at NC=1/2/4 on 8x MI355X (2026-07-28). Hence no interleave
+    // knob here; the fan-out is optimal as-is.
     // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count overflow
     // on >1 GiB per-rank chunks; the signal rides the final segment.
     for (int r = tid; r < nRanks; r += nthreads) {
@@ -236,7 +404,14 @@ testResult_t ScatterRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, s
         // Override with NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t scThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER", gin_sdma::kScatterSdmaThresholdDefault);
-        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, scThr));
+        // LSA-tier root fan-out layout: peer-interleaved (all xGMI links
+        // concurrent) by default; NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE=0 forces
+        // the historical sequential loop (one link at a time) for A/B.
+        static const int scLsaInterleave = []() {
+          size_t v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE");
+          return (v == TEST_SDMA_THRESHOLD_UNSET) ? 1 : (v != 0 ? 1 : 0);
+        }();
+        TESTCHECK(testLaunchDeviceKernelThresholdLLFlag(SPECIALIZE_KERNEL(GinScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, scThr, g_scLLHandle, scLsaInterleave));
         return testSuccess;
       }
 #endif

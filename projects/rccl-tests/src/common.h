@@ -512,6 +512,20 @@ testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t 
   return testSuccess;
 }
 
+// Variant that forwards both an LL handle and a trailing int flag as the last
+// two kernel arguments. Used by the Scatter GIN kernel to toggle its LSA-tier
+// root fan-out layout (peer-interleaved vs sequential) at runtime from an env.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int flag) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle, flag);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -536,6 +550,10 @@ testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t se
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int flag) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
