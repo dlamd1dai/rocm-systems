@@ -6,6 +6,7 @@
 # Collective is selected with the COLL env var (default sendrecv):
 #   COLL=sendrecv  bash gin-sdma-ll-verify.bash [NP]   # ring send/recv LL
 #   COLL=scatter   bash gin-sdma-ll-verify.bash [NP]   # root fan-out LL
+#   COLL=gather    bash gin-sdma-ll-verify.bash [NP]   # all-to-one fan-in LL
 #
 # Runs, in order:
 #   1. BUILD  <coll>_perf + gin_sdma_policy_test (incremental, no GPU)
@@ -67,8 +68,23 @@ case "$COLL" in
     BIG_MIN_DEFAULT="4G"; BIG_MAX_DEFAULT="16G"   # chunk=total/NP; 8G=>1 GiB chunk, 16G=>2 GiB
     BIG_EXTRA="-r 0 -z 0"
     ;;
+  gather)
+    # All-to-one fan-in LL (inverse of Scatter): every rank packs its chunk into
+    # the ROOT's LL scratch and the root polls all N out. LL cap is on the
+    # per-rank chunk (= total/NP), same scaling as Scatter, and it needs a root
+    # (-r 0). BIG forces the GIN tier (default is LSA-always) across the 1 GiB
+    # per-put edge; the per-put is the per-rank chunk, so total must reach NP GiB.
+    BIN="gather_perf"
+    UT_FILTER='*Gather*:*Move*'
+    LL_ENV="NCCL_GIN_ANVIL_GATHER_LL_MAX_BYTES"
+    THR_ENV="NCCL_GIN_ANVIL_SDMA_THRESHOLD_GATHER"
+    AB_MIN_DEFAULT="64"; AB_MAX_DEFAULT="32K"     # LL cap 2 KiB/chunk => total <= NP*2 KiB
+    AB_EXTRA="-r 0 -z 0"
+    BIG_MIN_DEFAULT="4G"; BIG_MAX_DEFAULT="16G"   # chunk=total/NP; 8G=>1 GiB chunk, 16G=>2 GiB
+    BIG_EXTRA="-r 0 -z 0"
+    ;;
   *)
-    echo "unsupported COLL='$COLL' (want: sendrecv|scatter)" >&2
+    echo "unsupported COLL='$COLL' (want: sendrecv|scatter|gather)" >&2
     exit 2
     ;;
 esac
