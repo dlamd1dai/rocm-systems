@@ -7,6 +7,34 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+#include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
+#include "rccl_vector_types.h"
+#endif
+
+// LL (low-latency, packed data+flag) tiny-message Gather fast path. Gather is the
+// all-to-one INVERSE of Scatter: every rank packs its own chunk (as 8-byte units)
+// into the ROOT's epoch-tagged LL scratch at that rank's slot-region, and the
+// root alone polls all N slot-regions and unpacks them into recvbuff[r*chunk].
+// Because only the root reads (asymmetric fan-in, like Scatter/Broadcast and
+// unlike AllGather), the writers are not mutually back-pressured by reads, so a
+// single ENTRY LSA barrier is kept to bound writer-vs-root epoch skew (a fast
+// writer must not lap the root and clobber the double-buffered scratch). The
+// recv's epoch tag replaces the EXIT barrier, and only the root writes its own
+// recvbuff, so it is immune to the initData recvbuff-memset race. The root holds
+// nRanks chunks, so the scratch is sized nRanks*(cap/8) u64 slots (the AllGather
+// form, not Scatter's single-message form). On by default up to
+// kGatherLLDefaultMaxBytes; tune/disable via NCCL_GIN_ANVIL_GATHER_LL_MAX_BYTES
+// (0 = disable). Constants live in gin_sdma_collective_policy.h so the kernel
+// branch, requirements sizing and host unit tests share one source. nSlots==0 =>
+// LL not configured => the kernel uses the direct-LSA store.
+#if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+#define GA_HAVE_LL 1
+static size_t g_gaLLMaxBytes = 0;  // resolved from env at requirements time
+static ncclLLA2AHandle g_gaLLHandle = {};
+static ncclDevResourceRequirements g_gaLLReq = {};
+#endif
 
 void GatherGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *sendcount = (count/nranks) & -(16/eltSize);
@@ -44,6 +72,220 @@ void GatherGetBw(size_t count, int typesize, double sec, double* algBw, double* 
   *busBw = baseBw * factor;
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t GatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
+  if (!reqs || !commProperties) return testInternalError;
+  switch(deviceImpl) {
+    case 3: { // GinGatherKernel: each rank LSA stores / GIN puts its chunk to root
+      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+        fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
+        return testInternalError;
+      }
+      gin_sdma::DevReqs dr = gin_sdma::moveDevReqs(deviceCtaCount);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+      // LL scratch for the tiny-message fan-in fast path (single CTA => nBlocks=1),
+      // on by default up to kGatherLLDefaultMaxBytes, tunable via
+      // NCCL_GIN_ANVIL_GATHER_LL_MAX_BYTES (bytes; 0 = disable). All-to-one: the
+      // ROOT holds nRanks chunks, so a receiver needs nRanks*(cap/8) u64 slots
+      // (the AllGather form, not the single-message Scatter/Broadcast form).
+      g_gaLLMaxBytes = gin_sdma::resolveLLCap(
+          testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_GATHER_LL_MAX_BYTES"),
+          gin_sdma::kGatherLLDefaultMaxBytes, gin_sdma::kGatherLLMaxBytes);
+      if (g_gaLLMaxBytes > 0) {
+        int llMaxElts = commProperties->nRanks * (int)(g_gaLLMaxBytes / 8);
+        int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
+        ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_gaLLHandle, &g_gaLLReq);
+        g_gaLLReq.next = reqs->resourceRequirementsList;
+        reqs->resourceRequirementsList = &g_gaLLReq;
+      }
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
+      reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+#else
+      reqs->ginForceEnable = true;
+#endif
+      return testSuccess;
+    }
+    default:
+      return testNotImplemented;
+  }
+}
+#elif defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+bool GatherGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs) {
+  if (!reqs) return false;
+  memset(reqs, 0, sizeof(*reqs));
+  switch(deviceImpl) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+    case 3: {
+      gin_sdma::DevReqs dr = gin_sdma::moveDevReqs(deviceCtaCount);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+      return true;
+    }
+#endif
+    default:
+      return false;
+  }
+}
+#endif
+
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+__device__ size_t GatherGetSdmaThreshold(struct ncclDevComm const& devComm) {
+  using nccl::utility::loadConst;
+  if (devComm.ginConnectionCount == 0 || devComm.ginHandles[0] == nullptr) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  ncclGinAnvilSdmaGPUContext* rsCtx =
+      (ncclGinAnvilSdmaGPUContext*)devComm.ginHandles[0];
+  if (rsCtx == nullptr ||
+      loadConst(&rsCtx->layoutMagic) != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC) {
+    return NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  }
+  return loadConst(&rsCtx->sdmaThreshold);
+}
+
+template <typename T>
+__device__ void GatherLocalCopy(T* dst, const T* src, size_t count, int tid, int nthreads) {
+  const size_t bytes = count * sizeof(T);
+  const uintptr_t da = (uintptr_t)dst, sa = (uintptr_t)src;
+  if ((bytes % sizeof(uint4)) == 0 && (da % sizeof(uint4)) == 0 && (sa % sizeof(uint4)) == 0) {
+    uint4* d4 = (uint4*)dst; const uint4* s4 = (const uint4*)src;
+    const size_t n4 = bytes / sizeof(uint4);
+    for (size_t i = tid; i < n4; i += nthreads) d4[i] = s4[i];
+  } else {
+    for (size_t i = tid; i < count; i += nthreads) dst[i] = src[i];
+  }
+}
+
+#if defined(GA_HAVE_LL)
+// LL Gather for tiny messages, single CTA. All-to-one fan-in (inverse of Scatter
+// LL): every rank packs its own chunk (as 8-byte units) into the ROOT's
+// epoch-tagged LL scratch at its slot-region [rank*chunkU64 ..], and the root
+// alone polls all N slot-regions and unpacks them into recvbuff[r*chunk]. A
+// single entry LSA barrier bounds writer-vs-root epoch skew (only the root reads,
+// so like Scatter/Broadcast the fan-in is not mutually back-pressured; see file
+// header note); the recv's epoch tag replaces the exit barrier, and only the
+// root writes its own recvbuff, so it is immune to the initData recvbuff-memset
+// race. startColl folds rank*chunk into sendoffset for in-place (recvInplaceOffset
+// == 0), so the send source is (sendwin, sendoffset) for both in-place and OOP,
+// exactly as GinGatherKernel's direct path.
+__device__ void GatherLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+                             size_t chunkU64, int root, struct ncclDevComm const& devComm, ncclTeam lsa,
+                             ncclLLA2AHandle llHandle) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int rank = devComm.rank, nRanks = devComm.nRanks;
+
+  // Entry barrier: bounds writer-vs-root epoch skew (see file header note).
+  ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, /*block=*/0 };
+  lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  // The root holds nRanks chunks, so the session addresses nRanks*chunkU64 elts
+  // (AllGather sizing); a writer's chunk lands at the root's slot [rank*chunkU64 ..].
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+                                     /*maxElts=*/(int)((size_t)nRanks * chunkU64) };
+
+  // Every rank sends its own chunk into the root's scratch at its slot-region.
+  const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
+  const int myBase = rank * (int)chunkU64;
+  for (int j = tid; j < (int)chunkU64; j += nthreads) {
+    ll.send(root, myBase + j, src[j]);
+  }
+
+  // Only the root gathers all N chunks out of its own scratch into recvbuff.
+  if (rank == root) {
+    uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
+    const int total = nRanks * (int)chunkU64;
+    for (int e = tid; e < total; e += nthreads) {
+      dst[e] = ll.recv<uint64_t>(e);
+    }
+  }
+  ll.endEpoch(ncclCoopCta());
+}
+#endif
+
+// Single-node hybrid Gather (-D 3): every rank sends its per-rank chunk to the
+// root's recvbuff slot [rank*count]. The root's recv slot offset is uniform
+// across ranks (recvInplaceOffset == 0), so a rank addresses the root at its own
+// recvoffset + rank*chunk with no reconstruction; in-place works unchanged.
+//   chunkBytes <= LL cap (opt-out): LL packed data+flag fan-in, single CTA (tiny,
+//                                   exit barrier removed vs LSA).
+//   chunkBytes <= sdmaThreshold: each rank LSA-stores its chunk into root's slot.
+//   chunkBytes >  sdmaThreshold: each non-root issues one GIN put to root.
+// Completion is receiver-side and inverted vs Scatter: the root receives N-1
+// puts and waits base+(N-1); non-roots receive none and only flush. The root
+// fills its own slice with a local copy (no-op in-place).
+template <typename T>
+__global__ void GinGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+  const size_t chunkBytes = count * sizeof(T);
+  const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
+                                   ? sdmaThresholdOverride
+                                   : GatherGetSdmaThreshold(devComm);
+  const int rank = devComm.rank, nRanks = devComm.nRanks;
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+  const size_t myDstOff = recvoffset + (size_t)rank * chunkBytes;
+
+  if (chunkBytes <= sdmaThreshold) {
+    ncclTeam lsa = ncclTeamLsa(devComm);
+
+#if defined(GA_HAVE_LL)
+    // Tiny messages: LL packed data+flag fan-in (single CTA). Keeps one entry
+    // barrier (only the root reads, so the fan-in is not mutually back-pressured)
+    // and drops the exit barrier; memset-race-immune (cross-rank traffic stays in
+    // the LL scratch). Used when LL is configured (nSlots>0), the per-rank chunk
+    // is 8-byte aligned, and the root's nRanks*chunk fits the pre-sized slots.
+    if (gin_sdma::gatherLLEligible(chunkBytes, llHandle.nSlots, nRanks, gin_sdma::kGatherLLMaxBytes)) {
+      if (blockIdx.x != 0) return;  // single CTA
+      GatherLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkBytes / 8, root, devComm, lsa, llHandle);
+      return;
+    }
+#endif
+
+    ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+    const T* src = (const T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* dst = (T*)ncclGetLsaPointer(recvwin, myDstOff, root);  // root's slot for me
+    for (size_t i = tid; i < count; i += nthreads) dst[i] = src[i];
+
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    return;
+  }
+
+  const unsigned int signalIndex = 0;
+  ncclGin gin { devComm, /*context=*/0 };
+  const uint64_t signalValue = gin.readSignal(signalIndex);
+
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+
+  if (rank == root) {
+    // Root fills its own slice locally (no-op in-place: local src == local dst).
+    T* lsrc = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* ldst = (T*)ncclGetLocalPointer(recvwin, myDstOff);
+    if (lsrc != ldst) {
+      GatherLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
+    }
+    // Root receives exactly one put from each non-root.
+    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)(nRanks - 1));
+  } else {
+    // One put of my chunk into root's slot [rank*chunk] (issued once).
+    // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count
+    // overflow on >1 GiB chunks; the signal rides the final segment.
+    if (tid == 0) {
+      ginPutChunked(gin, ncclTeamWorld(devComm), root,
+          recvwin, myDstOff,
+          sendwin, sendoffset,
+          chunkBytes, ncclGin_SignalInc{signalIndex});
+    }
+    gin.flush(ncclCoopCta());
+  }
+}
+#endif
+
 testResult_t GatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
   if (deviceImpl == 0) {
     int nRanks;
@@ -71,7 +313,22 @@ testResult_t GatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, si
     return testNcclError;
 #endif
   } else {
-    return testNotImplemented;
+    switch(deviceImpl) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+      case 3: {
+        // Gather-specific LSA<->GIN threshold (compared against the per-rank
+        // chunk). Default 1 GiB (LSA-always): every rank writes its own slice so
+        // parallel LSA beats GIN/SDMA at all measured sizes to 512 MiB (8x
+        // MI355X, 2026-07-27; 432 vs 419 GB/s). Set
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_GATHER=0 to force the GIN tier.
+        static const size_t gaThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_GATHER", gin_sdma::kGatherSdmaThresholdDefault);
+        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, gaThr, g_gaLLHandle));
+        return testSuccess;
+      }
+#endif
+      default:
+        return testNotImplemented;
+    }
   }
   return testSuccess;
 }
@@ -125,5 +382,8 @@ testResult_t GatherRunTest(struct threadArgs* args, int root, ncclDataType_t typ
 
 struct testEngine ncclTestEngine = {
   .getBuffSize = GatherGetBuffSize,
-  .runTest = GatherRunTest
+  .runTest = GatherRunTest,
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+  .getDevCommRequirements = GatherGetDevCommRequirements
+#endif
 };

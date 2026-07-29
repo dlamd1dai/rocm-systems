@@ -194,3 +194,17 @@ add_rccl_test(reduce)
 add_rccl_test(scatter)
 add_rccl_test(sendrecv)
 add_rccl_test(all_reduce_bias)
+
+# Phase-1 GIN-SDMA movement collectives (-D 3): scatter/gather/sendrecv _perf
+# need the same -fgpu-rdc device-API link against librccl's GIN device runtime
+# as all_gather/alltoall/broadcast above. Placed after the targets are created.
+if (ENABLE_ROCSHMEM AND ROCSHMEM_LIBRARY)
+    find_library(_DRM drm HINTS ${ROCM_PATH}/lib/rocm_sysdeps/lib)
+    find_library(_DRM_AMDGPU drm_amdgpu HINTS ${ROCM_PATH}/lib/rocm_sysdeps/lib)
+    foreach(_gin_move_target scatter_perf gather_perf sendrecv_perf)
+        target_compile_definitions(${_gin_move_target} PRIVATE ENABLE_ROCSHMEM ENABLE_ROCSHMEM_GIN)
+        target_compile_options(${_gin_move_target} PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
+        target_link_libraries(${_gin_move_target} PRIVATE ${ROCSHMEM_LIBRARY} ibverbs hsa-runtime64 hsakmt numa ${_DRM} ${_DRM_AMDGPU})
+        target_link_options(${_gin_move_target} PRIVATE -fgpu-rdc --hip-link ${_rocshmem_offload_arch_flags} -rdynamic)
+    endforeach()
+endif()

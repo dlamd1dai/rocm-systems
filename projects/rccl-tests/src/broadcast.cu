@@ -225,6 +225,11 @@ __device__ void BroadcastLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWin
                                      /*maxElts=*/(int)chunkU64 };
 
   // Root broadcasts its message into every peer's scratch slot [0..chunkU64).
+  // NB: ll.bcast() already fans out to all N peers per call with an 8-way
+  // unrolled, register-reusing store loop, so it is more efficient than an
+  // explicit per-(peer,slot) send flatten across the LL range (measured: the
+  // flatten helps only <=512 B but regresses 1-2 KiB by 20-40%). Unlike Scatter
+  // (which had a genuinely serial explicit-send loop), keep bcast() here.
   if (devComm.rank == root) {
     const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
     for (size_t j = tid; j < chunkU64; j += nthreads) {
@@ -305,10 +310,12 @@ __global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset
       BroadcastLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
     }
 
-    // Flat fan-out: one put per non-self peer; skip self.
+    // Flat fan-out: one put per non-self peer; skip self. Chunked to <=1 GiB
+    // segments to avoid the 30-bit SDMA copy-count overflow on >1 GiB messages;
+    // the signal rides the final segment.
     for (int r = tid; r < devComm.nRanks; r += nthreads) {
       if (r == root) continue;
-      gin.put(ncclTeamWorld(devComm), r,
+      ginPutChunked(gin, ncclTeamWorld(devComm), r,
           recvwin, recvoffset,
           sendwin, sendoffset,
           msgBytes, ncclGin_SignalInc{signalIndex});
@@ -393,7 +400,8 @@ __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t 
       if (r == root) continue;
       const gin_sdma::Chunk rChunk = gin_sdma::sagChunk(count, N, r);
       const size_t rOff = rChunk.eltOffset * sizeof(T);
-      gin.put(ncclTeamWorld(devComm), r,
+      // Chunked to <=1 GiB segments (30-bit SDMA copy-count guard).
+      ginPutChunked(gin, ncclTeamWorld(devComm), r,
           recvwin, recvoffset + rOff,
           sendwin, sendoffset + rOff,
           rChunk.count * sizeof(T), ncclGin_SignalInc{sigScatter});
@@ -415,7 +423,8 @@ __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t 
   const size_t myWinOff = (rank == root) ? (sendoffset + myByteOff) : (recvoffset + myByteOff);
   for (int r = tid; r < N; r += nthreads) {
     if (r == rank) continue;
-    gin.put(ncclTeamWorld(devComm), r,
+    // Chunked to <=1 GiB segments (30-bit SDMA copy-count guard).
+    ginPutChunked(gin, ncclTeamWorld(devComm), r,
         recvwin, recvoffset + myByteOff,
         myWin, myWinOff,
         myBytes, ncclGin_SignalInc{sigGather});

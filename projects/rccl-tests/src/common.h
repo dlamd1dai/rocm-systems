@@ -441,6 +441,37 @@ static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDe
 }
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+// Overflow-safe gin.put for the Anvil-SDMA backend. The SDMA linear-copy count
+// field is 30 bits and 1-based (count = bytes-1), so the largest single packet
+// is exactly 2^30 = 1 GiB; a put of >1 GiB silently truncates and corrupts data
+// (a 2 GiB transfer copies only 1 GiB). Split the transfer into
+// <=gin_sdma::kGinPutMaxBytes (1 GiB, the HW max) segments and carry the caller's
+// remote action (e.g. SignalInc) ONLY on the final segment: the SDMA queue is
+// in-order, so a single signal still correctly means "the whole message has
+// landed" and per-message signal accounting (waitSignal counts) is unchanged. A
+// <=1 GiB message is a single put with no extra overhead. Threads still each own
+// a disjoint (peer, offset) tuple, so the inner segmentation is race-free.
+template <typename RemoteAction>
+__device__ __forceinline__ void ginPutChunked(
+    ncclGin& gin, ncclTeam team, int peer,
+    ncclWindow_t dstWin, size_t dstOff,
+    ncclWindow_t srcWin, size_t srcOff,
+    size_t bytes, RemoteAction finalAction) {
+  const size_t kMax = gin_sdma::kGinPutMaxBytes;
+  size_t off = 0;
+  do {
+    const size_t rem = bytes - off;
+    const size_t seg = rem > kMax ? kMax : rem;
+    if (off + seg >= bytes) {
+      // Final (or only) segment carries the signal / remote action.
+      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg, finalAction);
+    } else {
+      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg);
+    }
+    off += seg;
+  } while (off < bytes);
+}
+
 template <typename F>
 testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   if (kernel == nullptr) return testNotImplemented;
@@ -481,6 +512,20 @@ testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t 
   return testSuccess;
 }
 
+// Variant that forwards both an LL handle and a trailing int flag as the last
+// two kernel arguments. Used by the Scatter GIN kernel to toggle its LSA-tier
+// root fan-out layout (peer-interleaved vs sequential) at runtime from an env.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int flag) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle, flag);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -505,6 +550,10 @@ testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t se
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int flag) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr

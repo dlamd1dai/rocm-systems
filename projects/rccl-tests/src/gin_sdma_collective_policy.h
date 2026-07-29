@@ -66,6 +66,51 @@ static constexpr size_t kAllToAllLLMaxBytes            = 65536;         // 64 Ki
 // AllToAll LL is OFF by default (unset env -> 0 cap).
 static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
 
+// SendRecv LL fast path: compile ceiling + default runtime cutover. Point-to-
+// point carries a single message per receiver (like Broadcast, not AllGather),
+// so a receiver needs just cap/8 u64 slots. On by default (2 KiB) since the ring
+// is barrier-bound at tiny sizes and LL removes the exit barrier.
+static constexpr size_t kSendRecvLLMaxBytes            = 65536;         // 64 KiB
+static constexpr size_t kSendRecvLLDefaultMaxBytes     = 2048;          // 2 KiB
+
+// Scatter LL fast path: compile ceiling + default runtime cutover. Scatter is
+// one-to-all with a DISTINCT per-rank chunk, but each receiver still takes a
+// single incoming message (its own chunk from the root), so a receiver needs
+// just chunk/8 u64 slots -- the same single-message sizing as Broadcast/SendRecv
+// (not the nRanks*... AllGather/AllToAll form). The LL cap is compared against
+// the per-rank chunk bytes (matching the Scatter LSA<->GIN threshold). On by
+// default (2 KiB) since tiny scatters are barrier-bound and LL drops the exit
+// barrier; tune/disable via NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES (0 = disable).
+static constexpr size_t kScatterLLMaxBytes             = 65536;         // 64 KiB/chunk
+static constexpr size_t kScatterLLDefaultMaxBytes      = 2048;          // 2 KiB/chunk
+
+// Gather LL fast path: compile ceiling + default runtime cutover. Gather is the
+// all-to-one inverse of Scatter: every rank packs its chunk into the ROOT's LL
+// scratch and the root alone polls all N chunks out. So -- unlike Scatter's
+// single-message sizing -- the root holds nRanks chunks and the slot demand is
+// nRanks*(chunk/8) (the AllGather form). The cap is compared against the per-rank
+// chunk bytes (matching the Gather LSA<->GIN threshold). Provisionally on at
+// 2 KiB pending the LL-on/off A/B (unlike Scatter, Gather concentrates all
+// unpacking on the root, so the win is expected to be narrower); tune/disable via
+// NCCL_GIN_ANVIL_GATHER_LL_MAX_BYTES (0 = disable).
+static constexpr size_t kGatherLLMaxBytes              = 65536;         // 64 KiB/chunk
+static constexpr size_t kGatherLLDefaultMaxBytes       = 2048;          // 2 KiB/chunk
+
+// Max bytes per single gin.put() on the Anvil-SDMA backend. The SDMA linear-copy
+// descriptor count field is 30 bits and 1-based (HW encodes count = bytes - 1,
+// see rocr-runtime amd_blit_sdma.cpp / sdma_registers.h), so the largest single
+// packet is (2^30 - 1) + 1 = 2^30 = exactly 1 GiB. A put of >1 GiB silently
+// truncates: a 2 GiB put encodes count = (2^31-1) & 0x3FFFFFFF = 2^30-1 and the
+// HW copies only 1 GiB, corrupting the transfer. Every GIN-tier put must be
+// split into segments of at most this size (see common.h::ginPutChunked).
+//
+// Set to exactly 1 GiB: this is the hardware maximum, so the segmentation clamp
+// (seg <= kGinPutMaxBytes) guarantees count = seg-1 <= 2^30-1 = 0x3FFFFFFF, which
+// fills the 30-bit field exactly with no truncation. Zero margin by design; do
+// NOT raise above 2^30. 1 GiB is a multiple of 32 B, satisfying the copy
+// descriptor's 32 B length alignment.
+static constexpr size_t kGinPutMaxBytes                = 1024ull * 1024 * 1024;  // 1 GiB (2^30, HW max)
+
 // ---------------------------- env / threshold ----------------------------
 
 // Parse a size string ("123", "4K", "2M", "1G"; decimal only, optional single
@@ -249,6 +294,130 @@ GIN_SDMA_HD inline DevReqs a2aDevReqs(int deviceImpl, int deviceCtaCount) {
       r.supported = false;
       return r;
   }
+}
+
+// ---------------- Scatter / Gather / SendRecv (pure movement) ----------------
+//
+// Phase-1 single-phase movement collectives. They share one tier predicate and
+// one devComm-requirement shape: a size-hybrid LSA(small) / GIN-SDMA(large) split
+// at a per-collective LSA<->GIN threshold (default 256 KiB, retuned by
+// measurement per the design plan), and barrier = lsaBarrier = ginSignal =
+// deviceCtaCount with needsGin. No scratch. SendRecv additionally has an
+// opt-out LL tiny-message tier (below); Scatter/Gather stay LSA/GIN for now.
+
+// Compared against the transfer bytes (Scatter/Gather: per-rank chunk; SendRecv:
+// full message). Tuned on 8x MI355X (gfx950, NCCL_GIN_TYPE=6, -V 32, 2026-07-27;
+// LSA-forced vs GIN-forced sweeps, gin-sdma-phase1-tune.bash):
+//
+//   * Scatter LSA is root-egress-bound (only the root SM-stores all N-1 peer
+//     chunks, ~64 GB/s ceiling), so GIN/SDMA wins decisively once the per-rank
+//     chunk is large: crossover at a 256 KiB chunk (2 MiB total), and by 512 MiB
+//     GIN is 390 vs 64 GB/s. Default 128 KiB puts the cutover just below the
+//     measured crossover (<=128 KiB chunk -> LSA, >=256 KiB -> GIN).
+//   * Gather and SendRecv distribute the writes across all ranks (every rank
+//     stores its own slice), so direct LSA beats GIN/SDMA at *every* measured
+//     size up to 512 MiB (Gather 432 vs 419, SendRecv 62.4 vs 61.1 GB/s at
+//     512 MiB). Their default is set high so LSA is used across all practical
+//     sizes; the GIN tier remains available as an env-tunable escape hatch
+//     (NCCL_GIN_ANVIL_SDMA_THRESHOLD_{GATHER,SENDRECV}=0 forces it).
+static constexpr size_t kScatterSdmaThresholdDefault  = 131072;      // 128 KiB/rank chunk
+static constexpr size_t kGatherSdmaThresholdDefault   = 1073741824;  // 1 GiB: LSA-always
+static constexpr size_t kSendRecvSdmaThresholdDefault = 1073741824;  // 1 GiB: LSA-always
+
+enum class MoveTier { LSA, Gin };
+
+// Tier chosen by the single-phase movement kernels: LSA below/at the threshold,
+// GIN/SDMA above it.
+GIN_SDMA_HD inline MoveTier moveKernelTier(size_t bytes, size_t sdmaThreshold) {
+  return (bytes <= sdmaThreshold) ? MoveTier::LSA : MoveTier::Gin;
+}
+
+// devComm requirements for the -D 3 movement kernels (scatter/gather/sendrecv):
+// one barrier + one lsaBarrier + one signal per CTA, GIN required.
+GIN_SDMA_HD inline DevReqs moveDevReqs(int deviceCtaCount) {
+  DevReqs r{deviceCtaCount, deviceCtaCount, deviceCtaCount, true, true};
+  return r;
+}
+
+// SendRecv LL eligibility (inside the msgBytes<=sdmaThreshold branch): LL
+// configured (nSlots>0), 8-byte aligned, within the compile ceiling, and it
+// fits the pre-sized slot count. Single incoming message per receiver, so the
+// slot demand is msgBytes/8 (mirrors bcastLLEligible, not the nRanks*... forms).
+GIN_SDMA_HD inline bool sendRecvLLEligible(size_t msgBytes, int llSlots,
+                                           size_t llMaxBytes) {
+  return llSlots != 0 && (msgBytes % 8 == 0) && msgBytes <= llMaxBytes &&
+         (msgBytes / 8) <= (size_t)llSlots;
+}
+
+enum class SendRecvTier { LL, LSA, Gin };
+
+// Tier chosen by GinSendRecvKernel: LL (tiny, one barrier removed) below the LL
+// cap, else LSA below/at the SDMA threshold, else GIN/SDMA. Shared by the kernel
+// and the host unit tests.
+GIN_SDMA_HD inline SendRecvTier sendRecvKernelTier(size_t msgBytes,
+                                                   size_t sdmaThreshold,
+                                                   int llSlots,
+                                                   size_t llMaxBytes) {
+  if (msgBytes <= sdmaThreshold) {
+    if (sendRecvLLEligible(msgBytes, llSlots, llMaxBytes)) return SendRecvTier::LL;
+    return SendRecvTier::LSA;
+  }
+  return SendRecvTier::Gin;
+}
+
+// Scatter LL eligibility (inside the chunkBytes<=sdmaThreshold branch): LL
+// configured (nSlots>0), 8-byte aligned, within the compile ceiling, and it
+// fits the pre-sized slot count. Each receiver takes ONE chunk from the root, so
+// the slot demand is chunkBytes/8 (mirrors bcast/sendRecvLLEligible, not the
+// nRanks*... forms). Compared against the per-rank chunk bytes.
+GIN_SDMA_HD inline bool scatterLLEligible(size_t chunkBytes, int llSlots,
+                                          size_t llMaxBytes) {
+  return llSlots != 0 && (chunkBytes % 8 == 0) && chunkBytes <= llMaxBytes &&
+         (chunkBytes / 8) <= (size_t)llSlots;
+}
+
+enum class ScatterTier { LL, LSA, Gin };
+
+// Tier chosen by GinScatterKernel: LL (tiny, exit barrier removed) below the LL
+// cap, else LSA below/at the SDMA threshold, else GIN/SDMA. Compared against the
+// per-rank chunk bytes. Shared by the kernel and the host unit tests.
+GIN_SDMA_HD inline ScatterTier scatterKernelTier(size_t chunkBytes,
+                                                 size_t sdmaThreshold,
+                                                 int llSlots,
+                                                 size_t llMaxBytes) {
+  if (chunkBytes <= sdmaThreshold) {
+    if (scatterLLEligible(chunkBytes, llSlots, llMaxBytes)) return ScatterTier::LL;
+    return ScatterTier::LSA;
+  }
+  return ScatterTier::Gin;
+}
+
+// Gather LL eligibility (inside the chunkBytes<=sdmaThreshold branch): LL
+// configured (nSlots>0), 8-byte aligned, within the compile ceiling, and it fits
+// the pre-sized slot count. All-to-one fan-in: the ROOT holds nRanks chunks in
+// its scratch, so the slot demand is nRanks*(chunk/8) -- the AllGather form, not
+// Scatter's single-message form. Compared against the per-rank chunk bytes.
+GIN_SDMA_HD inline bool gatherLLEligible(size_t chunkBytes, int llSlots,
+                                         int nRanks, size_t llMaxBytes) {
+  return llSlots != 0 && (chunkBytes % 8 == 0) && chunkBytes <= llMaxBytes &&
+         (size_t)nRanks * (chunkBytes / 8) <= (size_t)llSlots;
+}
+
+enum class GatherTier { LL, LSA, Gin };
+
+// Tier chosen by GinGatherKernel: LL (tiny, exit barrier removed) below the LL
+// cap, else LSA below/at the SDMA threshold (default 1 GiB = LSA-always), else
+// GIN/SDMA. Compared against the per-rank chunk bytes. Shared by the kernel and
+// the host unit tests.
+GIN_SDMA_HD inline GatherTier gatherKernelTier(size_t chunkBytes,
+                                               size_t sdmaThreshold,
+                                               int llSlots, int nRanks,
+                                               size_t llMaxBytes) {
+  if (chunkBytes <= sdmaThreshold) {
+    if (gatherLLEligible(chunkBytes, llSlots, nRanks, llMaxBytes)) return GatherTier::LL;
+    return GatherTier::LSA;
+  }
+  return GatherTier::Gin;
 }
 
 }  // namespace gin_sdma

@@ -280,4 +280,134 @@ TEST(A2aDevReqs, PerDeviceImpl) {
   EXPECT_FALSE(r5.supported);
 }
 
+// -------------------- Scatter/Gather/SendRecv (movement) --------------------
+
+TEST(MoveKernelTier, ThresholdSplit) {
+  const size_t thr = 262144;
+  EXPECT_EQ(moveKernelTier(thr, thr), MoveTier::LSA);      // at threshold -> LSA
+  EXPECT_EQ(moveKernelTier(thr - 1, thr), MoveTier::LSA);
+  EXPECT_EQ(moveKernelTier(thr + 1, thr), MoveTier::Gin);  // above -> GIN
+  EXPECT_EQ(moveKernelTier(0, thr), MoveTier::LSA);
+  EXPECT_EQ(moveKernelTier(1, 0), MoveTier::Gin);          // threshold 0 -> always GIN
+}
+
+TEST(MoveDevReqs, UniformCtaCountsAndGin) {
+  const int cta = 8;
+  DevReqs r = moveDevReqs(cta);
+  EXPECT_TRUE(r.supported);
+  EXPECT_TRUE(r.needsGin);
+  EXPECT_EQ(r.barrierCount, cta);
+  EXPECT_EQ(r.lsaBarrierCount, cta);
+  EXPECT_EQ(r.ginSignalCount, cta);
+}
+
+TEST(MoveThresholdDefaults, TunedPerCollective) {
+  // Tuned on 8x MI355X (2026-07-27): Scatter LSA is root-egress-bound so GIN
+  // wins for chunks >=256 KiB (cutover 128 KiB); Gather/SendRecv distribute
+  // writes so LSA wins to 512 MiB (LSA-always via a 1 GiB cutover).
+  EXPECT_EQ(kScatterSdmaThresholdDefault, 131072u);        // 128 KiB
+  EXPECT_EQ(kGatherSdmaThresholdDefault, 1073741824u);     // 1 GiB (LSA-always)
+  EXPECT_EQ(kSendRecvSdmaThresholdDefault, 1073741824u);   // 1 GiB (LSA-always)
+}
+
+TEST(SendRecvLLEligible, AllGates) {
+  const size_t cap = kSendRecvLLMaxBytes;
+  EXPECT_FALSE(sendRecvLLEligible(64, 0, cap));           // no slots
+  EXPECT_FALSE(sendRecvLLEligible(60, 1000, cap));        // not 8-aligned
+  EXPECT_FALSE(sendRecvLLEligible(cap + 8, 100000, cap)); // above ceiling
+  EXPECT_FALSE(sendRecvLLEligible(800, 99, cap));         // 800/8=100 slots > 99
+  EXPECT_TRUE(sendRecvLLEligible(800, 100, cap));         // exactly fits
+  EXPECT_TRUE(sendRecvLLEligible(8, 1, cap));
+}
+
+TEST(SendRecvKernelTier, LadderSelection) {
+  const size_t thr = 262144;
+  const size_t cap = kSendRecvLLMaxBytes;
+  EXPECT_EQ(sendRecvKernelTier(thr + 1, thr, 100000, cap), SendRecvTier::Gin);
+  EXPECT_EQ(sendRecvKernelTier(800, thr, 100000, cap), SendRecvTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(sendRecvKernelTier(800, thr, 0, cap), SendRecvTier::LSA);
+  // <=thr, LL configured but message above LL ceiling -> LSA.
+  EXPECT_EQ(sendRecvKernelTier(cap + 8, thr, 1u << 20, cap), SendRecvTier::LSA);
+}
+
+TEST(SendRecvLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kSendRecvLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kSendRecvLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
+}
+
+TEST(ScatterLLEligible, AllGates) {
+  const size_t cap = kScatterLLMaxBytes;
+  EXPECT_FALSE(scatterLLEligible(64, 0, cap));           // no slots
+  EXPECT_FALSE(scatterLLEligible(60, 1000, cap));        // not 8-aligned
+  EXPECT_FALSE(scatterLLEligible(cap + 8, 100000, cap)); // above ceiling
+  EXPECT_FALSE(scatterLLEligible(800, 99, cap));         // 800/8=100 slots > 99
+  EXPECT_TRUE(scatterLLEligible(800, 100, cap));         // exactly fits
+  EXPECT_TRUE(scatterLLEligible(8, 1, cap));
+}
+
+TEST(ScatterKernelTier, LadderSelection) {
+  // Compared against the per-rank chunk bytes.
+  const size_t thr = 131072;  // scatter default
+  const size_t cap = kScatterLLMaxBytes;
+  EXPECT_EQ(scatterKernelTier(thr + 1, thr, 100000, cap), ScatterTier::Gin);
+  EXPECT_EQ(scatterKernelTier(800, thr, 100000, cap), ScatterTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(scatterKernelTier(800, thr, 0, cap), ScatterTier::LSA);
+  // <=thr, LL configured but chunk above LL ceiling -> LSA.
+  EXPECT_EQ(scatterKernelTier(cap + 8, thr, 1u << 20, cap), ScatterTier::LSA);
+}
+
+TEST(ScatterLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kScatterLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kScatterLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
+}
+
+TEST(GatherLLEligible, AllGates) {
+  // All-to-one fan-in: the ROOT holds nRanks chunks, so the slot demand is
+  // nRanks*(chunk/8) (the AllGather form, not Scatter's single-message form).
+  const size_t cap = kGatherLLMaxBytes;
+  const int nRanks = 8;
+  EXPECT_FALSE(gatherLLEligible(64, 0, nRanks, cap));            // no slots
+  EXPECT_FALSE(gatherLLEligible(60, 100000, nRanks, cap));       // not 8-aligned
+  EXPECT_FALSE(gatherLLEligible(cap + 8, 1u << 20, nRanks, cap));// above ceiling
+  // 800 B chunk => 100 u64/chunk => root needs 8*100 = 800 slots.
+  EXPECT_FALSE(gatherLLEligible(800, 799, nRanks, cap));         // 800 > 799
+  EXPECT_TRUE(gatherLLEligible(800, 800, nRanks, cap));          // exactly fits
+  EXPECT_TRUE(gatherLLEligible(8, nRanks, nRanks, cap));         // 1 u64/chunk * N
+  EXPECT_FALSE(gatherLLEligible(8, nRanks - 1, nRanks, cap));    // N slots short
+}
+
+TEST(GatherKernelTier, LadderSelection) {
+  // Compared against the per-rank chunk bytes; default threshold is LSA-always.
+  const size_t thr = 1073741824u;  // gather default (1 GiB)
+  const size_t cap = kGatherLLMaxBytes;
+  const int nRanks = 8;
+  // Chunk within LL cap and slots sized for N chunks -> LL.
+  EXPECT_EQ(gatherKernelTier(800, thr, 8u << 10, nRanks, cap), GatherTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(gatherKernelTier(800, thr, 0, nRanks, cap), GatherTier::LSA);
+  // <=thr, LL configured but chunk above LL ceiling -> LSA.
+  EXPECT_EQ(gatherKernelTier(cap + 8, thr, 1u << 20, nRanks, cap), GatherTier::LSA);
+  // Above the (forced-low) threshold -> GIN.
+  EXPECT_EQ(gatherKernelTier(4096, 2048, 1u << 20, nRanks, cap), GatherTier::Gin);
+}
+
+TEST(GatherLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kGatherLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kGatherLLDefaultMaxBytes, 2048u);  // 2 KiB provisional default (on)
+}
+
+// The Anvil-SDMA linear-copy count field is 30 bits and 1-based (count = bytes-1),
+// so the largest safe single put is exactly 2^30 = 1 GiB (count = 2^30-1 fills the
+// field). The chunk ceiling MUST NOT exceed 2^30, or seg-1 overflows 30 bits and
+// the copy silently truncates. It is currently set to the hardware max (1 GiB).
+TEST(GinPutMaxBytes, AtSdma30BitLimit) {
+  EXPECT_EQ(kGinPutMaxBytes, 1073741824u);         // 1 GiB (2^30, HW max)
+  // Hard correctness bound: seg <= kGinPutMaxBytes => count = seg-1 <= 2^30-1.
+  EXPECT_LE(kGinPutMaxBytes, 1073741824ull);       // <= 2^30
+  EXPECT_LE(kGinPutMaxBytes - 1u, 0x3FFFFFFFull);  // count fits 30-bit field
+  EXPECT_EQ(kGinPutMaxBytes % 32u, 0u);            // 32 B copy-length aligned
+}
+
 }  // namespace
