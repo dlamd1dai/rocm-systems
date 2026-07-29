@@ -26,7 +26,11 @@ set -euo pipefail
 
 NP="${1:-8}"
 MAX_BYTES="${2:-128M}"
-MIN_BYTES="${MIN_BYTES:-8}"
+# Start at 128 B (= NP*16): scatter's per-rank chunk is (total/NP) rounded down
+# to a 16-byte-aligned element count, so any total < NP*16 collapses to a
+# 0-element chunk and prints empty "size 0 / count 0" rows. 128 B is the first
+# total that yields a nonzero aligned per-rank chunk on NP=8.
+MIN_BYTES="${MIN_BYTES:-128}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
