@@ -1,9 +1,11 @@
 # GIN-SDMA Collectives Expansion: Design & Implementation Plan
 
 **Document type:** Internal AMD design/implementation plan
-**Status:** **Proposed** — extends the implemented GIN-SDMA collectives (AllToAll, AllGather,
+**Status:** **In progress** — extends the implemented GIN-SDMA collectives (AllToAll, AllGather,
 Broadcast) to the remaining single-node collectives. No RCCL backend / GIN-ABI changes.
-**Date:** 2026-07-27
+**Phase 1 (SendRecv, Scatter, Gather `-D 3`) has landed** (see §3.1–3.3, marked IMPLEMENTED); P2+
+(reduction collectives) remain proposed.
+**Date:** 2026-07-27 (updated 2026-07-29)
 **Scope:** `projects/rccl-tests/` device kernels (`-D 3`, `NCCL_GIN_TYPE=6`), the shared
 `gin_sdma_collective_policy.h`, host policy unit tests, and per-collective gate scripts.
 **Related:**
@@ -61,9 +63,9 @@ in the 2026-07-27 scoping review.)
 | AllToAll | movement | ✅ | — | per-peer put loop, symmetric |
 | AllGather | movement | ✅ | — | own-slot put to all peers, symmetric |
 | Broadcast | movement | ✅ | — | root fan-out; large = scatter+allgather |
-| **Scatter** | movement | ❌ | **excellent** | root puts distinct chunk to each rank (= SAG scatter phase) |
-| **Gather** | movement | ❌ | **excellent** | each rank puts its chunk to root's slot |
-| **SendRecv** | movement | ❌ | **excellent** | single put + waitSignal |
+| **Scatter** | movement | ✅ (P1, `-D 3`) | **excellent** | root puts distinct chunk to each rank; LL→LSA(interleaved)→GIN |
+| **Gather** | movement | ✅ (P1, `-D 3`) | **excellent** | each rank puts its chunk to root's slot |
+| **SendRecv** | movement | ✅ (P1, `-D 3`) | **excellent** | single put + waitSignal |
 | **AllToAllv** | movement | ❌ | **good** | AllToAll put loop with per-peer displacements/counts |
 | **ReduceScatter** | reduction | ❌ | **good** (SM reduce) | LSA read-reduce (small) / put-partials + SM reduce (large) |
 | **AllReduce** | reduction | ❌ | **good** (SM reduce) | ReduceScatter + AllGather (reuse AG large path) |
@@ -83,19 +85,54 @@ case 3, with a `<Coll>GetDevCommRequirements` case 3, and a threshold resolved h
 `…_THRESHOLD` → default 256 KiB). Small tiers reuse `ncclGetLsaPointer`; large tiers use the
 `gin.put`/`waitSignal`/`flush` triple. All keep the **entry-barrier-only** sync model.
 
-### 3.1 Scatter (`scatter.cu`) — Tier A
+### 3.1 Scatter (`scatter.cu`) — Tier A — **IMPLEMENTED (`GinScatterKernel`, 2026-07-29)**
 
-Root sends a distinct chunk `r` to rank `r`. This is exactly the scatter phase of the implemented
-`GinScatterAllgatherBroadcastKernel`.
+Root sends a distinct chunk `r` to rank `r` (elements `[r*count .. (r+1)*count)` of its send
+buffer). The **as-built** kernel is a three-tier ladder keyed on the **per-rank chunk** bytes
+(`chunk = total/N`), not a two-tier small/large split. All tiers keep the entry-barrier-only model.
 
-- **Small (≤ threshold):** LSA — root SM-stores chunk `r` into each peer's `recvbuff` via
-  `ncclGetLsaPointer(recvwin, recvoffset, r)`; entry+exit LSA barrier.
-- **Large (> threshold):** root issues N−1 `gin.put`s (`recvwin@recvoffset`, `sendwin@r*chunk`,
-  `SignalInc{0}`); root does its own slice with a local copy; non-roots `waitSignal(base+1)`;
-  root `flush`es. Asymmetric completion (same as flat Broadcast, but distinct source offsets).
-- **DevComm:** `barrier = lsaBarrier = ginSignal = deviceCtaCount`, `needsGin`.
+- **Tiny — LL (≤ `NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES`, default 2 KiB/chunk; 64 KiB compile
+  ceiling):** single-CTA packed data+flag path. The root writes each peer's distinct chunk into
+  that peer's epoch-tagged LL scratch — **including its own** so every rank uniformly polls its own
+  scratch into `recvbuff`. The `(peer, slot)` fan-out is flattened **peer-major** (`r = w % N`) so
+  consecutive threads target distinct peers and all xGMI egress links fire concurrently in one burst
+  (the old peer-outer nesting serialized the root's ~N stores and dominated LL latency). A single
+  **entry** LSA barrier bounds root-vs-laggard epoch skew (only the root writes, so the ring lacks
+  the mutual-recv backpressure AllGather has); the recv's epoch tag replaces the exit barrier, and
+  each rank writes only its own `recvbuff` ⇒ immune to the `initData` recvbuff-memset race. Each
+  receiver takes one chunk, so it needs only `chunk/8` u64 slots (Broadcast/SendRecv sizing, not the
+  `N*…` AllGather form). `NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES=0` disables it.
+- **Small/med — LSA (chunk ≤ threshold):** root SM-stores each peer's chunk over xGMI, entry+exit
+  LSA barrier. Because **only the root writes**, its fan-out *layout* decides link utilization, so
+  the store loop is **peer-interleaved by default** (`ScatterLsaFanout`,
+  `NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE`, default on): map each CTA to a peer-slot
+  (`blockIdx % min(gridDim, N)`) so all peers' links run concurrently, with extra CTAs splitting a
+  peer's chunk for more threads/link. `INTERLEAVE=0` selects the historical sequential loop (all SMs
+  drive one link at a time) for A/B.
+- **Large — GIN/SDMA (chunk > threshold):** root issues one `gin.put` **per non-self peer**
+  (`SignalInc{0}`) and does its own slice with a local copy; non-roots `waitSignal(base+1)`; root
+  `flush`es. Asymmetric completion (same as flat Broadcast, distinct source offsets). Each put is
+  **chunked to ≤1 GiB** segments (the signal rides the final segment) to avoid the 30-bit SDMA
+  copy-count overflow on >1 GiB per-rank chunks.
+  - **Settled fan-out (2026-07-29, 8× MI355X):** the flat one-put-per-peer shape is optimal as-is.
+    The backend routes each peer's put to its own per-peer queue (`handles[r*numChannels+ch]`), so
+    the N−1 copies already run concurrently on independent SDMA engines. **No interleave knob on this
+    tier:** neither extra SDMA channels (`NUM_CHANNELS`=1/2/4 measured flat, ≥2 also deadlocks) nor
+    slicing each peer's chunk into 2/4 sub-puts helps — a single put already saturates its per-peer
+    xGMI link, and segmentation regressed 15–40 % from added SDMA descriptor overhead.
+- **Threshold (`kScatterSdmaThresholdDefault` = 128 KiB/chunk):** LSA is **root-egress-bound** (the
+  root alone stores all N−1 peer chunks, ~64 GB/s ceiling). Measured crossover on 8× MI355X
+  (2026-07-27) sits between a 128 KiB chunk (LSA still wins) and 256 KiB (GIN wins; 512 MiB total:
+  390 vs 64 GB/s). The **128 KiB default is the threshold, not the crossover** — the largest chunk
+  LSA still wins — so ≤128 KiB routes to LSA and ≥256 KiB to GIN. Override with
+  `NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER` or the shared `…_THRESHOLD`.
+- **In-place:** detected by `sendwin == recvwin`; rank `r`'s recv slot is `base + r*chunk` and the
+  root's own chunk is already in place. The root reconstructs the shared base as
+  `recvoffset − rank*chunk`.
+- **DevComm:** `barrier = lsaBarrier = ginSignal = deviceCtaCount`, `needsGin`, plus a single-CTA LL
+  scratch requirement sized from the LL cap (bypassed when `nSlots==0`).
 
-### 3.2 Gather (`gather.cu`) — Tier A
+### 3.2 Gather (`gather.cu`) — Tier A — **IMPLEMENTED (`GinGatherKernel`, P1)**
 
 Inverse of Scatter: each rank `r` puts its chunk into root's `recvbuff[r*chunk]`.
 
@@ -105,7 +142,7 @@ Inverse of Scatter: each rank `r` puts its chunk into root's `recvbuff[r*chunk]`
   **root** `waitSignal(base + N−1)` (root is the sole receiver); non-roots `flush`.
 - **DevComm:** as Scatter.
 
-### 3.3 SendRecv (`sendrecv.cu`) — Tier A (also removes the current `testNotImplemented`)
+### 3.3 SendRecv (`sendrecv.cu`) — Tier A — **IMPLEMENTED (`GinSendRecvKernel`, P1; removed the old `testNotImplemented`)**
 
 Point-to-point rank pairing (the rccl-tests SendRecv pairs rank `r` with `r ± nRanks/2`).
 
@@ -420,7 +457,7 @@ basis table exactly like §4.3.1 of the broadcast plan.
 
 | Phase | Deliverable | Risk | Notes |
 |---|---|---|---|
-| **P1** | SendRecv, Scatter, Gather (`-D 3`) | low | pure movement; reuse SAG-scatter / AG-put bodies |
+| **P1** ✅ | SendRecv, Scatter, Gather (`-D 3`) | low | **Landed** (2026-07-29). Pure movement; each adds an LL tiny tier. Scatter also gained a peer-interleaved LSA fan-out; thresholds tuned (Scatter 128 KiB; Gather/SendRecv LSA-always). |
 | **P2** | ReduceScatter (`-D 3`) | med | introduces `Apply<op,T>` + scratch window |
 | **P3** | **AllReduce** (`-D 3`) | med | RS + AG composition, two signals; **highest value** |
 | **P4** | Reduce (`-D 3`) | med | RS + Gather, or direct root-ingress |
