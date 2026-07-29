@@ -341,15 +341,15 @@ __global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWi
       ScatterLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
     }
     // Flat scatter: one put per non-self peer, each issued by a distinct thread
-    // (tid=r). Unlike the LSA tier (whose sequential per-peer store loop needed
-    // explicit peer-interleaving to light up all xGMI links), this GIN fan-out is
-    // *already* peer-concurrent by construction: the Anvil-SDMA backend routes
-    // each peer's put to its own per-peer queue (handles[r*numChannels + ch]), so
-    // the N-1 copies run concurrently on independent SDMA engines. Adding SDMA
-    // channels (NUM_CHANNELS>1) is a second, per-peer parallelism axis that a
-    // 1-chunk-per-peer scatter never exercises -- measured perf-neutral (and
-    // deadlock-free) at NC=1/2/4 on 8x MI355X (2026-07-28). Hence no interleave
-    // knob here; the fan-out is optimal as-is.
+    // (tid=r). This GIN fan-out is already peer-concurrent by construction: the
+    // Anvil-SDMA backend routes each peer's put to its own per-peer queue
+    // (handles[r*numChannels + ch]), so the N-1 copies run concurrently on
+    // independent SDMA engines. Adding SDMA channels (NUM_CHANNELS>1) or slicing
+    // each peer's chunk into multiple sub-puts does NOT help -- a single put
+    // already saturates its per-peer xGMI link, so both are perf-neutral-to-
+    // negative (measured 2026-07-29 on 8x MI355X: NC=1/2/4 flat; segmenting each
+    // peer into 2/4 sub-puts regressed 15-40% by adding SDMA descriptor
+    // overhead). Hence one put per peer, unsegmented.
     // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count overflow
     // on >1 GiB per-rank chunks; the signal rides the final segment.
     for (int r = tid; r < nRanks; r += nthreads) {
