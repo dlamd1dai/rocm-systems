@@ -50,6 +50,10 @@ if [[ ! -x "$EXE" ]]; then
 fi
 
 MIN_BYTES="${GIN_SDMA_MIN_BYTES:-8}"
+# Default 64M keeps the gate fast; the GIN tier is size-safe above 1 GiB because
+# every GIN put is split into <=1 GiB segments (common.h::ginPutChunked, the HW
+# 30-bit copy-count max), so GIN_SDMA_MAX_BYTES may be raised past 1 GiB to
+# exercise the chunk boundary without the old copy-count truncation.
 MAX_BYTES="${GIN_SDMA_MAX_BYTES:-64M}"
 FACTOR="${GIN_SDMA_FACTOR:-2}"
 CTA="${GIN_SDMA_CTA:-32}"       # -V device CTA count (matches gate scripts)
@@ -147,14 +151,25 @@ case "$COLL" in
     set +x
     ;;
   sendrecv)
-    # Ring send/recv; in-place is not validated for sendrecv (OOP only).
-    run "sweep out-of-place" -z 0
-    # SendRecv defaults to LSA at all sizes (tuned); force the GIN tier so its
-    # kernel path stays covered.
+    # Ring send/recv; in-place is not validated for sendrecv (OOP only). The
+    # default sweep exercises the LL tiny-message path (on by default <=2 KiB)
+    # and the LSA path above it.
+    run "sweep out-of-place (LL default on)" -z 0
+    # Force the GIN tier so its kernel path stays covered (SendRecv defaults to
+    # LSA at all sizes).
     echo "=== [$COLL] GIN-tier forced (NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV=0) ==="
     set -x
     "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
       "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV=0 \
+      "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -z 0
+    set +x
+    # Disable LL (NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES=0) so the tiny-message LSA
+    # store path stays covered too.
+    echo "=== [$COLL] LL disabled (NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES=0) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES=0 \
       "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -z 0
     set +x

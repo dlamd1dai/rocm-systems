@@ -310,4 +310,42 @@ TEST(MoveThresholdDefaults, TunedPerCollective) {
   EXPECT_EQ(kSendRecvSdmaThresholdDefault, 1073741824u);   // 1 GiB (LSA-always)
 }
 
+TEST(SendRecvLLEligible, AllGates) {
+  const size_t cap = kSendRecvLLMaxBytes;
+  EXPECT_FALSE(sendRecvLLEligible(64, 0, cap));           // no slots
+  EXPECT_FALSE(sendRecvLLEligible(60, 1000, cap));        // not 8-aligned
+  EXPECT_FALSE(sendRecvLLEligible(cap + 8, 100000, cap)); // above ceiling
+  EXPECT_FALSE(sendRecvLLEligible(800, 99, cap));         // 800/8=100 slots > 99
+  EXPECT_TRUE(sendRecvLLEligible(800, 100, cap));         // exactly fits
+  EXPECT_TRUE(sendRecvLLEligible(8, 1, cap));
+}
+
+TEST(SendRecvKernelTier, LadderSelection) {
+  const size_t thr = 262144;
+  const size_t cap = kSendRecvLLMaxBytes;
+  EXPECT_EQ(sendRecvKernelTier(thr + 1, thr, 100000, cap), SendRecvTier::Gin);
+  EXPECT_EQ(sendRecvKernelTier(800, thr, 100000, cap), SendRecvTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(sendRecvKernelTier(800, thr, 0, cap), SendRecvTier::LSA);
+  // <=thr, LL configured but message above LL ceiling -> LSA.
+  EXPECT_EQ(sendRecvKernelTier(cap + 8, thr, 1u << 20, cap), SendRecvTier::LSA);
+}
+
+TEST(SendRecvLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kSendRecvLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kSendRecvLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
+}
+
+// The Anvil-SDMA linear-copy count field is 30 bits and 1-based (count = bytes-1),
+// so the largest safe single put is exactly 2^30 = 1 GiB (count = 2^30-1 fills the
+// field). The chunk ceiling MUST NOT exceed 2^30, or seg-1 overflows 30 bits and
+// the copy silently truncates. It is currently set to the hardware max (1 GiB).
+TEST(GinPutMaxBytes, AtSdma30BitLimit) {
+  EXPECT_EQ(kGinPutMaxBytes, 1073741824u);         // 1 GiB (2^30, HW max)
+  // Hard correctness bound: seg <= kGinPutMaxBytes => count = seg-1 <= 2^30-1.
+  EXPECT_LE(kGinPutMaxBytes, 1073741824ull);       // <= 2^30
+  EXPECT_LE(kGinPutMaxBytes - 1u, 0x3FFFFFFFull);  // count fits 30-bit field
+  EXPECT_EQ(kGinPutMaxBytes % 32u, 0u);            // 32 B copy-length aligned
+}
+
 }  // namespace
