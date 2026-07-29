@@ -172,8 +172,10 @@ __global__ void GinGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWin
     gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)(nRanks - 1));
   } else {
     // One put of my chunk into root's slot [rank*chunk] (issued once).
+    // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count
+    // overflow on >1 GiB chunks; the signal rides the final segment.
     if (tid == 0) {
-      gin.put(ncclTeamWorld(devComm), root,
+      ginPutChunked(gin, ncclTeamWorld(devComm), root,
           recvwin, myDstOff,
           sendwin, sendoffset,
           chunkBytes, ncclGin_SignalInc{signalIndex});

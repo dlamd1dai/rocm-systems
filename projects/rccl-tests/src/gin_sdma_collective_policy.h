@@ -66,6 +66,28 @@ static constexpr size_t kAllToAllLLMaxBytes            = 65536;         // 64 Ki
 // AllToAll LL is OFF by default (unset env -> 0 cap).
 static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
 
+// SendRecv LL fast path: compile ceiling + default runtime cutover. Point-to-
+// point carries a single message per receiver (like Broadcast, not AllGather),
+// so a receiver needs just cap/8 u64 slots. On by default (2 KiB) since the ring
+// is barrier-bound at tiny sizes and LL removes the exit barrier.
+static constexpr size_t kSendRecvLLMaxBytes            = 65536;         // 64 KiB
+static constexpr size_t kSendRecvLLDefaultMaxBytes     = 2048;          // 2 KiB
+
+// Max bytes per single gin.put() on the Anvil-SDMA backend. The SDMA linear-copy
+// descriptor count field is 30 bits and 1-based (HW encodes count = bytes - 1,
+// see rocr-runtime amd_blit_sdma.cpp / sdma_registers.h), so the largest single
+// packet is (2^30 - 1) + 1 = 2^30 = exactly 1 GiB. A put of >1 GiB silently
+// truncates: a 2 GiB put encodes count = (2^31-1) & 0x3FFFFFFF = 2^30-1 and the
+// HW copies only 1 GiB, corrupting the transfer. Every GIN-tier put must be
+// split into segments of at most this size (see common.h::ginPutChunked).
+//
+// Set to exactly 1 GiB: this is the hardware maximum, so the segmentation clamp
+// (seg <= kGinPutMaxBytes) guarantees count = seg-1 <= 2^30-1 = 0x3FFFFFFF, which
+// fills the 30-bit field exactly with no truncation. Zero margin by design; do
+// NOT raise above 2^30. 1 GiB is a multiple of 32 B, satisfying the copy
+// descriptor's 32 B length alignment.
+static constexpr size_t kGinPutMaxBytes                = 1024ull * 1024 * 1024;  // 1 GiB (2^30, HW max)
+
 // ---------------------------- env / threshold ----------------------------
 
 // Parse a size string ("123", "4K", "2M", "1G"; decimal only, optional single
@@ -257,7 +279,8 @@ GIN_SDMA_HD inline DevReqs a2aDevReqs(int deviceImpl, int deviceCtaCount) {
 // one devComm-requirement shape: a size-hybrid LSA(small) / GIN-SDMA(large) split
 // at a per-collective LSA<->GIN threshold (default 256 KiB, retuned by
 // measurement per the design plan), and barrier = lsaBarrier = ginSignal =
-// deviceCtaCount with needsGin. No scratch, no LL (movement only; Phase 1).
+// deviceCtaCount with needsGin. No scratch. SendRecv additionally has an
+// opt-out LL tiny-message tier (below); Scatter/Gather stay LSA/GIN for now.
 
 // Compared against the transfer bytes (Scatter/Gather: per-rank chunk; SendRecv:
 // full message). Tuned on 8x MI355X (gfx950, NCCL_GIN_TYPE=6, -V 32, 2026-07-27;
@@ -291,6 +314,32 @@ GIN_SDMA_HD inline MoveTier moveKernelTier(size_t bytes, size_t sdmaThreshold) {
 GIN_SDMA_HD inline DevReqs moveDevReqs(int deviceCtaCount) {
   DevReqs r{deviceCtaCount, deviceCtaCount, deviceCtaCount, true, true};
   return r;
+}
+
+// SendRecv LL eligibility (inside the msgBytes<=sdmaThreshold branch): LL
+// configured (nSlots>0), 8-byte aligned, within the compile ceiling, and it
+// fits the pre-sized slot count. Single incoming message per receiver, so the
+// slot demand is msgBytes/8 (mirrors bcastLLEligible, not the nRanks*... forms).
+GIN_SDMA_HD inline bool sendRecvLLEligible(size_t msgBytes, int llSlots,
+                                           size_t llMaxBytes) {
+  return llSlots != 0 && (msgBytes % 8 == 0) && msgBytes <= llMaxBytes &&
+         (msgBytes / 8) <= (size_t)llSlots;
+}
+
+enum class SendRecvTier { LL, LSA, Gin };
+
+// Tier chosen by GinSendRecvKernel: LL (tiny, one barrier removed) below the LL
+// cap, else LSA below/at the SDMA threshold, else GIN/SDMA. Shared by the kernel
+// and the host unit tests.
+GIN_SDMA_HD inline SendRecvTier sendRecvKernelTier(size_t msgBytes,
+                                                   size_t sdmaThreshold,
+                                                   int llSlots,
+                                                   size_t llMaxBytes) {
+  if (msgBytes <= sdmaThreshold) {
+    if (sendRecvLLEligible(msgBytes, llSlots, llMaxBytes)) return SendRecvTier::LL;
+    return SendRecvTier::LSA;
+  }
+  return SendRecvTier::Gin;
 }
 
 }  // namespace gin_sdma

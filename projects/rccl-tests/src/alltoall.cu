@@ -416,9 +416,11 @@ __global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset,
   int tid = threadIdx.x + blockIdx.x * blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
 
-  /* send to all peers via GIN */
+  /* send to all peers via GIN. Chunked to <=1 GiB segments to avoid the
+     30-bit SDMA copy-count overflow on >1 GiB per-peer chunks; the signal
+     rides the final segment. */
   for (int r=tid; r<devComm.nRanks; r+=nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
+    ginPutChunked(gin, ncclTeamWorld(devComm), r,
         recvwin, recvoffset + devComm.rank * size,
         sendwin, sendoffset + r * size,
         size, ncclGin_SignalInc{signalIndex});
@@ -462,14 +464,16 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
 
+    // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count overflow
+    // on >1 GiB per-peer chunks; the signal rides the final segment.
     for (int r = tid; r < startLsa; r += nthreads) {
-      gin.put(world, r,
+      ginPutChunked(gin, world, r,
           recvwin, recvoffset + world.rank * size,
           sendwin, sendoffset + r * size,
           size, ncclGin_SignalInc{signalIndex});
     }
     for (int r = startLsa + lsaSize + tid; r < world.nRanks; r += nthreads) {
-      gin.put(world, r,
+      ginPutChunked(gin, world, r,
           recvwin, recvoffset + world.rank * size,
           sendwin, sendoffset + r * size,
           size, ncclGin_SignalInc{signalIndex});

@@ -182,10 +182,12 @@ __global__ void GinScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWi
       ScatterLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
     }
     // Flat scatter: one put per non-self peer (issued once, by the thread tid=r).
+    // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count overflow
+    // on >1 GiB per-rank chunks; the signal rides the final segment.
     for (int r = tid; r < nRanks; r += nthreads) {
       if (r == root) continue;
       const size_t dstOff = inPlace ? (dstBase + (size_t)r * chunkBytes) : recvoffset;
-      gin.put(ncclTeamWorld(devComm), r,
+      ginPutChunked(gin, ncclTeamWorld(devComm), r,
           recvwin, dstOff,
           sendwin, sendoffset + (size_t)r * chunkBytes,
           chunkBytes, ncclGin_SignalInc{signalIndex});

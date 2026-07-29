@@ -344,8 +344,10 @@ __global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const int nthreads = blockDim.x * gridDim.x;
 
+  // Chunked to <=1 GiB segments to avoid the 30-bit SDMA copy-count overflow
+  // on >1 GiB per-rank chunks; the signal rides the final segment.
   for (int r = tid; r < devComm.nRanks; r += nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
+    ginPutChunked(gin, ncclTeamWorld(devComm), r,
         recvwin, recvoffset + (size_t)devComm.rank * chunkBytes,
         sendwin, sendoffset,
         chunkBytes, ncclGin_SignalInc{signalIndex});

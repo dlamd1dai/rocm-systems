@@ -13,6 +13,26 @@
 #include "rccl_vector_types.h"
 #endif
 
+// LL (low-latency, packed data+flag) tiny-message SendRecv fast path. The ring
+// pairs rank r with (r+1)%N (send) and (r-1+N)%N (recv); each rank sends its
+// payload into its send-peer's epoch-tagged LL scratch and polls its OWN scratch
+// (written by its recv-peer) into recvbuff. The recv's epoch tag replaces the
+// EXIT barrier; a single ENTRY LSA barrier is kept because the ring is not
+// mutually back-pressured (rank r receives from r-1, not from its reader r+1),
+// so -- like Broadcast, unlike AllGather -- a fast rank could otherwise run >=2
+// epochs ahead of its reader and deadlock the double-buffered LL scratch. On by
+// default up to SENDRECV_LL_DEFAULT_MAX_BYTES; tune/disable via
+// NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES (0 = disable). Constants live in
+// gin_sdma_collective_policy.h so the kernel branch, the requirements sizing and
+// the host unit tests share one source. nSlots==0 => LL not configured => the
+// kernel uses the direct-LSA store.
+#if (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)) || NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+#define SR_HAVE_LL 1
+static size_t g_srLLMaxBytes = 0;  // resolved from env at requirements time
+static ncclLLA2AHandle g_srLLHandle = {};
+static ncclDevResourceRequirements g_srLLReq = {};
+#endif
+
 void SendRecvGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *sendcount = count;
   *recvcount = count;
@@ -62,6 +82,20 @@ testResult_t SendRecvGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
+      // LL scratch for the tiny-message fast path (single CTA => nBlocks=1), on
+      // by default up to SENDRECV_LL_DEFAULT_MAX_BYTES, tunable via
+      // NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES (bytes; 0 = disable). One message
+      // per receiver, so a receiver needs just cap/8 u64 slots (like Broadcast).
+      g_srLLMaxBytes = gin_sdma::resolveLLCap(
+          testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_SENDRECV_LL_MAX_BYTES"),
+          gin_sdma::kSendRecvLLDefaultMaxBytes, gin_sdma::kSendRecvLLMaxBytes);
+      if (g_srLLMaxBytes > 0) {
+        int llMaxElts = (int)(g_srLLMaxBytes / 8);
+        int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
+        ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_srLLHandle, &g_srLLReq);
+        g_srLLReq.next = reqs->resourceRequirementsList;
+        reqs->resourceRequirementsList = &g_srLLReq;
+      }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -108,16 +142,53 @@ __device__ size_t SendRecvGetSdmaThreshold(struct ncclDevComm const& devComm) {
   return loadConst(&rsCtx->sdmaThreshold);
 }
 
+#if defined(SR_HAVE_LL)
+// LL ring SendRecv for tiny messages, single CTA. Each rank sends its payload
+// (as 8-byte units) into its send-peer's epoch-tagged LL scratch at slots
+// [0..chunkU64), then polls its OWN scratch (written by its recv-peer) into
+// recvbuff. A single entry LSA barrier bounds the epoch skew (the ring lacks the
+// mutual-recv backpressure AllGather has; see file header note); the recv's
+// epoch tag replaces the exit barrier, and each rank writes only its own
+// recvbuff, so it is immune to the initData recvbuff-memset race.
+__device__ void SendRecvLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+                               size_t chunkU64, int sendPeer, struct ncclDevComm const& devComm, ncclTeam lsa,
+                               ncclLLA2AHandle llHandle) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
+  uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
+
+  // Entry barrier: bounds send-peer-vs-laggard epoch skew (see file header note).
+  ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, /*block=*/0 };
+  lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+                                     /*maxElts=*/(int)chunkU64 };
+
+  // Send my message into the send-peer's scratch slots [0..chunkU64).
+  for (size_t j = tid; j < chunkU64; j += nthreads) {
+    ll.send(sendPeer, (int)j, src[j]);
+  }
+  // Gather my incoming message (written by my recv-peer) out of my own scratch.
+  for (size_t j = tid; j < chunkU64; j += nthreads) {
+    dst[j] = ll.recv<uint64_t>((int)j);
+  }
+  ll.endEpoch(ncclCoopCta());
+}
+#endif
+
 // Single-node ring SendRecv (-D 3): every rank sends its buffer to (rank+1)%N
 // and receives from (rank-1+N)%N, so each rank issues exactly one put and
 // receives exactly one put (symmetric completion, waitSignal base+1). The GIN
 // destination offset is uniform across ranks (out-of-place only; in-place
 // sendrecv is not validated), so the peer's recvbuff is addressed at recvoffset
 // directly.
-//   msgBytes <= sdmaThreshold: LSA store to the send peer's recvbuff.
-//   msgBytes >  sdmaThreshold: one GIN put to the send peer (Anvil picks SDMA).
+//   msgBytes <= LL cap (opt-out): LL packed data+flag, single CTA (tiny, one
+//                                 barrier removed vs LSA).
+//   msgBytes <= sdmaThreshold:    LSA store to the send peer's recvbuff.
+//   msgBytes >  sdmaThreshold:    one GIN put to the send peer (Anvil picks SDMA).
 template <typename T>
-__global__ void GinSendRecvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride) {
+__global__ void GinSendRecvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
   const size_t msgBytes = count * sizeof(T);
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -128,11 +199,25 @@ __global__ void GinSendRecvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
   const int nthreads = blockDim.x * gridDim.x;
 
   if (msgBytes <= sdmaThreshold) {
+    ncclTeam lsa = ncclTeamLsa(devComm);
+
+#if defined(SR_HAVE_LL)
+    // Tiny messages: LL packed data+flag path (single CTA). Keeps one entry
+    // barrier (the ring is not mutually back-pressured) and drops the exit
+    // barrier; memset-race-immune (cross-rank traffic stays in the LL scratch).
+    // Used when LL is configured (nSlots>0), the message is 8-byte aligned, and
+    // it fits the pre-sized slot count.
+    if (gin_sdma::sendRecvLLEligible(msgBytes, llHandle.nSlots, gin_sdma::kSendRecvLLMaxBytes)) {
+      if (blockIdx.x != 0) return;  // single CTA
+      SendRecvLLImpl(sendwin, sendoffset, recvwin, recvoffset, msgBytes / 8, sendPeer, devComm, lsa, llHandle);
+      return;
+    }
+#endif
+
     // LSA tier: store my send buffer into the send peer's recvbuff. Entry
     // barrier keeps every recvbuff quiescent past initData's memset before a
     // peer writes it; exit barrier makes the write visible before I read the
     // slice my recv peer wrote into my recvbuff.
-    ncclTeam lsa = ncclTeamLsa(devComm);
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
@@ -152,8 +237,10 @@ __global__ void GinSendRecvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
   // One put to the send peer (issue once, by the single global thread 0).
+  // Chunked to <=1 GiB segments so a >1 GiB message does not overflow the
+  // 30-bit SDMA copy-count; the signal rides the final segment.
   if (tid == 0) {
-    gin.put(ncclTeamWorld(devComm), sendPeer,
+    ginPutChunked(gin, ncclTeamWorld(devComm), sendPeer,
         recvwin, recvoffset,
         sendwin, sendoffset,
         msgBytes, ncclGin_SignalInc{signalIndex});
@@ -189,7 +276,7 @@ testResult_t SendRecvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         // 512 MiB (8x MI355X, 2026-07-27; 62.4 vs 61.1 GB/s). Set
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV=0 to force the GIN tier.
         static const size_t srThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_SENDRECV", gin_sdma::kSendRecvSdmaThresholdDefault);
-        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinSendRecvKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, srThr));
+        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinSendRecvKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, srThr, g_srLLHandle));
         return testSuccess;
       }
 #endif
