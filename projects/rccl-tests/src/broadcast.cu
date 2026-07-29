@@ -225,6 +225,11 @@ __device__ void BroadcastLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWin
                                      /*maxElts=*/(int)chunkU64 };
 
   // Root broadcasts its message into every peer's scratch slot [0..chunkU64).
+  // NB: ll.bcast() already fans out to all N peers per call with an 8-way
+  // unrolled, register-reusing store loop, so it is more efficient than an
+  // explicit per-(peer,slot) send flatten across the LL range (measured: the
+  // flatten helps only <=512 B but regresses 1-2 KiB by 20-40%). Unlike Scatter
+  // (which had a genuinely serial explicit-send loop), keep bcast() here.
   if (devComm.rank == root) {
     const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
     for (size_t j = tid; j < chunkU64; j += nthreads) {
