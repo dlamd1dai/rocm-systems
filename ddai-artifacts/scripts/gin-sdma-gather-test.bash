@@ -7,6 +7,10 @@
 # Usage: ./gin-sdma-gather-test.bash [NP] [MAX_BYTES]
 #   NP         default 8
 #   MAX_BYTES  default 128M   (total recv size; per-rank chunk = size/NP)
+#   MIN_BYTES  default 128    (>= NP*wordSize so every sweep row has a >=1-elt
+#              per-rank chunk; smaller totals round to a 0-element gather and
+#              print empty size-0 rows). 128 B still spans the whole LL band
+#              (chunks 16 B..2 KiB) for NP=8.
 #
 # Checks (order: GA-C1 host baseline -> GA-C2 GIN):
 #   GA-C1  Host-initiated ncclGather                (gather_perf -D 0)
@@ -26,7 +30,7 @@ set -euo pipefail
 
 NP="${1:-8}"
 MAX_BYTES="${2:-128M}"
-MIN_BYTES="${MIN_BYTES:-8}"
+MIN_BYTES="${MIN_BYTES:-128}"   # >= NP*wordSize; smaller totals gather 0 elts/rank
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
