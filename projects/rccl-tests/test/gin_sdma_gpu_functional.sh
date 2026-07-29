@@ -21,7 +21,7 @@
 #   Broadcast : LL (<=2 KiB) -> LSA (<=256 KiB) -> flat GIN (<2 MiB) -> scatter+AG (>=2 MiB)
 #   AllGather : LL (<=4 KiB/rank) -> LSA single-CTA (<=8 KiB) -> LSA multi-CTA (<=256 KiB) -> GIN
 #   AllToAll  : LSA (<=256 KiB/peer) -> GIN ; LL tier is opt-in and exercised via env
-#   Scatter   : LSA (<=256 KiB/rank chunk) -> GIN   (root fan-out; OOP + in-place)
+#   Scatter   : LL (<=2 KiB/rank chunk) -> LSA (<=128 KiB/rank chunk) -> GIN (root fan-out; OOP + in-place)
 #   Gather    : LSA (<=256 KiB/rank chunk) -> GIN   (root fan-in;  OOP + in-place)
 #   SendRecv  : LSA (<=256 KiB message)    -> GIN   (ring; OOP only)
 #
@@ -132,8 +132,9 @@ case "$COLL" in
     ;;
   scatter|gather)
     # Root fan-out/fan-in: exercise rank==root and non-root paths on root 0 and
-    # the last rank, across the LSA (small chunk) and GIN (large chunk) tiers,
-    # out-of-place and in-place.
+    # the last rank, across the tier ladder, out-of-place and in-place. For
+    # Scatter this default sweep also crosses the LL tiny-chunk path (on by
+    # default <=2 KiB/rank chunk); Gather has no LL tier.
     for root in 0 $((NP - 1)); do
       run "sweep root=$root out-of-place" -r "$root" -z 0
       run "sweep root=$root in-place"     -r "$root" -z 1
@@ -149,6 +150,26 @@ case "$COLL" in
       "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
     set +x
+    # Scatter LL is on by default; add an LL-disabled pass so the tiny-chunk LSA
+    # store path stays covered too. (Gather has no LL tier, so skip it there.)
+    if [[ "$COLL" == "scatter" ]]; then
+      echo "=== [$COLL] LL disabled (NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES=0) ==="
+      set -x
+      "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+        "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES=0 \
+        "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+        -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
+      set +x
+      # LSA root fan-out defaults to peer-interleaved; add a sequential-layout
+      # pass so the historical one-link-at-a-time store path stays covered too.
+      echo "=== [$COLL] LSA sequential fan-out (NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE=0) ==="
+      set -x
+      "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+        "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE=0 \
+        "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+        -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
+      set +x
+    fi
     ;;
   sendrecv)
     # Ring send/recv; in-place is not validated for sendrecv (OOP only). The

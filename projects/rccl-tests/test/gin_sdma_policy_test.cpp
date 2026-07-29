@@ -336,6 +336,33 @@ TEST(SendRecvLLDefaults, OnByDefault2KiB) {
   EXPECT_EQ(kSendRecvLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
 }
 
+TEST(ScatterLLEligible, AllGates) {
+  const size_t cap = kScatterLLMaxBytes;
+  EXPECT_FALSE(scatterLLEligible(64, 0, cap));           // no slots
+  EXPECT_FALSE(scatterLLEligible(60, 1000, cap));        // not 8-aligned
+  EXPECT_FALSE(scatterLLEligible(cap + 8, 100000, cap)); // above ceiling
+  EXPECT_FALSE(scatterLLEligible(800, 99, cap));         // 800/8=100 slots > 99
+  EXPECT_TRUE(scatterLLEligible(800, 100, cap));         // exactly fits
+  EXPECT_TRUE(scatterLLEligible(8, 1, cap));
+}
+
+TEST(ScatterKernelTier, LadderSelection) {
+  // Compared against the per-rank chunk bytes.
+  const size_t thr = 131072;  // scatter default
+  const size_t cap = kScatterLLMaxBytes;
+  EXPECT_EQ(scatterKernelTier(thr + 1, thr, 100000, cap), ScatterTier::Gin);
+  EXPECT_EQ(scatterKernelTier(800, thr, 100000, cap), ScatterTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(scatterKernelTier(800, thr, 0, cap), ScatterTier::LSA);
+  // <=thr, LL configured but chunk above LL ceiling -> LSA.
+  EXPECT_EQ(scatterKernelTier(cap + 8, thr, 1u << 20, cap), ScatterTier::LSA);
+}
+
+TEST(ScatterLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kScatterLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kScatterLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
+}
+
 // The Anvil-SDMA linear-copy count field is 30 bits and 1-based (count = bytes-1),
 // so the largest safe single put is exactly 2^30 = 1 GiB (count = 2^30-1 fills the
 // field). The chunk ceiling MUST NOT exceed 2^30, or seg-1 overflows 30 bits and
