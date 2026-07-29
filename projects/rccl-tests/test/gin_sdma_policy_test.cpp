@@ -363,6 +363,41 @@ TEST(ScatterLLDefaults, OnByDefault2KiB) {
   EXPECT_EQ(kScatterLLDefaultMaxBytes, 2048u);  // 2 KiB default cutover (on)
 }
 
+TEST(GatherLLEligible, AllGates) {
+  // All-to-one fan-in: the ROOT holds nRanks chunks, so the slot demand is
+  // nRanks*(chunk/8) (the AllGather form, not Scatter's single-message form).
+  const size_t cap = kGatherLLMaxBytes;
+  const int nRanks = 8;
+  EXPECT_FALSE(gatherLLEligible(64, 0, nRanks, cap));            // no slots
+  EXPECT_FALSE(gatherLLEligible(60, 100000, nRanks, cap));       // not 8-aligned
+  EXPECT_FALSE(gatherLLEligible(cap + 8, 1u << 20, nRanks, cap));// above ceiling
+  // 800 B chunk => 100 u64/chunk => root needs 8*100 = 800 slots.
+  EXPECT_FALSE(gatherLLEligible(800, 799, nRanks, cap));         // 800 > 799
+  EXPECT_TRUE(gatherLLEligible(800, 800, nRanks, cap));          // exactly fits
+  EXPECT_TRUE(gatherLLEligible(8, nRanks, nRanks, cap));         // 1 u64/chunk * N
+  EXPECT_FALSE(gatherLLEligible(8, nRanks - 1, nRanks, cap));    // N slots short
+}
+
+TEST(GatherKernelTier, LadderSelection) {
+  // Compared against the per-rank chunk bytes; default threshold is LSA-always.
+  const size_t thr = 1073741824u;  // gather default (1 GiB)
+  const size_t cap = kGatherLLMaxBytes;
+  const int nRanks = 8;
+  // Chunk within LL cap and slots sized for N chunks -> LL.
+  EXPECT_EQ(gatherKernelTier(800, thr, 8u << 10, nRanks, cap), GatherTier::LL);
+  // <=thr but LL not configured -> LSA.
+  EXPECT_EQ(gatherKernelTier(800, thr, 0, nRanks, cap), GatherTier::LSA);
+  // <=thr, LL configured but chunk above LL ceiling -> LSA.
+  EXPECT_EQ(gatherKernelTier(cap + 8, thr, 1u << 20, nRanks, cap), GatherTier::LSA);
+  // Above the (forced-low) threshold -> GIN.
+  EXPECT_EQ(gatherKernelTier(4096, 2048, 1u << 20, nRanks, cap), GatherTier::Gin);
+}
+
+TEST(GatherLLDefaults, OnByDefault2KiB) {
+  EXPECT_EQ(kGatherLLMaxBytes, 65536u);        // 64 KiB compile ceiling
+  EXPECT_EQ(kGatherLLDefaultMaxBytes, 2048u);  // 2 KiB provisional default (on)
+}
+
 // The Anvil-SDMA linear-copy count field is 30 bits and 1-based (count = bytes-1),
 // so the largest safe single put is exactly 2^30 = 1 GiB (count = 2^30-1 fills the
 // field). The chunk ceiling MUST NOT exceed 2^30, or seg-1 overflows 30 bits and

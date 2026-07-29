@@ -132,9 +132,9 @@ case "$COLL" in
     ;;
   scatter|gather)
     # Root fan-out/fan-in: exercise rank==root and non-root paths on root 0 and
-    # the last rank, across the tier ladder, out-of-place and in-place. For
-    # Scatter this default sweep also crosses the LL tiny-chunk path (on by
-    # default <=2 KiB/rank chunk); Gather has no LL tier.
+    # the last rank, across the tier ladder, out-of-place and in-place. Both
+    # Scatter and Gather cross the LL tiny-chunk path in this default sweep (on by
+    # default <=2 KiB/rank chunk).
     for root in 0 $((NP - 1)); do
       run "sweep root=$root out-of-place" -r "$root" -z 0
       run "sweep root=$root in-place"     -r "$root" -z 1
@@ -150,16 +150,17 @@ case "$COLL" in
       "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
     set +x
-    # Scatter LL is on by default; add an LL-disabled pass so the tiny-chunk LSA
-    # store path stays covered too. (Gather has no LL tier, so skip it there.)
+    # Scatter/Gather LL is on by default; add an LL-disabled pass so the tiny-chunk
+    # LSA path stays covered too.
+    LLENV="NCCL_GIN_ANVIL_$(echo "$COLL" | tr a-z A-Z)_LL_MAX_BYTES"
+    echo "=== [$COLL] LL disabled (${LLENV}=0) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x "${LLENV}=0" \
+      "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
+    set +x
     if [[ "$COLL" == "scatter" ]]; then
-      echo "=== [$COLL] LL disabled (NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES=0) ==="
-      set -x
-      "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
-        "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SCATTER_LL_MAX_BYTES=0 \
-        "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
-        -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
-      set +x
       # LSA root fan-out defaults to peer-interleaved; add a sequential-layout
       # pass so the historical one-link-at-a-time store path stays covered too.
       echo "=== [$COLL] LSA sequential fan-out (NCCL_GIN_ANVIL_SCATTER_LSA_INTERLEAVE=0) ==="
