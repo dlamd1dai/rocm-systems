@@ -399,9 +399,14 @@ testResult_t ScatterRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, s
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         // Scatter-specific LSA<->GIN threshold (compared against the per-rank
-        // chunk). Default 128 KiB: LSA is root-egress-bound so GIN/SDMA wins for
-        // chunks >=256 KiB (8x MI355X, 2026-07-27; 512 MiB: 390 vs 64 GB/s).
-        // Override with NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER or the shared
+        // chunk; predicate is chunk <= threshold ? LSA : GIN). LSA is
+        // root-egress-bound (only the root SM-stores all peer chunks, ~64 GB/s),
+        // so on 8x MI355X (2026-07-27) the measured crossover sits between a
+        // 128 KiB chunk (LSA still wins) and a 256 KiB chunk (GIN wins; 512 MiB
+        // total: 390 vs 64 GB/s). The 128 KiB default is the THRESHOLD, not the
+        // crossover: it is the largest chunk LSA still wins, so <=128 KiB routes
+        // to LSA and >=256 KiB to GIN. Override with
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t scThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_SCATTER", gin_sdma::kScatterSdmaThresholdDefault);
         // LSA-tier root fan-out layout: peer-interleaved (all xGMI links
