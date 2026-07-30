@@ -151,12 +151,14 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 //     latency (mirrors UnrollPeers=2). This is the mid-size lever: it breaks past
 //     the ~175 GB/s serial-per-peer plateau (e.g. 16 MiB 175->225, 32 MiB
 //     194->261) without the register cost of pack-unrolling;
-//   * >= ~48 MiB: a WARP-STRIDED, pack-unrolled loop -- a warp owns a tile of
-//     U*WARP packs and issues U independent 128-bit loads per source rank at stride
-//     WARP (lane varies fastest, so every load stays fully coalesced) before
-//     reducing, keeping many xGMI reads outstanding. This mirrors the UnrollPacks
-//     technique in RCCL's symmetric ReduceScatter LD kernel and is ~1.7x the
-//     grid-stride loop at 2 GiB (~parity with the host symmetric path).
+//   * >= ~48 MiB: a WARP-STRIDED loop that unrolls over BOTH packs and peers -- a
+//     warp owns a tile of U*WARP packs and issues U independent 128-bit loads per
+//     source rank at stride WARP (lane varies fastest, so every load stays fully
+//     coalesced), AND consumes source ranks two at a time, so 2*U loads are in
+//     flight before any reduce. This mirrors RCCL's symmetric ReduceScatter LD
+//     kernel (UnrollPacks=4 x UnrollPeers=2 = 8 outstanding loads): pack-ILP fills
+//     the pipe within a source, peer-ILP overlaps consecutive sources' xGMI read
+//     latency. ~parity with the host symmetric path at >=64 MiB.
 // count is always a multiple of 16/sizeof(T) (see ReduceScatterGetCollByteCount) so
 // packs tile exactly with no scalar element tail; a short per-lane tail loop covers
 // a partial final warp-tile in the unrolled path.
@@ -198,10 +200,12 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
   //   * small/mid (< RS_UNROLL_MIN total bytes): a register-light grid-stride loop
   //     (one 128-bit load per iter) that maximizes wave occupancy -- best latency
   //     hiding when there isn't enough data to saturate xGMI via ILP alone.
-  //   * large: a warp-strided, pack-unrolled loop that keeps U independent 128-bit
-  //     loads per source rank outstanding (each still fully coalesced across the
-  //     warp), mirroring RCCL's symmetric LD UnrollPacks -- this saturates xGMI at
-  //     large sizes (~1.7x the grid-stride loop at 2 GiB, ~parity with host).
+  //   * large: a warp-strided loop unrolled over packs AND peers -- U independent
+  //     128-bit loads per source rank (each fully coalesced across the warp) times
+  //     two source ranks in flight = 2*U outstanding loads, mirroring RCCL's
+  //     symmetric LD UnrollPacks=4 x UnrollPeers=2. Pack-ILP fills the per-source
+  //     pipe; peer-ILP overlaps consecutive sources' latency -- saturates xGMI at
+  //     large sizes (~parity with host).
   // The crossover (~48 MiB total) is where the unrolled path measurably overtakes
   // the occupancy-bound loop on 8x MI355X; below it the grid-stride loop is faster.
   constexpr size_t RS_UNROLL_MIN = (size_t)48 << 20;  // 48 MiB total message
@@ -255,22 +259,59 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
     const size_t tile = (size_t)U * WARP;
     const size_t gridStride = nWarps * tile;
 
-    for (size_t wbase = warpId * tile; wbase < nPacks; wbase += gridStride) {
+    // Software-pipelined source-0 seed: the source-0 tile for the NEXT full
+    // iteration is loaded while the current iteration reduces peers 1..N-1 and
+    // writes its output, hiding source 0's xGMI read latency across grid-stride
+    // iterations (mirrors the next-iteration prefetch in RCCL's symmetric LD
+    // reduceDeep). A warp's full tiles are contiguous with a fixed stride, so at
+    // most one trailing partial tile follows the last full one -- the prefetch
+    // guard (nb + tile <= nPacks) simply skips priming when the next tile is that
+    // partial remainder, which the tail branch handles without a seed.
+    const Pack* src0Base = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0) + myBaseP;
+    size_t wbase = warpId * tile;
+    Pack seed[U];
+    if (wbase + tile <= nPacks) {  // prime the pipeline for this warp's first full tile
+      const Pack* sp = src0Base + wbase + (size_t)lane;
+      #pragma unroll
+      for (int u = 0; u < U; u++) seed[u] = sp[(size_t)u * WARP];
+    }
+    for (; wbase < nPacks; wbase += gridStride) {
       if (wbase + tile <= nPacks) {
-        // ---- fully coalesced tile: U outstanding 128-bit loads per source rank ----
+        // ---- fully coalesced tile: 2*U outstanding 128-bit loads ----
+        // Combine pack-unroll (U packs/source, stride WARP) with PEER-unroll (two
+        // source ranks issued before either reduces): 2*U loads are in flight,
+        // mirroring RCCL's symmetric LD kernel (UnrollPacks=4 x UnrollPeers=2 = 8).
+        // Pack-ILP alone left the per-source dependency chain exposed at large
+        // sizes; adding peer-ILP overlaps consecutive ranks' xGMI read latency and
+        // is what closes the gap to the host path. Ascending source-rank fold
+        // (s, then s+1) is preserved, so the reduction stays bit-for-bit identical.
         const size_t p0 = wbase + (size_t)lane;  // this lane's first pack
         T acc[U][VEC];
-        {  // source s == 0 seeds the accumulator (ascending source-rank order)
-          const Pack* sp = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0) + myBaseP + p0;
-          Pack t[U];
+        #pragma unroll  // source s == 0: consume the prefetched seed (ascending fold)
+        for (int u = 0; u < U; u++)
           #pragma unroll
-          for (int u = 0; u < U; u++) t[u] = sp[(size_t)u * WARP];
+          for (int e = 0; e < VEC; e++) acc[u][e] = gin_sdma_reduce::preOp(redOp, seed[u].e[e], nRanks);
+        int s = 1;
+        for (; s + 1 < nRanks; s += 2) {
+          const Pack* sa = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s)     + myBaseP + p0;
+          const Pack* sb = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1) + myBaseP + p0;
+          Pack ta[U], tb[U];
+          #pragma unroll
+          for (int u = 0; u < U; u++) ta[u] = sa[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++) tb[u] = sb[(size_t)u * WARP];
           #pragma unroll
           for (int u = 0; u < U; u++)
             #pragma unroll
-            for (int e = 0; e < VEC; e++) acc[u][e] = gin_sdma_reduce::preOp(redOp, t[u].e[e], nRanks);
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, ta[u].e[e], nRanks));
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, tb[u].e[e], nRanks));
         }
-        for (int s = 1; s < nRanks; s++) {
+        for (; s < nRanks; s++) {  // odd peer tail
           const Pack* sp = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s) + myBaseP + p0;
           Pack t[U];
           #pragma unroll
@@ -280,6 +321,14 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
             #pragma unroll
             for (int e = 0; e < VEC; e++)
               acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, t[u].e[e], nRanks));
+        }
+        // Prefetch source 0 for the next full tile; the loads overlap the output
+        // write below (and the back-edge into the next iteration's peer loads).
+        const size_t nb = wbase + gridStride;
+        if (nb + tile <= nPacks) {
+          const Pack* spn = src0Base + nb + (size_t)lane;
+          #pragma unroll
+          for (int u = 0; u < U; u++) seed[u] = spn[(size_t)u * WARP];
         }
         #pragma unroll
         for (int u = 0; u < U; u++) {
