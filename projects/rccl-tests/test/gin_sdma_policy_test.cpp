@@ -410,4 +410,43 @@ TEST(GinPutMaxBytes, AtSdma30BitLimit) {
   EXPECT_EQ(kGinPutMaxBytes % 32u, 0u);            // 32 B copy-length aligned
 }
 
+// ---------------------------- ReduceScatter (P2) ----------------------------
+
+TEST(ReduceScatterKernelTier, LadderSelection) {
+  // Compared against the per-rank output-slice bytes (count*sizeof(T)).
+  const size_t thr = kReduceScatterSdmaThresholdDefault;  // 256 KiB
+  // At/below the threshold -> LSA read-reduce.
+  EXPECT_EQ(reduceScatterKernelTier(1024, thr), RSTier::LSA);
+  EXPECT_EQ(reduceScatterKernelTier(thr, thr), RSTier::LSA);       // boundary inclusive
+  // Above the threshold -> put-partials GIN/SDMA + SM reduce.
+  EXPECT_EQ(reduceScatterKernelTier(thr + 1, thr), RSTier::Gin);
+  EXPECT_EQ(reduceScatterKernelTier(4u << 20, thr), RSTier::Gin);
+  // A forced-low threshold (env override to 0) pushes everything to GIN.
+  EXPECT_EQ(reduceScatterKernelTier(8, 0), RSTier::Gin);
+}
+
+TEST(ReduceScatterDevReqs, BarrierShapeAndGin) {
+  const int cta = 12;
+  DevReqs r = reduceScatterDevReqs(cta);
+  EXPECT_TRUE(r.supported);
+  EXPECT_TRUE(r.needsGin);
+  EXPECT_EQ(r.barrierCount, cta);
+  EXPECT_EQ(r.lsaBarrierCount, cta);
+  EXPECT_EQ(r.ginSignalCount, cta);
+}
+
+TEST(ReduceScatterScratchBytes, RoundsUpTo128) {
+  EXPECT_EQ(reduceScatterScratchBytes(0), 0u);         // no message -> no scratch
+  EXPECT_EQ(reduceScatterScratchBytes(128), 128u);     // already aligned
+  EXPECT_EQ(reduceScatterScratchBytes(1), 128u);       // rounds up to the 128 B unit
+  EXPECT_EQ(reduceScatterScratchBytes(129), 256u);
+  EXPECT_EQ(reduceScatterScratchBytes(4096), 4096u);
+  // The full per-rank send buffer (N * maxChunk) must fit.
+  EXPECT_GE(reduceScatterScratchBytes(1u << 20), (size_t)(1u << 20));
+}
+
+TEST(ReduceScatterDefaults, Threshold256KiB) {
+  EXPECT_EQ(kReduceScatterSdmaThresholdDefault, 262144u);  // 256 KiB/rank slice
+}
+
 }  // namespace

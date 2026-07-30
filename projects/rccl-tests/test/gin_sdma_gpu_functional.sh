@@ -25,10 +25,10 @@
 #   Gather    : LSA (<=256 KiB/rank chunk) -> GIN   (root fan-in;  OOP + in-place)
 #   SendRecv  : LSA (<=256 KiB message)    -> GIN   (ring; OOP only)
 #
-# Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall|scatter|gather|sendrecv> <bin_dir> <np> [launcher]
+# Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter> <bin_dir> <np> [launcher]
 set -euo pipefail
 
-COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv)}"
+COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter)}"
 BIN_DIR="${2:?build dir containing *_perf}"
 NP="${3:-8}"
 LAUNCHER="${4:-mpirun}"
@@ -40,6 +40,7 @@ case "$COLL" in
   scatter)    BIN="scatter_perf" ;;
   gather)     BIN="gather_perf" ;;
   sendrecv)   BIN="sendrecv_perf" ;;
+  reduce_scatter) BIN="reduce_scatter_perf" ;;
   *) echo "unknown collective: $COLL" >&2; exit 2 ;;
 esac
 
@@ -171,6 +172,49 @@ case "$COLL" in
         -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r 0 -z 0
       set +x
     fi
+    ;;
+  reduce_scatter)
+    # First reduction collective: two size tiers (LSA read-reduce small,
+    # put-partials + SM reduce large) plus an op dimension. Start at 128 B so the
+    # per-rank slice is a nonzero 16 B-aligned count (total/NP). Default op sweep
+    # covers sum; the small-size op-matrix pass exercises Apply for every
+    # supported op x type against the verifiable oracle.
+    RS_MIN=$(( NP * 16 )); [[ "$MIN_BYTES" -gt "$RS_MIN" ]] && RS_MIN="$MIN_BYTES"
+    for zp in 0 1; do
+      echo "=== [$COLL] sweep op=sum $( [[ $zp == 0 ]] && echo out-of-place || echo in-place ) ==="
+      set -x
+      "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+        "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+        "$EXE" -b "$RS_MIN" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+        -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o sum -z "$zp"
+      set +x
+    done
+    # Force the large put-partials + SM-reduce tier (default cutover is 256 KiB).
+    # Start at 1 MiB, not RS_MIN: forcing GIN at very small sizes hits a
+    # pre-existing GIN/SDMA cold-start hang common to ALL GIN collectives (a
+    # control run of alltoall_perf with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=0
+    # -b 128 hangs at the same intermittent rate), so tiny forced-GIN is out of
+    # scope here. The GIN large tier is stable at realistic slice sizes (>=16 KiB
+    # in stress runs); 1 MiB gives ample margin while exercising the same kernel.
+    RS_GIN_MIN="${GIN_SDMA_RS_GIN_MIN:-1048576}"
+    [[ "$RS_GIN_MIN" -lt "$RS_MIN" ]] && RS_GIN_MIN="$RS_MIN"
+    echo "=== [$COLL] GIN-tier forced (NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER=0, -b ${RS_GIN_MIN}) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER=0 \
+      "$EXE" -b "$RS_GIN_MIN" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o sum -z 0
+    set +x
+    # Op x type matrix on a small range (LSA tier): every supported op and every
+    # type must match the verifiable oracle. fp8 prod/mulsum are skipped by the
+    # driver; PreMulSum ("mulsum") is deferred (dispatch -> testNotImplemented).
+    echo "=== [$COLL] op x type matrix, small range (-o all -d all) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+      "$EXE" -b "$RS_MIN" -e 64K -f 4 -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o all -d all -z 0
+    set +x
     ;;
   sendrecv)
     # Ring send/recv; in-place is not validated for sendrecv (OOP only). The
