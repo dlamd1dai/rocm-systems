@@ -18,21 +18,25 @@
 
 // ReduceScatter (-D 3): the first reduction collective. Single tier -- balanced
 // LSA read-reduce for all sizes. Every rank reads its owned output slice
-// [rank*count] from EVERY peer's sendbuff (cached, ncclMemAlloc'd) via
-// ncclGetLsaPointer, folds the N contributions with gin_sdma_reduce (ascending
-// source-rank order, matching the verifier bit-for-bit) and writes its local
-// recvbuff. Balanced egress, no scratch/signals -- entry + exit LSA barrier only.
-// Reads are 128-bit packed (see GinReduceScatterKernel) for bandwidth.
+// [rank*count] directly from EVERY peer's sendbuff via ncclGetLsaPointer, folds
+// the N contributions with gin_sdma_reduce (ascending source-rank order, matching
+// the verifier bit-for-bit) and writes its local recvbuff. This is the same
+// direct-parallel-pull algorithm RCCL's symmetric ReduceScatter LD kernel uses.
+// Balanced egress, no scratch/signals -- entry + exit LSA barrier only. Reads are
+// 128-bit packed and pack-unrolled (see GinReduceScatterKernel) to keep the xGMI
+// read pipe full.
 //
 // An earlier size-hybrid design added a large-tier "put-partials + SM reduce"
-// path that staged into the GIN resource window; that window is UNCACHED
-// (dev_runtime.cc), so the SM read-back of the staged partials dominated the
-// kernel and capped it near the scalar-read ceiling (~95 GB/s). The vectorized
-// LSA read of peers' CACHED sendbuffs is ~2.5-3x faster at large sizes and needs
-// no scratch, so it now serves every size. The launch still carries the
-// (unused) sdmaThreshold/scratch args for ABI stability; scratch is no longer
-// registered. PreMulSum/mulsum is deferred (SPECIALIZE_REDUCE_KERNEL returns
-// nullptr -> testNotImplemented); fp8 prod is excluded there and by the
+// path that staged into the GIN resource window and SM-reduced it. That was slow
+// for two reasons: (1) the extra staging round-trip, and (2) the reduce read all
+// N partials from a SINGLE local buffer, whereas the direct LSA pull spreads the
+// reduce reads across N peers' memories / xGMI links in parallel. (Note: under a
+// HIP_VMM_UNCACHED_MEMORY build -- active here -- both the resource window and
+// ncclMemAlloc'd send/recv buffers are UNCACHED, so caching is not the
+// differentiator; read parallelism + load scheduling are.) The launch still
+// carries the (unused) sdmaThreshold/scratch args for ABI stability; scratch is
+// no longer registered. PreMulSum/mulsum is deferred (SPECIALIZE_REDUCE_KERNEL
+// returns nullptr -> testNotImplemented); fp8 prod is excluded there and by the
 // ReduceScatterRunTest skip.
 static ncclDevResourceHandle g_rsScratchHandle = 0;  // unused (no scratch); passed to kernel as 0
 #endif
@@ -134,25 +138,39 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // Single-node ReduceScatter (-D 3). count is the per-rank output-slice element
 // count; the send buffer holds nRanks such slices ([p*count]).
 // Single tier: balanced LSA read-reduce. Each rank reads its owned output slice
-// [rank*count] from EVERY peer's sendbuff (cached, ncclMemAlloc'd) via
-// ncclGetLsaPointer, folds the N contributions in ascending source-rank order
-// (matching verifiable.cu bit-for-bit via gin_sdma_reduce), and writes its local
-// recvbuff. Entry + exit LSA barrier only -- no scratch, signals, or GIN puts.
+// [rank*count] directly from EVERY peer's sendbuff via ncclGetLsaPointer, folds
+// the N contributions in ascending source-rank order (matching verifiable.cu
+// bit-for-bit via gin_sdma_reduce), and writes its local recvbuff. Entry + exit
+// LSA barrier only -- no scratch, signals, or GIN puts.
 //
-// Reads are 128-bit packed (Pack = 16 bytes = VEC elements). count is always a
-// multiple of 16/sizeof(T) (see ReduceScatterGetCollByteCount), so the owned
-// slice base (rank*count) and length tile exactly into 16B-aligned packs with no
-// scalar tail. This mirrors RCCL's vectorized LSA AllReduce kernel and is much
-// faster than a scalar element loop (wider coalesced loads + per-pack ILP).
+// Reads are 128-bit packed (Pack = 16 bytes = VEC elements). The load SCHEDULE is
+// chosen by total message size (both schedules fold identically, bit-for-bit):
+//   * < ~48 MiB: a register-light grid-stride loop (one pack/thread for maximum
+//     wave occupancy) that consumes peers TWO at a time -- both loads issued
+//     before either reduce, so consecutive source ranks overlap their xGMI read
+//     latency (mirrors UnrollPeers=2). This is the mid-size lever: it breaks past
+//     the ~175 GB/s serial-per-peer plateau (e.g. 16 MiB 175->225, 32 MiB
+//     194->261) without the register cost of pack-unrolling;
+//   * >= ~48 MiB: a WARP-STRIDED, pack-unrolled loop -- a warp owns a tile of
+//     U*WARP packs and issues U independent 128-bit loads per source rank at stride
+//     WARP (lane varies fastest, so every load stays fully coalesced) before
+//     reducing, keeping many xGMI reads outstanding. This mirrors the UnrollPacks
+//     technique in RCCL's symmetric ReduceScatter LD kernel and is ~1.7x the
+//     grid-stride loop at 2 GiB (~parity with the host symmetric path).
+// count is always a multiple of 16/sizeof(T) (see ReduceScatterGetCollByteCount) so
+// packs tile exactly with no scalar element tail; a short per-lane tail loop covers
+// a partial final warp-tile in the unrolled path.
+//
+// NOTE on the accumulator: low-precision types (half/bf16/fp8) MUST narrow back
+// to T on every pairwise step (gin_sdma_reduce::combine) to bit-match the
+// verifier, so acc[] stays in T rather than a wider float -- the reduction ALU is
+// not the bottleneck; the load schedule is.
 //
 // This replaces an earlier size-hybrid design whose large tier staged partials
-// via GIN put into the resource window and SM-reduced them. That window is
-// UNCACHED (dev_runtime.cc allocates it hipMemAllocationTypeUncached), so the SM
-// read-back dominated the kernel (~99% of time; ~144 GB/s vs HBM peak). Reading
-// peers' cached sendbuffs directly is strictly faster at every measured size and
-// removes the scratch round-trip, so one LSA tier now covers all sizes. The
-// sdmaThreshold/scratch launch args are retained for ABI compatibility but
-// unused.
+// via GIN put into the resource window and SM-reduced them; the direct LSA pull
+// avoids the staging round-trip and spreads reduce reads across N peers' links
+// (see the file-top note). The sdmaThreshold/scratch launch args are retained for
+// ABI compatibility but unused.
 template <typename T>
 __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
   (void)sdmaThresholdOverride;
@@ -166,29 +184,133 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
   lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
   // 128-bit packed read-reduce over the owned slice. In-place safe: each thread
-  // reads its own input element (source s == rank) before writing the same recv
-  // element, and each thread owns a disjoint pack index.
+  // reads its own input pack (source s == rank) into registers before writing the
+  // same recv pack, and each thread owns a disjoint set of pack indices.
   constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
   struct alignas(16) Pack { T e[VEC]; };
-  T* dst = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+  Pack* dstP = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);
   const size_t nPacks = count / (size_t)VEC;
   const size_t myBaseP = ((size_t)devComm.rank * count) / (size_t)VEC;  // pack idx of my slice
 
-  for (size_t pk = tid; pk < nPacks; pk += nthreads) {
-    Pack v = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];  // s == 0
-    T acc[VEC];
-    #pragma unroll
-    for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v.e[e], nRanks);
-    for (int s = 1; s < nRanks; s++) {
-      Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+  // Adaptive load schedule. Both branches are the identical direct LSA read-reduce
+  // (same ascending source-rank fold, bit-for-bit); they differ ONLY in how loads
+  // are scheduled:
+  //   * small/mid (< RS_UNROLL_MIN total bytes): a register-light grid-stride loop
+  //     (one 128-bit load per iter) that maximizes wave occupancy -- best latency
+  //     hiding when there isn't enough data to saturate xGMI via ILP alone.
+  //   * large: a warp-strided, pack-unrolled loop that keeps U independent 128-bit
+  //     loads per source rank outstanding (each still fully coalesced across the
+  //     warp), mirroring RCCL's symmetric LD UnrollPacks -- this saturates xGMI at
+  //     large sizes (~1.7x the grid-stride loop at 2 GiB, ~parity with host).
+  // The crossover (~48 MiB total) is where the unrolled path measurably overtakes
+  // the occupancy-bound loop on 8x MI355X; below it the grid-stride loop is faster.
+  constexpr size_t RS_UNROLL_MIN = (size_t)48 << 20;  // 48 MiB total message
+  const size_t totalBytes = count * (size_t)nRanks * sizeof(T);
+
+  if (totalBytes < RS_UNROLL_MIN) {
+    // ---- small/mid: high-occupancy grid-stride with 2-way PEER ILP ----
+    // One pack per thread (register-light -> max occupancy), but the peers are
+    // consumed two at a time: both loads are issued before either is reduced, so
+    // consecutive source ranks overlap their xGMI read latency (mirrors the
+    // UnrollPeers=2 of RCCL's symmetric LD kernel) without the register cost of
+    // pack-unrolling. Ascending source-rank fold order is preserved (s then s+1).
+    for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
+      Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
+      T acc[VEC];
       #pragma unroll
-      for (int e = 0; e < VEC; e++)
-        acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+      for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
+      int s = 1;
+      for (; s + 1 < nRanks; s += 2) {
+        Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, a.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, b.e[e], nRanks));
+      }
+      for (; s < nRanks; s++) {  // odd peer tail
+        Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+      }
+      Pack o;
+      #pragma unroll
+      for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+      dstP[pk] = o;
     }
-    Pack out;
-    #pragma unroll
-    for (int e = 0; e < VEC; e++) out.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
-    ((Pack*)dst)[pk] = out;
+  } else {
+    // ---- large: warp-strided pack-unrolled (U outstanding coalesced loads) ----
+    // U=4 matches RCCL's symmetric LD UnrollPacks and is the measured sweet spot
+    // (U=8 adds a few % at >=512 MiB but costs occupancy); fp8 (VEC16) drops to 2
+    // to bound the acc[] footprint. Within one load a warp's lanes read WARP
+    // consecutive packs; the U loads stride by WARP so lane varies fastest.
+    constexpr int U = (VEC <= 8) ? 4 : 2;
+    constexpr int WARP = 64;  // CDNA wavefront
+    const int lane = tid & (WARP - 1);
+    const size_t warpId = (size_t)(tid / WARP);
+    const size_t nWarps = (size_t)(nthreads / WARP);
+    const size_t tile = (size_t)U * WARP;
+    const size_t gridStride = nWarps * tile;
+
+    for (size_t wbase = warpId * tile; wbase < nPacks; wbase += gridStride) {
+      if (wbase + tile <= nPacks) {
+        // ---- fully coalesced tile: U outstanding 128-bit loads per source rank ----
+        const size_t p0 = wbase + (size_t)lane;  // this lane's first pack
+        T acc[U][VEC];
+        {  // source s == 0 seeds the accumulator (ascending source-rank order)
+          const Pack* sp = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0) + myBaseP + p0;
+          Pack t[U];
+          #pragma unroll
+          for (int u = 0; u < U; u++) t[u] = sp[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++) acc[u][e] = gin_sdma_reduce::preOp(redOp, t[u].e[e], nRanks);
+        }
+        for (int s = 1; s < nRanks; s++) {
+          const Pack* sp = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s) + myBaseP + p0;
+          Pack t[U];
+          #pragma unroll
+          for (int u = 0; u < U; u++) t[u] = sp[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, t[u].e[e], nRanks));
+        }
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+          Pack o;
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[u][e], nRanks);
+          dstP[p0 + (size_t)u * WARP] = o;
+        }
+      } else {
+        // ---- tail: partial warp-tile; each lane covers packs wbase+u*WARP+lane ----
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+          const size_t pk = wbase + (size_t)u * WARP + (size_t)lane;
+          if (pk >= nPacks) continue;
+          Pack v = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
+          T acc[VEC];
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v.e[e], nRanks);
+          for (int s = 1; s < nRanks; s++) {
+            Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+          }
+          Pack o;
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+          dstP[pk] = o;
+        }
+      }
+    }
   }
 
   lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
