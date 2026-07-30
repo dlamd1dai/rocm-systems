@@ -141,7 +141,7 @@ std::string rccl_output_file;
 std::string rccl_output_format;
 static int report_cputime = 0;
 static int report_timestamps = 0;
-static int deviceImpl = 0;
+int deviceImpl = 0;  // exposed (common.h) so per-coll RunTest can gate device-only op/type skips
 int unalign = 0;
 int memory_report = 0;
 
@@ -2208,10 +2208,10 @@ testResult_t run() {
   }
 
   fflush(stdout);
-  
+
   // RCCL: Call NCCL's refactored header function with RCCL-specific parameters
   writeResultHeader(report_cputime, report_timestamps, enable_out_of_place, enable_in_place, output_algo_proto_channels);
-  
+
   // RCCL: Initialize Reporter for file output (-Z flag)
   Reporter reporter(rccl_output_file, rccl_output_format);
 

@@ -420,6 +420,56 @@ GIN_SDMA_HD inline GatherTier gatherKernelTier(size_t chunkBytes,
   return GatherTier::Gin;
 }
 
+// ---------------------- ReduceScatter (Phase-2, reduction) ----------------------
+//
+// First reduction collective: adds an SM-side reduce (SDMA/LSA only move bytes).
+// Two-tier ladder keyed on the per-rank output-slice bytes (chunk = recvcount *
+// eltSize = sendBytes/N):
+//   * Small/med -- LSA read-reduce: every rank reads its owned slice [rank*chunk]
+//     from EVERY peer's sendbuff via ncclGetLsaPointer, folds with Apply<op,T>,
+//     writes recvbuff. Egress is balanced (each rank pulls N-1 remote slices), so
+//     no scratch and no signals -- just an entry+exit LSA barrier. This is the
+//     latency-optimal small path.
+//   * Large -- put-partials + SM reduce: each rank gin.puts its partial for peer
+//     p (its slice p) into p's scratch window at slot [srcRank*chunk]
+//     (SignalInc{0}); after waitSignal(base + N-1) each rank SM-reduces the N
+//     contributions in its scratch into recvbuff; flush. Egress balanced across
+//     all N ranks (the ReduceScatter roofline).
+//
+// Threshold default 256 KiB/rank slice (provisional; retune by measurement per
+// the design plan). Compared against the per-rank slice bytes.
+static constexpr size_t kReduceScatterSdmaThresholdDefault = 262144;  // 256 KiB/rank slice
+
+enum class RSTier { LSA, Gin };
+
+// Tier chosen by GinReduceScatterKernel: LSA read-reduce below/at the threshold,
+// else put-partials GIN/SDMA + SM reduce. Compared against the per-rank slice
+// bytes. Shared by the kernel and the host unit tests.
+GIN_SDMA_HD inline RSTier reduceScatterKernelTier(size_t chunkBytes,
+                                                  size_t sdmaThreshold) {
+  return (chunkBytes <= sdmaThreshold) ? RSTier::LSA : RSTier::Gin;
+}
+
+// devComm requirements for the -D 3 ReduceScatter kernel: one barrier +
+// lsaBarrier + signal per CTA, GIN required. The large tier additionally needs a
+// scratch window (see reduceScatterScratchBytes); that requirement is added
+// separately in the .cu (mirroring how the LL scratch is wired), so DevReqs here
+// carries only the barrier/signal shape.
+GIN_SDMA_HD inline DevReqs reduceScatterDevReqs(int deviceCtaCount) {
+  DevReqs r{deviceCtaCount, deviceCtaCount, deviceCtaCount, true, true};
+  return r;
+}
+
+// Bytes of scratch-window the large tier needs per rank: it stages N incoming
+// per-source partials, each up to the largest per-rank slice, so it needs the
+// full per-rank send-buffer worth (N * maxChunkBytes == maxSendBytesPerRank).
+// Sized once at the worst-case (max) message; rounded up to the 128 B
+// resource-buffer granularity. Zero maxSendBytes -> zero (no scratch).
+GIN_SDMA_HD inline size_t reduceScatterScratchBytes(size_t maxSendBytesPerRank) {
+  if (maxSendBytesPerRank == 0) return 0;
+  return (maxSendBytesPerRank + 127) & ~(size_t)127;
+}
+
 }  // namespace gin_sdma
 
 #endif  // GIN_SDMA_COLLECTIVE_POLICY_H_

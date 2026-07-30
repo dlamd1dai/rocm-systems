@@ -362,6 +362,10 @@ typedef enum { ncclCoarse        = 0,
                nccl_NUM_MTYPES   = 4 } ncclMemoryType_t;
 extern const char *test_memorytypes[nccl_NUM_MTYPES];
 extern int deviceCtaCount; // number of CTAs for device implementation
+extern int deviceImpl;     // selected -D device implementation (0 = host); lets per-coll
+                           // RunTest skip op/type combos unimplemented on the device path
+extern size_t maxBytes;    // largest message the run will exercise (from -e); used
+                           // by device-kernel scratch-window sizing (ReduceScatter)
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
@@ -526,6 +530,22 @@ testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, siz
   return testSuccess;
 }
 
+// Variant for the reduction collectives (ReduceScatter): forwards the LSA<->GIN
+// threshold, the reduction op (as an int -- the kernel switches on it via
+// gin_sdma_reduce), and a resource-buffer scratch-window handle for the large
+// put-partials tier. The handle is a small POD (uint32_t) assigned during
+// ncclDevCommCreate; 0 means no scratch was configured.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -538,6 +558,41 @@ testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, siz
    type == ncclFloat32 ? kernel<float> : \
    type == ncclFloat64 ? kernel<double> : \
    nullptr \
+  )
+
+// Op-aware dispatch for the reduction collectives (ReduceScatter). Unlike
+// SPECIALIZE_KERNEL (which forces op==ncclSum), this selects kernel<T> across the
+// full element-type set for any of the supported built-in reduction ops
+// (sum/prod/max/min/avg). PreMulSum ("mulsum", a created op handle >= ncclNumOps)
+// is NOT supported (deferred) -> nullptr -> testNotImplemented; fp8 prod is
+// excluded too (matches the ReduceScatterRunTest skip). The reduction op itself
+// is passed to the kernel at launch (runtime switch), so the template varies
+// only on T.
+#if HAVE_BF16
+#define RS_BF16_CASE(kernel, type) (type) == ncclBfloat16 ? kernel<hip_bfloat16> :
+#else
+#define RS_BF16_CASE(kernel, type)
+#endif
+#if HAVE_FP8
+#define RS_FP8_CASE(kernel, type) (type) == ncclFloat8e4m3 ? kernel<rccl_float8> : (type) == ncclFloat8e5m2 ? kernel<rccl_bfloat8> :
+#else
+#define RS_FP8_CASE(kernel, type)
+#endif
+#define SPECIALIZE_REDUCE_KERNEL(kernel, type, op) \
+  ( (int)(op) >= (int)ncclNumOps ? nullptr : \
+    (((op) == ncclProd && ((type) == ncclFloat8e4m3 || (type) == ncclFloat8e5m2)) ? nullptr : \
+     (type) == ncclInt8 ? kernel<int8_t> : \
+     (type) == ncclUint8 ? kernel<uint8_t> : \
+     (type) == ncclInt32 ? kernel<int32_t> : \
+     (type) == ncclUint32 ? kernel<uint32_t> : \
+     (type) == ncclInt64 ? kernel<int64_t> : \
+     (type) == ncclUint64 ? kernel<uint64_t> : \
+     (type) == ncclFloat16 ? kernel<half> : \
+     (type) == ncclFloat32 ? kernel<float> : \
+     (type) == ncclFloat64 ? kernel<double> : \
+     RS_BF16_CASE(kernel, type) \
+     RS_FP8_CASE(kernel, type) \
+     nullptr) \
   )
 #else
 template <typename F>
@@ -556,7 +611,12 @@ template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int flag) {
   return testNotImplemented;
 }
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle) {
+  return testNotImplemented;
+}
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
+#define SPECIALIZE_REDUCE_KERNEL(kernel, type, op) nullptr
 #endif
 
 typedef enum {
