@@ -67,7 +67,7 @@ in the 2026-07-27 scoping review.)
 | **Gather** | movement | ✅ (P1, `-D 3`) | **excellent** | each rank puts its chunk to root's slot |
 | **SendRecv** | movement | ✅ (P1, `-D 3`) | **excellent** | single put + waitSignal |
 | **AllToAllv** | movement | ❌ | **good** | AllToAll put loop with per-peer displacements/counts |
-| **ReduceScatter** | reduction | ❌ | **good** (SM reduce) | LSA read-reduce (small) / put-partials + SM reduce (large) |
+| **ReduceScatter** | reduction | ✅ (P2, `-D 3`) | **excellent** | single-tier direct LSA read-reduce; adaptive load schedule (peer-unroll grid-stride / pack+peer-unroll+prefetch). No scratch. See [reducescatter-gin-sdma-phase2.md](reducescatter-gin-sdma-phase2.md) |
 | **AllReduce** | reduction | ❌ | **good** (SM reduce) | ReduceScatter + AllGather (reuse AG large path) |
 | **Reduce** | reduction | ❌ | **good** (SM reduce) | ReduceScatter + Gather, or direct root-ingress reduce |
 | Barrier | control | (have sessions) | trivial | reuse barrier session |
@@ -458,7 +458,7 @@ basis table exactly like §4.3.1 of the broadcast plan.
 | Phase | Deliverable | Risk | Notes |
 |---|---|---|---|
 | **P1** ✅ | SendRecv, Scatter, Gather (`-D 3`) | low | **Landed** (2026-07-29). Pure movement; each adds an LL tiny tier. Scatter also gained a peer-interleaved LSA fan-out; thresholds tuned (Scatter 128 KiB; Gather/SendRecv LSA-always). |
-| **P2** | ReduceScatter (`-D 3`) | med | introduces `Apply<op,T>` + scratch window |
+| **P2** ✅ | ReduceScatter (`-D 3`) | med | **Landed** (2026-07-30). Final design is single-tier **direct LSA read-reduce** (no scratch/put-partials): each rank reads its output slice from every peer and folds locally, adaptive load schedule ported from the host symmetric LD kernel. 97–100% of host at ≥64 MiB (beats host 64–256 MiB). SDMA-scatter (>host ceiling) investigated + de-risked, not implemented — see [reducescatter-gin-sdma-phase2.md](reducescatter-gin-sdma-phase2.md). |
 | **P3** | **AllReduce** (`-D 3`) | med | RS + AG composition, two signals; **highest value** |
 | **P4** | Reduce (`-D 3`) | med | RS + Gather, or direct root-ingress |
 | **P5** | AllToAllv (`-D 3`) | med | needs device-visible displ/count arrays (Q3) |
