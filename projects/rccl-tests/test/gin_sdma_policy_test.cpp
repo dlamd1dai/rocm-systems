@@ -260,12 +260,23 @@ TEST(A2aDevReqs, PerDeviceImpl) {
   EXPECT_FALSE(r2.needsGin);
   EXPECT_EQ(r2.lsaBarrierCount, cta);
 
+  // F1: case 3 sizes the barrier/signal pools for the largest grid the
+  // size-adaptive LSA launch can request (max(deviceCtaCount, kA2aLsaMaxCtas)),
+  // so a small -V (here cta=8) still allocates kA2aLsaMaxCtas barriers and any
+  // adaptive grid uses only a subset.
+  const int r3Expected = cta > kA2aLsaMaxCtas ? cta : kA2aLsaMaxCtas;
   DevReqs r3 = a2aDevReqs(3, cta);
   EXPECT_TRUE(r3.supported);
   EXPECT_TRUE(r3.needsGin);
-  EXPECT_EQ(r3.barrierCount, cta);
-  EXPECT_EQ(r3.lsaBarrierCount, cta);
-  EXPECT_EQ(r3.ginSignalCount, cta);
+  EXPECT_EQ(r3.barrierCount, r3Expected);
+  EXPECT_EQ(r3.lsaBarrierCount, r3Expected);
+  EXPECT_EQ(r3.ginSignalCount, r3Expected);
+
+  // A large -V (> kA2aLsaMaxCtas) is honored as-is.
+  DevReqs r3big = a2aDevReqs(3, kA2aLsaMaxCtas + 16);
+  EXPECT_EQ(r3big.barrierCount, kA2aLsaMaxCtas + 16);
+  EXPECT_EQ(r3big.lsaBarrierCount, kA2aLsaMaxCtas + 16);
+  EXPECT_EQ(r3big.ginSignalCount, kA2aLsaMaxCtas + 16);
 
   DevReqs r4 = a2aDevReqs(4, cta);
   EXPECT_TRUE(r4.supported);
@@ -278,6 +289,23 @@ TEST(A2aDevReqs, PerDeviceImpl) {
   EXPECT_FALSE(r0.supported);
   DevReqs r5 = a2aDevReqs(5, cta);
   EXPECT_FALSE(r5.supported);
+}
+
+TEST(A2aLsaCtaCount, SizeLadder) {
+  const int cap = kA2aLsaMaxCtas;  // 64
+  // Ladder rungs (per-peer bytes): <=32K -> 8, <=64K -> 16, <=1M -> 32, else 64.
+  EXPECT_EQ(a2aLsaCtaCount(0, cap), 8);
+  EXPECT_EQ(a2aLsaCtaCount(32u * 1024, cap), 8);            // tiny boundary
+  EXPECT_EQ(a2aLsaCtaCount(32u * 1024 + 1, cap), 16);
+  EXPECT_EQ(a2aLsaCtaCount(64u * 1024, cap), 16);
+  EXPECT_EQ(a2aLsaCtaCount(64u * 1024 + 1, cap), 32);
+  EXPECT_EQ(a2aLsaCtaCount(256u * 1024, cap), 32);          // 2 MiB total: now 32 (was 16)
+  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024, cap), 32);         // 8 MiB total: top LSA rung
+  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024 + 1, cap), 64);     // beyond -> max
+  EXPECT_EQ(a2aLsaCtaCount(64u * 1024 * 1024, cap), 64);
+  // Cap clamps the ladder when maxCtas is below a rung.
+  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024 + 1, 16), 16);
+  EXPECT_EQ(a2aLsaCtaCount(0, 4), 4);
 }
 
 // -------------------- Scatter/Gather/SendRecv (movement) --------------------

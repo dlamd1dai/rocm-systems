@@ -516,6 +516,24 @@ testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t 
   return testSuccess;
 }
 
+// Like ...ThresholdLL, but the caller picks the grid (CTA count) per call instead
+// of using the global deviceCtaCount. Used by AllToAll's size-adaptive LSA tier
+// (F1): the CTA count grows with the per-peer chunk to scale xGMI egress like the
+// host RING's channel parallelism, while the SDMA tier launches a small grid. The
+// requested grid must be <= the allocated lsaBarrier count (see a2aDevReqs), which
+// is sized for kA2aLsaMaxCtas; launching fewer CTAs than allocated is always safe.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  return testSuccess;
+}
+
 // Variant that forwards both an LL handle and a trailing int flag as the last
 // two kernel arguments. Used by the Scatter GIN kernel to toggle its LSA-tier
 // root fan-out layout (peer-interleaved vs sequential) at runtime from an env.

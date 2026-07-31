@@ -60,11 +60,53 @@ static constexpr size_t kAllGatherLLMaxBytes           = 4096;          // 4 KiB
 // Per-rank chunk at/below which the LSA branch collapses to a single CTA.
 static constexpr size_t kAllGatherLsaSingleCtaMax      = 8192;          // 8 KiB/rank
 
-// AllToAll LSA<->GIN default; compared against the per-peer chunk bytes.
-static constexpr size_t kAllToAllSdmaThresholdDefault  = 262144;        // 256 KiB/peer
+// AllToAll LSA<->GIN default; compared against the per-peer chunk bytes. The
+// value is the *largest per-peer chunk the LSA tier still wins* (not the
+// crossover), matching the Scatter/Broadcast convention. Measured on 8x MI355X
+// (2026-07-31, F1 adaptive-CTA + F2 rotated schedule) via all-LSA vs all-SDMA
+// sweeps: LSA leads through 1 MiB/peer (8 MiB total, 176 vs 171 GB/s) and its
+// busbw then collapses (SM-copy can't scale the large chunk), while SDMA takes
+// over at 2 MiB/peer (16 MiB total, 244 vs 196 GB/s). So <=1 MiB/peer -> LSA,
+// >1 MiB/peer -> GIN-SDMA. Raised from the pre-F1/F2 256 KiB/peer default,
+// which left the 512 KiB-1 MiB/peer band (4-8 MiB total) on the slower tier.
+static constexpr size_t kAllToAllSdmaThresholdDefault  = 1048576;       // 1 MiB/peer
 static constexpr size_t kAllToAllLLMaxBytes            = 65536;         // 64 KiB/peer
 // AllToAll LL is OFF by default (unset env -> 0 cap).
 static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
+
+// AllToAll LSA-tier CTA parallelism (F1: size-adaptive CTA count). The direct
+// LSA scatter is a pure SM-copy tier whose xGMI-egress throughput scales with
+// the number of in-flight remote stores, i.e. the launched CTA count -- exactly
+// the "channel parallelism" the host RING gets from its ~32 channels. The
+// original fixed grid (-V 8) under-parallelizes: a -V sweep on 8x MI355X showed
+// a 2.85x busbw gain at a 4 MiB total message (44.6 -> 127 GB/s) going V8->V32,
+// with the optimal count growing with the per-peer chunk. a2aLsaCtaCount() maps
+// the per-peer chunk to that ladder; kA2aLsaMaxCtas caps it (and sizes the
+// lsaBarrier allocation so any adaptive grid is always <= the allocated
+// barriers, regardless of -V). The SDMA (large) tier only needs nRanks threads
+// to issue one put per peer, so it launches a small fixed grid (kA2aSdmaCtas):
+// more CTAs there only inflate the world-barrier cost without adding puts.
+static constexpr int kA2aLsaMaxCtas = 64;
+static constexpr int kA2aSdmaCtas   = 8;
+
+// Size-adaptive CTA count for the LSA (SM-copy) tier. Tuned from a dedicated
+// CTA sweep on 8x MI355X (2026-07-31, all-LSA, 128 B-8 MiB) that isolated the
+// grid size at fixed message size: 32 CTAs is the band-wide optimum. Fewer
+// starves the large per-peer chunk (8 CTAs collapses to ~1-3 GB/s at >=1 MiB
+// total; 16 lags 3-6% at 1-2 MiB and cliffs at >=4 MiB), while 48/64 regress a
+// few percent (barrier/incast overhead). So the whole >64 KiB/peer LSA band
+// uses 32; only truly tiny chunks stay latency-bound on a small grid. The >1 MiB
+// rung is effectively unreachable at the default 1 MiB/peer threshold (larger
+// chunks route to GIN-SDMA) but is kept as a safe cap for raised thresholds.
+// Result is clamped to maxCtas (== the allocated lsaBarrier count).
+GIN_SDMA_HD inline int a2aLsaCtaCount(size_t perPeerBytes, int maxCtas) {
+  int n;
+  if (perPeerBytes <= 32u * 1024)         n = 8;    // tiny: latency-bound
+  else if (perPeerBytes <= 64u * 1024)    n = 16;
+  else if (perPeerBytes <= 1024u * 1024)  n = 32;   // 128 KiB-1 MiB/peer: sweep optimum
+  else                                    n = 64;   // >1 MiB/peer (raised-threshold only)
+  return n < maxCtas ? n : maxCtas;
+}
 
 // SendRecv LL fast path: compile ceiling + default runtime cutover. Point-to-
 // point carries a single message per receiver (like Broadcast, not AllGather),
@@ -278,12 +320,19 @@ GIN_SDMA_HD inline DevReqs a2aDevReqs(int deviceImpl, int deviceCtaCount) {
     case 2:  // NvlAlltoAllKernelOptimized
       r.lsaBarrierCount = deviceCtaCount;
       return r;
-    case 3:  // GinHybridAlltoAllKernel
-      r.barrierCount = deviceCtaCount;
-      r.lsaBarrierCount = deviceCtaCount;
-      r.ginSignalCount = deviceCtaCount;
+    case 3: {  // GinHybridAlltoAllKernel
+      // Size the barrier/signal pools for the largest grid the size-adaptive
+      // launch (F1) can request (kA2aLsaMaxCtas), so any per-call adaptive grid
+      // uses only a subset of the allocated per-CTA-index barriers -- launching
+      // *fewer* CTAs than allocated is always safe (each CTA index syncs its
+      // cross-rank counterpart independently); launching more would overflow.
+      int lsaMax = deviceCtaCount > kA2aLsaMaxCtas ? deviceCtaCount : kA2aLsaMaxCtas;
+      r.barrierCount = lsaMax;
+      r.lsaBarrierCount = lsaMax;
+      r.ginSignalCount = lsaMax;
       r.needsGin = true;
       return r;
+    }
     case 4:  // HybridAlltoAllKernel: CTA 0 = GIN, CTAs 1..N = LSA
       r.barrierCount = 1;
       r.lsaBarrierCount = deviceCtaCount - 1;
