@@ -17,10 +17,12 @@ _run_test() {
 
 _trace_on() {
   [[ "${RCCL_GIN_ECHO:-1}" == 1 ]] && set -x
+  return 0
 }
 
 _trace_off() {
   [[ "${RCCL_GIN_ECHO:-1}" == 1 ]] && set +x
+  return 0
 }
 
 if [[ "${DOCKER_ULIMIT_MEMLOCK:-1}" != 0 ]]; then
@@ -465,6 +467,29 @@ if _should_run_test5; then
   TEST5_MODE="${TEST5_MODE:-d3}"
   TEST5_D4_CTA_COUNT="${TEST5_D4_CTA_COUNT:-${TEST5_CTA_COUNT:-8}}"
   TEST5_D3_CTA_COUNT="${TEST5_D3_CTA_COUNT:-8}"
+  # HIP-graph capture for the Test#5 measurement (-G/--cudagraph). Captures the
+  # timed iters loop once and replays it TEST5_CUDAGRAPH times, so per-iteration
+  # *host* kernel-launch overhead is removed from the reported GPU time. Smoke-
+  # tested on 8x MI355X: the GIN -D 3 kernel captures and validates cleanly
+  # (#wrong=0) across both the LSA (small) and SDMA (large) branches.
+  # Caveat: -G removes only host launch latency. The in-kernel opening cross-
+  # node barrier and closing waitSignal+flush execute on every replay and are
+  # still counted (isolating those needs device-side timing, out of scope here).
+  # Warmup must be >=1 so GIN connection setup / first-touch allocation happen
+  # BEFORE capture (a cudaMalloc during ThreadLocal stream capture is illegal).
+  # Set TEST5_CUDAGRAPH=0 to disable -G and fall back to launch-inclusive timing.
+  # Only Test#5 uses -G; Test#1 (host baseline) stays launch-inclusive by design.
+  TEST5_CUDAGRAPH="${TEST5_CUDAGRAPH:-4}"
+  TEST5_WARMUP="${TEST5_WARMUP:-5}"
+  TEST5_ITERS="${TEST5_ITERS:-20}"
+  TEST5_GRAPH_ARGS=()
+  if [[ "${TEST5_CUDAGRAPH}" != 0 ]]; then
+    TEST5_GRAPH_ARGS=(-G "${TEST5_CUDAGRAPH}")
+    if [[ "${TEST5_WARMUP}" == 0 ]]; then
+      echo "warning: TEST5_CUDAGRAPH>0 with TEST5_WARMUP=0 can fail graph capture (lazy alloc during capture); using -w 1" >&2
+      TEST5_WARMUP=1
+    fi
+  fi
   _a2a_gin() {  # $1=deviceImpl $2=ctaCount $3=minBytes $4=maxBytes
     ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
       mpirun -n "${NP}" ${MPI_OPT} \
@@ -479,15 +504,16 @@ if _should_run_test5; then
       -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
       "${TEST5_MPI_EXTRA[@]}" \
-      rccl-tests/alltoall_perf -b "$3" -e "$4" -f 2 -g 1 -R 2 -D "$1" -A 1 -V "$2"
+      rccl-tests/alltoall_perf -b "$3" -e "$4" -f 2 -g 1 -R 2 -D "$1" -A 1 -V "$2" \
+      -w "${TEST5_WARMUP}" -n "${TEST5_ITERS}" "${TEST5_GRAPH_ARGS[@]}"
   }
   case "${TEST5_MODE}" in
     d3)
-      echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=${TEST5_A2A_THRESHOLD}B/peer, SDMA above; V=${TEST5_D3_CTA_COUNT}, NCCL_GIN_TYPE=6) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=${TEST5_A2A_THRESHOLD}B/peer, SDMA above; V=${TEST5_D3_CTA_COUNT}, NCCL_GIN_TYPE=6, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
       _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     d4)
-      echo "=== Test#5: A2A, ${NP} gpus, GIN hybrid -D 4 LSA (V=${TEST5_D4_CTA_COUNT}, NCCL_GIN_TYPE=6) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GIN hybrid -D 4 LSA (V=${TEST5_D4_CTA_COUNT}, NCCL_GIN_TYPE=6, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
       _a2a_gin 4 "${TEST5_D4_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     *)
