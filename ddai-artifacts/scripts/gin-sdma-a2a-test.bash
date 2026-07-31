@@ -445,9 +445,10 @@ if _should_run_test5; then
   # Kernel-level LSA<->SDMA switch for the -D 3 size-hybrid (per-peer bytes).
   # Set explicitly so it takes precedence over the shared THRESHOLD=0 above
   # (which would otherwise force the kernel all-SDMA). Default matches the
-  # rccl-tests built-in default (262144 = 256K/peer = 2M total on 8 ranks).
-  # Set to 0 to force all-SDMA, or a huge value to force all-LSA (sweeps).
-  TEST5_A2A_THRESHOLD="${TEST5_A2A_THRESHOLD:-262144}"
+  # rccl-tests built-in default (2097152 = 2 MiB/peer = 16M total on 8 ranks,
+  # the F1/F2/F3-measured LSA<->SDMA crossover). Set to 0 to force all-SDMA, or
+  # a huge value to force all-LSA (sweeps).
+  TEST5_A2A_THRESHOLD="${TEST5_A2A_THRESHOLD:-2097152}"
   # Optional LSA-tier CTA-count override (F1 tuning knob): 0 = use the adaptive
   # a2aLsaCtaCount ladder (default), >0 = force that grid for the LSA tier.
   TEST5_A2A_LSA_CTAS="${TEST5_A2A_LSA_CTAS:-0}"
