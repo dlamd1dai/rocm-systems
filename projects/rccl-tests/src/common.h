@@ -534,6 +534,22 @@ testResult_t testLaunchDeviceKernelThresholdLLCtas(F kernel, void* sendbuff, siz
   return testSuccess;
 }
 
+// Like ...ThresholdLLCtas, but also forwards a trailing int (caller-picked grid +
+// an int flag). Used by AllToAll's LSA tier to select its cross-rank sync mode at
+// runtime (0 = LSA barriers, 1 = none [diagnostic ceiling], 2 = point-to-point
+// ready/done flags).
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLCtasFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int gridCtas, int flag, ncclDevResourceHandle_t flagBuf) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle, flag, flagBuf);
+  return testSuccess;
+}
+
 // Variant that forwards both an LL handle and a trailing int flag as the last
 // two kernel arguments. Used by the Scatter GIN kernel to toggle its LSA-tier
 // root fan-out layout (peer-interleaved vs sequential) at runtime from an env.
@@ -627,6 +643,10 @@ testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t 
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int flag) {
+  return testNotImplemented;
+}
+template <typename F, typename H, typename R>
+testResult_t testLaunchDeviceKernelThresholdLLCtasFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int gridCtas, int flag, R flagBuf) {
   return testNotImplemented;
 }
 template <typename F, typename H>

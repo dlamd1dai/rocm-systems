@@ -74,6 +74,22 @@ static constexpr size_t kAllToAllSdmaThresholdDefault  = 2097152;       // 2 MiB
 static constexpr size_t kAllToAllLLMaxBytes            = 65536;         // 64 KiB/peer
 // AllToAll LL is OFF by default (unset env -> 0 cap).
 static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
+// AllToAll LL-tier CTA count (multi-CTA barrier-free LL prototype for the small-
+// message tail). The single-CTA LL scatter/gather collapses above ~32 KiB total
+// because one CTA can't drive the xGMI inbox writes; splitting the per-peer chunk
+// across this many CTAs (each owning its own scratch block, indexed by blockIdx)
+// restores parallelism while keeping the barrier-free epoch/flag protocol. The LL
+// scratch is allocated for this many blocks; the tier launches this many CTAs.
+// Override at runtime (<= this max) with NCCL_GIN_ANVIL_A2A_LL_CTAS for sweeps.
+static constexpr int    kA2aLLCtas                     = 16;
+// AllToAll LSA-tier barrier-free completion (Option A): number of double-buffered
+// flag slots per (CTA, source rank). The direct 1-pass LSA copy beats host RING
+// but the two collective LSA barriers are the whole small-message gap; a per-call
+// point-to-point done-flag exchange (each CTA signals every peer once its slice
+// is written+fenced, then waits for all sources) replaces them. Epoch-tagged and
+// double-buffered so consecutive calls reuse distinct slots; AllToAll's mutual
+// coupling bounds cross-rank skew well below this depth.
+static constexpr int    kA2aFlagSlots                  = 4;
 
 // AllToAll LSA-tier CTA parallelism (F1: size-adaptive CTA count). The direct
 // LSA scatter is a pure SM-copy tier whose xGMI-egress throughput scales with

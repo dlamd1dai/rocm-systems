@@ -45,6 +45,27 @@
 static size_t g_a2aLLMaxBytes = 0;  // resolved from env at requirements time
 static ncclLLA2AHandle g_a2aLLHandle = {};
 static ncclDevResourceRequirements g_a2aLLReq = {};
+
+// Option A (barrier-free LSA completion) scratch: a per-rank flag inbox in the
+// resource window. Allocated only when NCCL_GIN_ANVIL_A2A_SYNC_MODE==2. Layout
+// per slab (uint64): [epoch[c]] for c in [0,kA2aLsaMaxCtas) then
+// [done[c][s][slot]] indexed (kA2aLsaMaxCtas + ((c*nRanks + s)*kA2aFlagSlots + slot)).
+static int g_a2aSyncMode = 0;                      // resolved from env at requirements time
+static ncclDevResourceHandle_t g_a2aFlagHandle = 0;
+static ncclDevResourceRequirements g_a2aFlagReq = {};
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+// System-scope release store / acquire load of a single 64-bit flag to/from a
+// peer's (or our own) resource-window inbox. System scope + release/acquire give
+// the cross-GPU ordering (data writes -> fence -> done flag; peer: acquire flag
+// -> data visible) without a collective barrier.
+__device__ __forceinline__ void a2aFlagStore(uint64_t* p, uint64_t v) {
+  __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ uint64_t a2aFlagLoad(uint64_t* p) {
+  return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+#endif
 #endif
 
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -106,11 +127,14 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
         reqs->lsaBarrierCount = dr.lsaBarrierCount;
         reqs->ginSignalCount = dr.ginSignalCount;
       }
-      // LL scratch for the tiny-message fast path (single CTA => nBlocks=1),
-      // opt-in via NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES (per-peer bytes; 0/unset =
-      // disabled, the measured-best default). Sized for the LSA team scattering
-      // up to the requested cap: a receiver holds nRanks source-chunks of
-      // (cap/8) u64 slots (same layout as AllGather).
+      // LL scratch for the tiny-message fast path (multi-CTA barrier-free LL:
+      // nBlocks=kA2aLLCtas, each CTA owns its own scratch block), opt-in via
+      // NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES (per-peer bytes; 0/unset = disabled).
+      // Each block is sized for the full LSA-team scatter: a receiver holds
+      // nRanks source-chunks of (cap/8) u64 slots (same layout as AllGather).
+      // Per-block over-provisioning (each CTA uses only its chunk slice) keeps
+      // the slot indexing identical to the single-CTA path and the scratch small
+      // (nBlocks * 2 * nRanks * cap/8 * 16 B ~ 33 MiB at the 64 KiB/peer cap).
       {
         g_a2aLLMaxBytes = gin_sdma::resolveLLCap(
             testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES"),
@@ -118,9 +142,25 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
         if (g_a2aLLMaxBytes > 0) {
           int llMaxElts = commProperties->nRanks * (int)(g_a2aLLMaxBytes / 8);
           int nSlots = ncclLLA2ACalcSlots(llMaxElts, /*maxEltSize=*/8);
-          ncclLLA2ACreateRequirement(/*nBlocks=*/1, nSlots, &g_a2aLLHandle, &g_a2aLLReq);
+          ncclLLA2ACreateRequirement(/*nBlocks=*/gin_sdma::kA2aLLCtas, nSlots, &g_a2aLLHandle, &g_a2aLLReq);
           g_a2aLLReq.next = reqs->resourceRequirementsList;
           reqs->resourceRequirementsList = &g_a2aLLReq;
+        }
+      }
+      // Option A: allocate the barrier-free completion flag inbox when sync mode 2
+      // is selected. Sized for kA2aLsaMaxCtas CTAs x nRanks sources x kA2aFlagSlots.
+      {
+        const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
+        g_a2aSyncMode = (e && *e) ? atoi(e) : 3;  // default: single exit barrier
+        if (g_a2aSyncMode == 2) {
+          size_t nFlags = (size_t)gin_sdma::kA2aLsaMaxCtas *
+                          (1 + (size_t)commProperties->nRanks * gin_sdma::kA2aFlagSlots);
+          memset(&g_a2aFlagReq, 0, sizeof(g_a2aFlagReq));
+          g_a2aFlagReq.bufferSize = nFlags * sizeof(uint64_t);
+          g_a2aFlagReq.bufferAlign = 16;
+          g_a2aFlagReq.outBufferHandle = &g_a2aFlagHandle;
+          g_a2aFlagReq.next = reqs->resourceRequirementsList;
+          reqs->resourceRequirementsList = &g_a2aFlagReq;
         }
       }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
@@ -326,7 +366,7 @@ __device__ size_t AlltoAllGetSdmaThreshold(struct ncclDevComm const& devComm) {
   return loadConst(&rsCtx->sdmaThreshold);
 }
 
-// LL (low-latency) AllToAll for tiny messages, single CTA. Unlike AllGather
+// LL (low-latency) AllToAll for tiny messages, MULTI-CTA. Unlike AllGather
 // (one chunk broadcast to all peers), AllToAll scatters a distinct chunk to
 // each peer, so this uses the LL A2A session's point-to-point send(): rank myR
 // sends its chunk destined for peer p into peer p's epoch-tagged scratch at the
@@ -335,8 +375,17 @@ __device__ size_t AlltoAllGetSdmaThreshold(struct ncclDevComm const& devComm) {
 // local recvbuff at [s*chunkU64 ..]. There is NO cross-rank recvbuff write and
 // NO barrier: cross-rank traffic is confined to the LL scratch and ordered
 // purely by the per-slot epoch tag (ncclLLA2ASession), so it is immune to the
-// initData recvbuff-memset race that a barrier-free direct-LSA copy would
-// suffer. Requires 8-byte-aligned per-peer chunks (guaranteed by the test's
+// initData recvbuff-memset race that a barrier-free direct-LSA copy would suffer.
+//
+// Multi-CTA: the single-CTA LL scatter/gather can't drive the xGMI inbox writes
+// fast enough above ~32 KiB total, so each CTA (blockIdx.x, gridDim.x total)
+// owns its own scratch block and processes the contiguous chunk slice
+// [cta*slice .. ) of every peer's chunk. The slot index keeps the *global*
+// element offset (myR*chunkU64 + e), so distinct blocks address disjoint slots
+// within their (over-provisioned) block and the layout matches the single-CTA
+// path exactly. Sender CTA c and receiver CTA c derive the same slice from
+// blockIdx.x, so the epoch/flag handshake stays consistent per block.
+// Requires 8-byte-aligned per-peer chunks (guaranteed by the test's
 // 16/eltSize base alignment).
 __device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
                                size_t chunkU64, struct ncclDevComm const& devComm, ncclTeam lsa,
@@ -345,22 +394,32 @@ __device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWind
   const int nthreads = blockDim.x;
   const int nR = lsa.nRanks;
   const int myR = lsa.rank;
+  const int cta = blockIdx.x;
+  const int nCtas = gridDim.x;
   const uint64_t* src = (const uint64_t*)ncclGetLocalPointer(sendwin, sendoffset);
   uint64_t* dst = (uint64_t*)ncclGetLocalPointer(recvwin, recvoffset);
 
-  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/0,
+  // This CTA's contiguous slice of every peer's per-peer chunk.
+  const size_t slice = (chunkU64 + (size_t)nCtas - 1) / (size_t)nCtas;
+  const size_t myStart = (size_t)cta * slice;
+  const size_t myLen = (myStart >= chunkU64) ? 0
+                       : ((chunkU64 - myStart < slice) ? (chunkU64 - myStart) : slice);
+
+  ncclLLA2ASession<ncclCoopCta> ll { ncclCoopCta(), devComm, lsa, llHandle, /*block=*/(uint32_t)cta,
                                      /*maxElts=*/(int)((size_t)nR * chunkU64) };
 
-  // Scatter: send my per-peer chunk to peer p, keyed by my (source) rank.
+  // Scatter my slice to peer p, keyed by my (source) rank + global element index.
   for (int p = 0; p < nR; p++) {
-    for (size_t j = tid; j < chunkU64; j += nthreads) {
-      ll.send(p, (int)((size_t)myR * chunkU64 + j), src[(size_t)p * chunkU64 + j]);
+    for (size_t j = tid; j < myLen; j += nthreads) {
+      const size_t e = myStart + j;
+      ll.send(p, (int)((size_t)myR * chunkU64 + e), src[(size_t)p * chunkU64 + e]);
     }
   }
-  // Gather every source rank's chunk-for-me out of my scratch into recvbuff.
+  // Gather every source rank's slice-for-me out of my scratch block into recvbuff.
   for (int s = 0; s < nR; s++) {
-    for (size_t j = tid; j < chunkU64; j += nthreads) {
-      dst[(size_t)s * chunkU64 + j] = ll.recv<uint64_t>((int)((size_t)s * chunkU64 + j));
+    for (size_t j = tid; j < myLen; j += nthreads) {
+      const size_t e = myStart + j;
+      dst[(size_t)s * chunkU64 + e] = ll.recv<uint64_t>((int)((size_t)s * chunkU64 + e));
     }
   }
   ll.endEpoch(ncclCoopCta());
@@ -380,7 +439,7 @@ __device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWind
 // independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
 // value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
   const size_t size = count * sizeof(T);  // per-peer chunk bytes
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -395,23 +454,79 @@ __global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset,
     // configured (nSlots>0), the per-peer chunk is 8-byte aligned, and it fits
     // the pre-sized slot count.
     if (gin_sdma::a2aLLEligible(size, llHandle.nSlots, devComm.nRanks, gin_sdma::kAllToAllLLMaxBytes)) {
-      if (blockIdx.x != 0) return;  // single CTA
+      // Multi-CTA: every launched CTA participates (one scratch block each).
       const size_t chunkU64 = size / 8;
       AlltoAllLLImpl(sendwin, sendoffset, recvwin, recvoffset, chunkU64, devComm, lsa, llHandle);
       return;
     }
 
-    /* small messages: direct LSA all-peers copy (all CTAs) */
+    /* small messages: direct LSA all-peers copy (all CTAs). a2aSyncMode selects
+     * the cross-rank sync:
+     *   3 = DEFAULT: single exit barrier only. The exit barrier both completes the
+     *       call (all ranks done writing before any returns) and guards the *next*
+     *       call's writes into this recvbuf, so a separate entry barrier is
+     *       redundant; the first call's memset race is covered by the one-time
+     *       connect/init sync. +9-17% busbw across the LSA band vs mode 0.
+     *   0 = the two LSA barriers (legacy: redundant entry barrier + exit barrier).
+     *   1 = NONE (diagnostic: barrier-free ceiling of the 1-pass copy; correct
+     *       only under the harness's external per-iteration rank sync).
+     *   2 = per-call point-to-point done-flag completion. Each CTA writes its
+     *       slice, fences (release, system scope), signals every peer one done
+     *       flag, then waits for all sources -> me. Correct, but measured ~= the
+     *       two-barrier cost: a 1-pass copy's completion is inherently a
+     *       cross-rank sync (barrier-free completion would need in-band flags,
+     *       i.e. a second pass). Kept as a documented diagnostic. */
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
-    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    if (a2aSyncMode == 0) lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     const int rank = devComm.rank, nRanks = devComm.nRanks;
     const int tid = threadIdx.x + blockDim.x * blockIdx.x;
     const int nthreads = blockDim.x * gridDim.x;
 
+    // Mode 2: read the per-CTA persistent epoch (raw+1 so epoch>=1 never matches
+    // a zero-initialized flag slot) and pick the double-buffer slot.
+    __shared__ uint64_t s_a2aEpoch;
+    uint64_t a2aEpoch = 0;
+    int a2aSlot = 0;
+    uint64_t* a2aMyFlags = nullptr;
+    if (a2aSyncMode == 2) {
+      a2aMyFlags = (uint64_t*)ncclGetResourceBufferLocalPointer(devComm, a2aFlagBuf);
+      if (threadIdx.x == 0) s_a2aEpoch = a2aMyFlags[blockIdx.x] + 1;
+      __syncthreads();
+      a2aEpoch = s_a2aEpoch;
+      a2aSlot = (int)(a2aEpoch % (uint64_t)gin_sdma::kA2aFlagSlots);
+    }
+
     AlltoAllVectorizedImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
 
-    lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    if (a2aSyncMode == 0 || a2aSyncMode == 3) {
+      // mode 3: exit barrier only (skip entry). One optimized team barrier per
+      // call provides both completion and the *next* call's readiness guard; the
+      // very first call's memset race is covered by the harness's initial sync.
+      lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+    } else if (a2aSyncMode == 2) {
+      // Publish this CTA's writes to system scope before signaling any done flag:
+      // syncthreads (all block writes complete) -> per-thread system fence ->
+      // syncthreads (all fences retired) so no done flag is stored before every
+      // thread's recvbuf writes are globally visible.
+      __syncthreads();
+      __threadfence_system();
+      __syncthreads();
+      const int maxCtas = gin_sdma::kA2aLsaMaxCtas;
+      const int SLOTS = gin_sdma::kA2aFlagSlots;
+      const size_t doneBase = (size_t)maxCtas;
+      // One lane per peer/source: lane l signals "I am done writing peer l" into
+      // peer l's inbox, then waits for "source l is done writing me" in my inbox.
+      if (threadIdx.x < nRanks) {
+        const int l = threadIdx.x;
+        uint64_t* peerFlags = (uint64_t*)ncclGetResourceBufferPeerPointer(devComm, a2aFlagBuf, lsa, l);
+        a2aFlagStore(peerFlags + doneBase + ((size_t)blockIdx.x * nRanks + rank) * SLOTS + a2aSlot, a2aEpoch);
+        uint64_t* mine = a2aMyFlags + doneBase + ((size_t)blockIdx.x * nRanks + l) * SLOTS + a2aSlot;
+        while (a2aFlagLoad(mine) < a2aEpoch) { /* spin */ }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) a2aMyFlags[blockIdx.x] = a2aEpoch;  // persist for next call
+    }
     return;
   }
 
@@ -591,7 +706,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         int gridCtas = (tier == gin_sdma::A2ATier::Gin)
                            ? gin_sdma::kA2aSdmaCtas
                            : (tier == gin_sdma::A2ATier::LL)
-                                 ? 1
+                                 ? gin_sdma::kA2aLLCtas
                                  : gin_sdma::a2aLsaCtaCount(perPeerBytes, gin_sdma::kA2aLsaMaxCtas);
         // Tuning override for the LSA tier grid (F1): NCCL_GIN_ANVIL_A2A_LSA_CTAS,
         // if >0, forces the LSA-tier CTA count (clamped to kA2aLsaMaxCtas) so the
@@ -605,7 +720,32 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
           if (lsaCtaOverride > 0)
             gridCtas = lsaCtaOverride < gin_sdma::kA2aLsaMaxCtas ? lsaCtaOverride : gin_sdma::kA2aLsaMaxCtas;
         }
-        TESTCHECK(testLaunchDeviceKernelThresholdLLCtas(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas));
+        // Prototype knob: sweep the multi-CTA LL grid without a rebuild (clamped
+        // to kA2aLLCtas, the number of scratch blocks allocated at init).
+        if (tier == gin_sdma::A2ATier::LL) {
+          static const int llCtaOverride = []() {
+            const char* e = getenv("NCCL_GIN_ANVIL_A2A_LL_CTAS");
+            return (e && *e) ? atoi(e) : 0;
+          }();
+          if (llCtaOverride > 0)
+            gridCtas = llCtaOverride < gin_sdma::kA2aLLCtas ? llCtaOverride : gin_sdma::kA2aLLCtas;
+        }
+        // LSA-tier cross-rank sync mode (NCCL_GIN_ANVIL_A2A_SYNC_MODE):
+        //   3 (DEFAULT) = single exit barrier (the exit barrier both completes the
+        //       call and guards the next call's writes; the first call's memset
+        //       race is covered by the one-time connect/init sync). +9-17% busbw
+        //       across the LSA band vs the legacy two-barrier path, #wrong==0.
+        //   0 = two LSA barriers (legacy: redundant entry barrier + exit barrier).
+        //   1 = none (diagnostic ceiling: barrier-free 1-pass copy; correct only
+        //       under an external per-iteration sync -- beats host by 10-21%).
+        //   2 = point-to-point done-flag completion (diagnostic: a correct per-call
+        //       barrier-free-completion attempt; measured ~= the two-barrier cost,
+        //       since a 1-pass copy's completion is inherently a cross-rank sync).
+        static const int a2aSyncMode = []() {
+          const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
+          return (e && *e) ? atoi(e) : 3;
+        }();
+        TESTCHECK(testLaunchDeviceKernelThresholdLLCtasFlag(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas, a2aSyncMode, g_a2aFlagHandle));
 #else
         TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr));
 #endif
