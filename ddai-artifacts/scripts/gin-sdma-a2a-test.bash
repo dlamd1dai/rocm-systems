@@ -448,10 +448,14 @@ if _should_run_test5; then
   # rccl-tests built-in default (262144 = 256K/peer = 2M total on 8 ranks).
   # Set to 0 to force all-SDMA, or a huge value to force all-LSA (sweeps).
   TEST5_A2A_THRESHOLD="${TEST5_A2A_THRESHOLD:-262144}"
+  # Optional LSA-tier CTA-count override (F1 tuning knob): 0 = use the adaptive
+  # a2aLsaCtaCount ladder (default), >0 = force that grid for the LSA tier.
+  TEST5_A2A_LSA_CTAS="${TEST5_A2A_LSA_CTAS:-0}"
   TEST5_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=${TEST5_A2A_THRESHOLD}"
+    -x "NCCL_GIN_ANVIL_A2A_LSA_CTAS=${TEST5_A2A_LSA_CTAS}"
   )
   # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=6), measured 8x MI355X
   # (2026-07-26), out-of-place:

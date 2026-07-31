@@ -588,6 +588,18 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
                            : (tier == gin_sdma::A2ATier::LL)
                                  ? 1
                                  : gin_sdma::a2aLsaCtaCount(perPeerBytes, gin_sdma::kA2aLsaMaxCtas);
+        // Tuning override for the LSA tier grid (F1): NCCL_GIN_ANVIL_A2A_LSA_CTAS,
+        // if >0, forces the LSA-tier CTA count (clamped to kA2aLsaMaxCtas) so the
+        // adaptive ladder can be swept without a rebuild. Does not affect the SDMA
+        // or LL tiers. Unset/<=0 keeps the a2aLsaCtaCount() ladder.
+        if (tier == gin_sdma::A2ATier::LSA) {
+          static const int lsaCtaOverride = []() {
+            const char* e = getenv("NCCL_GIN_ANVIL_A2A_LSA_CTAS");
+            return (e && *e) ? atoi(e) : 0;
+          }();
+          if (lsaCtaOverride > 0)
+            gridCtas = lsaCtaOverride < gin_sdma::kA2aLsaMaxCtas ? lsaCtaOverride : gin_sdma::kA2aLsaMaxCtas;
+        }
         TESTCHECK(testLaunchDeviceKernelThresholdLLCtas(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas));
 #else
         TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr));
