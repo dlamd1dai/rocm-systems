@@ -63,13 +63,14 @@ static constexpr size_t kAllGatherLsaSingleCtaMax      = 8192;          // 8 KiB
 // AllToAll LSA<->GIN default; compared against the per-peer chunk bytes. The
 // value is the *largest per-peer chunk the LSA tier still wins* (not the
 // crossover), matching the Scatter/Broadcast convention. Measured on 8x MI355X
-// (2026-07-31, F1 adaptive-CTA + F2 rotated schedule) via all-LSA vs all-SDMA
-// sweeps: LSA leads through 1 MiB/peer (8 MiB total, 176 vs 171 GB/s) and its
-// busbw then collapses (SM-copy can't scale the large chunk), while SDMA takes
-// over at 2 MiB/peer (16 MiB total, 244 vs 196 GB/s). So <=1 MiB/peer -> LSA,
-// >1 MiB/peer -> GIN-SDMA. Raised from the pre-F1/F2 256 KiB/peer default,
-// which left the 512 KiB-1 MiB/peer band (4-8 MiB total) on the slower tier.
-static constexpr size_t kAllToAllSdmaThresholdDefault  = 1048576;       // 1 MiB/peer
+// (2026-07-31, F1 adaptive-CTA + F2 rotated schedule + F3 per-CTA peer phase)
+// via all-LSA vs all-SDMA sweeps: with F3 running all 7 xGMI egress links
+// concurrently the LSA tier leads through 2 MiB/peer (16 MiB total, 251 vs 244
+// GB/s) and SDMA takes over at 4 MiB/peer (32 MiB total, 311 vs 265), scaling
+// to ~426 at 2 GiB. So <=2 MiB/peer -> LSA, >2 MiB/peer -> GIN-SDMA. Raised
+// from the pre-F3 1 MiB/peer default (F3 roughly doubled the large-chunk LSA
+// busbw, moving the crossover out one f2 step).
+static constexpr size_t kAllToAllSdmaThresholdDefault  = 2097152;       // 2 MiB/peer
 static constexpr size_t kAllToAllLLMaxBytes            = 65536;         // 64 KiB/peer
 // AllToAll LL is OFF by default (unset env -> 0 cap).
 static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
@@ -89,22 +90,22 @@ static constexpr size_t kAllToAllLLDefaultMaxBytes     = 0;
 static constexpr int kA2aLsaMaxCtas = 64;
 static constexpr int kA2aSdmaCtas   = 8;
 
-// Size-adaptive CTA count for the LSA (SM-copy) tier. Tuned from a dedicated
-// CTA sweep on 8x MI355X (2026-07-31, all-LSA, 128 B-8 MiB) that isolated the
-// grid size at fixed message size: 32 CTAs is the band-wide optimum. Fewer
-// starves the large per-peer chunk (8 CTAs collapses to ~1-3 GB/s at >=1 MiB
-// total; 16 lags 3-6% at 1-2 MiB and cliffs at >=4 MiB), while 48/64 regress a
-// few percent (barrier/incast overhead). So the whole >64 KiB/peer LSA band
-// uses 32; only truly tiny chunks stay latency-bound on a small grid. The >1 MiB
-// rung is effectively unreachable at the default 1 MiB/peer threshold (larger
-// chunks route to GIN-SDMA) but is kept as a safe cap for raised thresholds.
-// Result is clamped to maxCtas (== the allocated lsaBarrier count).
+// Size-adaptive CTA count for the LSA (SM-copy) tier. Tuned from CTA sweeps on
+// 8x MI355X (2026-07-31, all-LSA) at fixed message size. With F3 driving all 7
+// xGMI links concurrently the optimum shifted up vs the pre-F3 ladder: 32 CTAs
+// wins through 512 KiB/peer (<=4 MiB total: 32 beats 48 by ~15% at 4 MiB), and
+// 48 wins for the larger 1-2 MiB/peer chunks (8 MiB: 241 vs 234 @32; 16 MiB: 284
+// vs 218 @32, 265 @64) -- more links in flight help until 64 overshoots into
+// barrier/incast overhead. Truly tiny chunks stay latency-bound on a small grid.
+// Chunks >2 MiB/peer route to GIN-SDMA by default, so the top rung only serves
+// the 1-2 MiB/peer band (and caps any raised-threshold LSA run). Result is
+// clamped to maxCtas (== the allocated lsaBarrier count).
 GIN_SDMA_HD inline int a2aLsaCtaCount(size_t perPeerBytes, int maxCtas) {
   int n;
-  if (perPeerBytes <= 32u * 1024)         n = 8;    // tiny: latency-bound
-  else if (perPeerBytes <= 64u * 1024)    n = 16;
-  else if (perPeerBytes <= 1024u * 1024)  n = 32;   // 128 KiB-1 MiB/peer: sweep optimum
-  else                                    n = 64;   // >1 MiB/peer (raised-threshold only)
+  if (perPeerBytes <= 32u * 1024)          n = 8;    // tiny: latency-bound
+  else if (perPeerBytes <= 64u * 1024)     n = 16;
+  else if (perPeerBytes <= 512u * 1024)    n = 32;   // <=512 KiB/peer (<=4 MiB total)
+  else                                     n = 48;   // 1-2 MiB/peer: F3 sweep optimum
   return n < maxCtas ? n : maxCtas;
 }
 

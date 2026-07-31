@@ -183,14 +183,17 @@ template <typename T>
 __device__ void AlltoAllScalarImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
   T* sendPtr = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
 
+  // F2+F3 peer schedule: peer = (rank + blockIdx.x + pp) % nRanks. F2 rotates by
+  // rank so different ranks target distinct peers at the same step (no cross-rank
+  // xGMI incast). F3 adds blockIdx.x so different CTAs of the *same* rank are on
+  // different peers at the same instant -- otherwise every CTA marches through
+  // the peers in lock-step and the rank drives only one xGMI egress link at a
+  // time, cycling the 7 links serially; the phase shift spreads the CTAs across
+  // all peers so every link runs concurrently (host-RING channel parallelism).
+  // Coverage is unchanged: each thread still visits every peer once per offset.
   for (size_t offset = tid; offset < count; offset += nthreads) {
-    // F2: rotate the peer order by rank so that at each step every rank targets
-    // a *distinct* peer (peer=(rank+pp)%nRanks) -- this staggers the writes and
-    // removes the xGMI incast hotspot a naive 0..nRanks scan creates (all ranks
-    // hammering peer 0, then peer 1, ...), mirroring the host RING's rotated
-    // pairwise schedule.
     for (int pp = 0; pp < nRanks; pp++) {
-      int peer = (rank + pp) % nRanks;
+      int peer = (rank + blockIdx.x + pp) % nRanks;
       T value = sendPtr[peer * count + offset];
       T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, peer);
       recvPtr[rank * count + offset] = value;
@@ -228,9 +231,11 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
 
         #pragma unroll
         for (int p = 0; p < peersInGroup; p++) {
-          // F2: rotate by rank so different ranks target different peers at the
-          // same step (no xGMI incast); (peerBase+p) is a permutation over peers.
-          int peer = (rank + peerBase + p) % nRanks;
+          // F2+F3: rotate by rank (cross-rank de-incast) AND by blockIdx.x so
+          // different CTAs of this rank hit different peers concurrently, keeping
+          // all xGMI egress links busy instead of one at a time. See
+          // AlltoAllScalarImpl for the full rationale.
+          int peer = (rank + blockIdx.x + peerBase + p) % nRanks;
           TN* sendVecPtr = (TN*)(sendPtr + peer * count);
           TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + rank * count);
           TN values[UNROLL_FACTOR];
@@ -253,7 +258,7 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
     // handle remaining vectorized elements that didn't fit in aligned chunks
     for (size_t base_offset = aligned_vector_count + tid; base_offset < vector_count; base_offset += nthreads) {
       for (int pp = 0; pp < nRanks; pp++) {
-        int peer = (rank + pp) % nRanks;  // F2: rotated peer order
+        int peer = (rank + blockIdx.x + pp) % nRanks;  // F2+F3: rotated + per-CTA phase
         TN* sendVecPtr = (TN*)(sendPtr + peer * count);
         TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + rank * count);
         recvVecPtr[base_offset] = sendVecPtr[base_offset];
@@ -264,7 +269,7 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
     size_t scalar_start = vector_count * VECTOR_FACTOR;
     for (size_t offset = scalar_start + tid; offset < count; offset += nthreads) {
       for (int pp = 0; pp < nRanks; pp++) {
-        int peer = (rank + pp) % nRanks;  // F2: rotated peer order
+        int peer = (rank + blockIdx.x + pp) % nRanks;  // F2+F3: rotated + per-CTA phase
         T value = sendPtr[peer * count + offset];
         T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, peer);
         recvPtr[rank * count + offset] = value;
@@ -563,11 +568,11 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         // AlltoAll-specific LSA<->SDMA threshold. Compared against the per-peer
-        // chunk (count*sizeof(T) = total/nRanks). Default = 1 MiB/peer: on 8x
-        // MI355X (NCCL_GIN_TYPE=6, F1 adaptive-CTA + F2 rotated schedule) the
-        // direct LSA copy wins through 1 MiB/peer (8 MiB total) and GIN/SDMA wins
-        // from 2 MiB/peer (16 MiB total: 244 vs 196 GB/s, scaling to ~426)
-        // (measured 2026-07-31). Override with
+        // chunk (count*sizeof(T) = total/nRanks). Default = 2 MiB/peer: on 8x
+        // MI355X (NCCL_GIN_TYPE=6, F1 adaptive-CTA + F2 rotated + F3 per-CTA peer
+        // phase) the direct LSA copy wins through 2 MiB/peer (16 MiB total, 251 vs
+        // 244 GB/s) and GIN/SDMA wins from 4 MiB/peer (32 MiB total: 311 vs 265,
+        // scaling to ~426) (measured 2026-07-31). Override with
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", gin_sdma::kAllToAllSdmaThresholdDefault);

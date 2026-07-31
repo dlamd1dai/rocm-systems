@@ -293,18 +293,18 @@ TEST(A2aDevReqs, PerDeviceImpl) {
 
 TEST(A2aLsaCtaCount, SizeLadder) {
   const int cap = kA2aLsaMaxCtas;  // 64
-  // Ladder rungs (per-peer bytes): <=32K -> 8, <=64K -> 16, <=1M -> 32, else 64.
+  // F3-tuned ladder (per-peer bytes): <=32K -> 8, <=64K -> 16, <=512K -> 32, else 48.
   EXPECT_EQ(a2aLsaCtaCount(0, cap), 8);
   EXPECT_EQ(a2aLsaCtaCount(32u * 1024, cap), 8);            // tiny boundary
   EXPECT_EQ(a2aLsaCtaCount(32u * 1024 + 1, cap), 16);
   EXPECT_EQ(a2aLsaCtaCount(64u * 1024, cap), 16);
   EXPECT_EQ(a2aLsaCtaCount(64u * 1024 + 1, cap), 32);
-  EXPECT_EQ(a2aLsaCtaCount(256u * 1024, cap), 32);          // 2 MiB total: now 32 (was 16)
-  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024, cap), 32);         // 8 MiB total: top LSA rung
-  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024 + 1, cap), 64);     // beyond -> max
-  EXPECT_EQ(a2aLsaCtaCount(64u * 1024 * 1024, cap), 64);
+  EXPECT_EQ(a2aLsaCtaCount(512u * 1024, cap), 32);          // 4 MiB total: 32 optimum
+  EXPECT_EQ(a2aLsaCtaCount(512u * 1024 + 1, cap), 48);      // >512K/peer -> 48
+  EXPECT_EQ(a2aLsaCtaCount(2u * 1024 * 1024, cap), 48);     // 16 MiB total: top LSA rung
+  EXPECT_EQ(a2aLsaCtaCount(64u * 1024 * 1024, cap), 48);
   // Cap clamps the ladder when maxCtas is below a rung.
-  EXPECT_EQ(a2aLsaCtaCount(1024u * 1024 + 1, 16), 16);
+  EXPECT_EQ(a2aLsaCtaCount(512u * 1024 + 1, 16), 16);
   EXPECT_EQ(a2aLsaCtaCount(0, 4), 4);
 }
 
