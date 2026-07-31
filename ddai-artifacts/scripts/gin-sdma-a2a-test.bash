@@ -452,11 +452,23 @@ if _should_run_test5; then
   # Optional LSA-tier CTA-count override (F1 tuning knob): 0 = use the adaptive
   # a2aLsaCtaCount ladder (default), >0 = force that grid for the LSA tier.
   TEST5_A2A_LSA_CTAS="${TEST5_A2A_LSA_CTAS:-0}"
+  # Multi-CTA LL tier (small-message tail prototype): per-peer bytes cap to enable
+  # the barrier-free LL scatter/gather (0/unset = disabled -> direct-LSA copy),
+  # and an optional CTA-count override for that tier (0 = use kA2aLLCtas default).
+  TEST5_A2A_LL_MAX="${TEST5_A2A_LL_MAX:-0}"
+  TEST5_A2A_LL_CTAS="${TEST5_A2A_LL_CTAS:-0}"
+  # LSA-tier cross-rank sync mode: 3 = single exit barrier (default, +9-17% vs
+  # legacy), 0 = two LSA barriers (legacy), 1 = none (diagnostic ceiling, correct
+  # only under external sync), 2 = point-to-point done-flag completion (diagnostic).
+  TEST5_A2A_SYNC_MODE="${TEST5_A2A_SYNC_MODE:-3}"
   TEST5_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=${TEST5_A2A_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_A2A_LSA_CTAS=${TEST5_A2A_LSA_CTAS}"
+    -x "NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=${TEST5_A2A_LL_MAX}"
+    -x "NCCL_GIN_ANVIL_A2A_LL_CTAS=${TEST5_A2A_LL_CTAS}"
+    -x "NCCL_GIN_ANVIL_A2A_SYNC_MODE=${TEST5_A2A_SYNC_MODE}"
   )
   # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=6), measured 8x MI355X
   # (2026-07-26), out-of-place:
