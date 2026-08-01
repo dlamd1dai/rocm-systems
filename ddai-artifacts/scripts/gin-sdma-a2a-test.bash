@@ -461,6 +461,15 @@ if _should_run_test5; then
   # legacy), 0 = two LSA barriers (legacy), 1 = none (diagnostic ceiling, correct
   # only under external sync), 2 = point-to-point done-flag completion (diagnostic).
   TEST5_A2A_SYNC_MODE="${TEST5_A2A_SYNC_MODE:-3}"
+  # Device-side (in-kernel wall_clock64) timing (AICOMRCCL-1459, rocSHMEM method):
+  # 1 = print an extra "#[a2a-devtime]" line per size with the pure GPU
+  # device-function execution time (excludes host launch / teardown / graph
+  # overhead), reported alongside the normal graph/hipEvent numbers (report, not
+  # replace). LOOP/SKIP mirror rocSHMEM defaults (10/10); auto-reduced for very
+  # large per-peer chunks by the harness.
+  TEST5_A2A_DEVICE_TIMING="${TEST5_A2A_DEVICE_TIMING:-0}"
+  TEST5_A2A_DEVTIME_LOOP="${TEST5_A2A_DEVTIME_LOOP:-10}"
+  TEST5_A2A_DEVTIME_SKIP="${TEST5_A2A_DEVTIME_SKIP:-10}"
   TEST5_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
@@ -469,6 +478,9 @@ if _should_run_test5; then
     -x "NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=${TEST5_A2A_LL_MAX}"
     -x "NCCL_GIN_ANVIL_A2A_LL_CTAS=${TEST5_A2A_LL_CTAS}"
     -x "NCCL_GIN_ANVIL_A2A_SYNC_MODE=${TEST5_A2A_SYNC_MODE}"
+    -x "NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=${TEST5_A2A_DEVICE_TIMING}"
+    -x "NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP=${TEST5_A2A_DEVTIME_LOOP}"
+    -x "NCCL_GIN_ANVIL_A2A_DEVTIME_SKIP=${TEST5_A2A_DEVTIME_SKIP}"
   )
   # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=6), measured 8x MI355X
   # (2026-07-26), out-of-place:
