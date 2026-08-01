@@ -11,6 +11,14 @@ RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
 GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${TEST2_HOST_SO_SEARCH_DIRS:-/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}"
 ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
 
+# Shared measurement iteration counts applied to ALL tests (#1-#5) so the host,
+# rocSHMEM, and GIN paths are compared over the SAME warmup(skip)/timed(loop)
+# counts. WARMUP = discarded warmup iters (-w / device "skip"); ITERS = timed
+# iters (-n / device "loop"). For Test#5 device-timing these also feed the
+# in-kernel wall_clock64 skip/loop so its measurement window matches the others.
+A2A_WARMUP="${A2A_WARMUP:-5}"
+A2A_ITERS="${A2A_ITERS:-20}"
+
 _run_test() {
   [[ ",${RCCL_GIN_RUN_TESTS}," == *",$1,"* ]]
 }
@@ -345,7 +353,7 @@ _a2a_host_ring() {  # $1=min $2=max
     -x NCCL_GIN_TYPE=0 \
     -x NCCL_MIN_NCHANNELS="${TEST1_NCHANNELS}" \
     -x NCCL_MAX_NCHANNELS="${TEST1_NCHANNELS}" \
-    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
 }
 _a2a_host_ce() {  # $1=min $2=max
   ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
@@ -356,7 +364,7 @@ _a2a_host_ce() {  # $1=min $2=max
     -x NCCL_GIN_ENABLE=0 \
     -x NCCL_GIN_TYPE=0 \
     -x NCCL_CTA_POLICY=ZERO \
-    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
 }
 
 # --- UT: GIN-SDMA host policy unit tests (no GPU); hard preflight gate ---
@@ -416,7 +424,7 @@ if _run_test 2; then
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=2 \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
   _trace_off
 fi
 
@@ -432,7 +440,7 @@ if _should_run_test4; then
     -x ROCSHMEM_SDMA_ENABLED=1 \
     -x NCCL_GIN_ENABLE=1 \
     -x NCCL_GIN_TYPE=5 \
-    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
   _trace_off
 fi
 
@@ -461,15 +469,20 @@ if _should_run_test5; then
   # legacy), 0 = two LSA barriers (legacy), 1 = none (diagnostic ceiling, correct
   # only under external sync), 2 = point-to-point done-flag completion (diagnostic).
   TEST5_A2A_SYNC_MODE="${TEST5_A2A_SYNC_MODE:-3}"
-  # Device-side (in-kernel wall_clock64) timing (AICOMRCCL-1459, rocSHMEM method):
-  # 1 = print an extra "#[a2a-devtime]" line per size with the pure GPU
-  # device-function execution time (excludes host launch / teardown / graph
-  # overhead), reported alongside the normal graph/hipEvent numbers (report, not
-  # replace). LOOP/SKIP mirror rocSHMEM defaults (10/10); auto-reduced for very
-  # large per-peer chunks by the harness.
+  # Device-side (in-kernel wall_clock64) timing (AICOMRCCL-1459, rocSHMEM method).
+  # Reports the pure GPU device-function execution time (excludes host launch /
+  # teardown / graph overhead). Modes:
+  #   0 = off (default).
+  #   1 = augment: normal graph/hipEvent run PLUS an extra "#[a2a-devtime]" line.
+  #   2 = device-time-only: skip the graph/hipEvent timed loop for the
+  #       out-of-place pass and report the device time as THE metric (warmup +
+  #       datacheck still run for #wrong). Fastest, cleanest single number.
+  # LOOP/SKIP mirror rocSHMEM defaults (10/10); auto-reduced for large chunks.
   TEST5_A2A_DEVICE_TIMING="${TEST5_A2A_DEVICE_TIMING:-0}"
-  TEST5_A2A_DEVTIME_LOOP="${TEST5_A2A_DEVTIME_LOOP:-10}"
-  TEST5_A2A_DEVTIME_SKIP="${TEST5_A2A_DEVTIME_SKIP:-10}"
+  # Default the device-timing skip/loop to the shared harness counts so Test#5's
+  # in-kernel measurement window matches the -w/-n used by Test#1-#4.
+  TEST5_A2A_DEVTIME_LOOP="${TEST5_A2A_DEVTIME_LOOP:-${A2A_ITERS}}"
+  TEST5_A2A_DEVTIME_SKIP="${TEST5_A2A_DEVTIME_SKIP:-${A2A_WARMUP}}"
   TEST5_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
@@ -509,8 +522,8 @@ if _should_run_test5; then
   # Set TEST5_CUDAGRAPH=0 to disable -G and fall back to launch-inclusive timing.
   # Only Test#5 uses -G; Test#1 (host baseline) stays launch-inclusive by design.
   TEST5_CUDAGRAPH="${TEST5_CUDAGRAPH:-4}"
-  TEST5_WARMUP="${TEST5_WARMUP:-5}"
-  TEST5_ITERS="${TEST5_ITERS:-20}"
+  TEST5_WARMUP="${TEST5_WARMUP:-${A2A_WARMUP}}"
+  TEST5_ITERS="${TEST5_ITERS:-${A2A_ITERS}}"
   TEST5_GRAPH_ARGS=()
   if [[ "${TEST5_CUDAGRAPH}" != 0 ]]; then
     TEST5_GRAPH_ARGS=(-G "${TEST5_CUDAGRAPH}")
