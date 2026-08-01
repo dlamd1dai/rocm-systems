@@ -803,10 +803,24 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   Barrier(args);
 
+  // Device-time-only mode (NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=2): for collectives
+  // that provide a device-timing hook, skip the host/graph timed loop entirely
+  // and report the in-kernel wall_clock64 measurement as the metric. Warmup and
+  // datacheck still run (correctness). Mode 1 keeps the normal timed loop and
+  // augments with an extra line; mode 0 is off.
+  int devTimeMode = 0;
+  if (deviceImpl != 0 && args->collTest->deviceTime != nullptr) {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
+    devTimeMode = (e && *e) ? atoi(e) : 0;
+  }
+  // Device-time-only applies to the out-of-place pass (the reported gin-sdma
+  // metric). The in-place pass keeps normal timing so its column stays valid.
+  const bool deviceOnly = (devTimeMode == 2) && (in_place == 0);
+
 #if HIP_VERSION >= 50221310
   std::vector<cudaGraph_t> graphs(args->nGpus);
   std::vector<cudaGraphExec_t> graphExec(args->nGpus);
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     // Begin cuda graph capture
     for (int i=0; i<args->nGpus; i++) {
       // Thread local mdoe is needed for:
@@ -820,16 +834,18 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   // Performance Benchmark
   timer tim;
-  for (int iter = 0; iter < iters; iter++) {
-    if (agg_iters>1) NCCLCHECK(ncclGroupStart());
-    for (int aiter = 0; aiter < agg_iters; aiter++) {
-      TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
+  if (!deviceOnly) {
+    for (int iter = 0; iter < iters; iter++) {
+      if (agg_iters>1) NCCLCHECK(ncclGroupStart());
+      for (int aiter = 0; aiter < agg_iters; aiter++) {
+        TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
+      }
+      if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
     }
-    if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
   }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     // HIP (and CUDA) graph limitation: in single-process multi-GPU mode (-g N),
     // graph nodes are associated with the calling thread's current device at
     // capture time, not the stream's device. RCCL internally calls cudaSetDevice()
@@ -890,10 +906,19 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   double deltaSec = tim.elapsed();
   deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
-  Allreduce(args, &deltaSec, average);
+  if (!deviceOnly) Allreduce(args, &deltaSec, average);
+
+  if (deviceOnly) {
+    // The reported metric is the in-kernel wall_clock64 device latency
+    // (per iteration, max across ranks), measured by the collective's hook.
+    double deviceDeltaSec = 0.0;
+    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, &deviceDeltaSec));
+    deltaSec = deviceDeltaSec;
+    cputimeSec = deviceDeltaSec;
+  }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     //destroy cuda graph
     for (int i=0; i<args->nGpus; i++) {
 #ifdef __HIP_PLATFORM_AMD__
@@ -996,12 +1021,11 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   args->bw[0] += busBw;
   args->bw_count[0]++;
 
-  // Optional augmented device-side timing (in-kernel wall_clock64). Runs once
-  // per size, out-of-place only, and only when the collective provides the hook
-  // and NCCL_GIN_ANVIL_A2A_DEVICE_TIMING is set. It prints an extra line and
-  // does not touch the numbers reported above (report, not replace).
-  if (in_place == 0 && deviceImpl != 0 && args->collTest->deviceTime != nullptr) {
-    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place));
+  // Mode 1 (augment): print an extra device-only line alongside the normal
+  // graph/hipEvent numbers above. Mode 2 already reported device time as THE
+  // metric before getBw, so no extra line here.
+  if (in_place == 0 && devTimeMode == 1) {
+    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, nullptr));
   }
   return testSuccess;
 }

@@ -809,10 +809,12 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 // the (skip+loop) steady-state collectives with the GPU wall clock, reduces the
 // grid busy window (min start .. max end over CTAs) and the slowest rank (MPI
 // MAX), and prints an augmented line. It does NOT alter the graph/hipEvent
-// numbers reported by BenchTime (report, not replace). rocSHMEM defaults:
-// loop=10, skip=10, auto-reduced for very large per-peer chunks.
+// numbers reported by BenchTime (report, not replace). loop/skip come from
+// NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP/_SKIP (the harness sets these to the same
+// -w/-n counts used by every other test); auto-reduce for very large chunks is
+// opt-in via NCCL_GIN_ANVIL_A2A_DEVTIME_AUTOREDUCE=1.
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(A2A_HAVE_LL)
-testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
+testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
   static const int devTiming = []() {
     const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
     return (e && *e) ? atoi(e) : 0;
@@ -838,11 +840,20 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
     return (e && *e) ? atoi(e) : 3;
   }();
 
-  // Auto-reduce iteration counts for very large chunks so the timed run stays
-  // bounded (the per-call copy time dominates; a handful of iters suffices).
+  // By default use the exact skip/loop counts at every size so the device-timing
+  // measurement window matches the host tests' -w/-n (same loop/skip across
+  // Test#1-#5). Opt in to auto-reducing iteration counts for very large chunks
+  // (bounded runtime; per-call copy dominates) via
+  // NCCL_GIN_ANVIL_A2A_DEVTIME_AUTOREDUCE=1.
+  static const int autoReduce = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVTIME_AUTOREDUCE");
+    return (e && *e) ? atoi(e) : 0;
+  }();
   int loop = loopEnv, skip = skipEnv;
-  if (perPeerBytes >= (size_t)64 * 1024 * 1024) { loop = loop < 2 ? loop : 2; skip = skip < 1 ? skip : 1; }
-  else if (perPeerBytes >= (size_t)8 * 1024 * 1024) { loop = loop < 4 ? loop : 4; skip = skip < 2 ? skip : 2; }
+  if (autoReduce) {
+    if (perPeerBytes >= (size_t)64 * 1024 * 1024) { loop = loop < 2 ? loop : 2; skip = skip < 1 ? skip : 1; }
+    else if (perPeerBytes >= (size_t)8 * 1024 * 1024) { loop = loop < 4 ? loop : 4; skip = skip < 2 ? skip : 2; }
+  }
 
   // GPU fixed-frequency wall-clock rate (kHz), queried once.
   static int wallClkRateKhz = 0;
@@ -922,6 +933,16 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
   MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 #endif
 
+  // Mode 2 (device-time-only): hand the per-iteration latency (seconds) back to
+  // BenchTime, which reports it as THE time/busbw metric on the normal result
+  // line. Stay silent here so that line is not split (the preamble is already
+  // printed and the body is appended right after this returns).
+  if (outDeltaSec != nullptr) {
+    *outDeltaSec = devUs * 1.0e-6;
+    return testSuccess;
+  }
+
+  // Mode 1 (augment): print the extra device-only line next to the graph numbers.
   if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
     double sec = devUs * 1.0e-6;
     double algBw = (double)(perPeerBytes * (size_t)nRanksGlobal) / 1.0e9 / sec;
@@ -933,7 +954,7 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
   return testSuccess;
 }
 #else
-testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
+testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
   return testSuccess;  // device API / LL path not available in this build
 }
 #endif
