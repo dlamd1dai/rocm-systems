@@ -804,7 +804,12 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
     // ===== Variant A: direct-LSA read-reduce RS, then GIN-put AG =====
     const uint64_t sigBase = gin.readSignal(sig);   // baseline BEFORE the barrier (no puts yet)
     ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+    // Drain (Put|Get), NOT Relaxed: with up to 16 concurrent GIN CTAs per launch the
+    // A2A single-CTA Relaxed(=None, no drain) pattern lets SDMA/GIN state accumulate
+    // across a dense sweep until the engine hangs. A draining entry barrier quiesces
+    // the prior launch's residual puts before this launch starts.
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed,
+             ncclGinFenceLevel::Put | ncclGinFenceLevel::Get);
 
     // RS: reduce my tile from every peer's sendbuf into my recvbuf.
     arReduceTileLsa<T>(sendwin, sendoffset, recvwin, recvoffset, tBeg, tEnd, nRanks, redOp);
@@ -837,7 +842,8 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
     // linked into all_reduce_perf (anvil-SDMA only). This matches the proven A2A
     // and variant-A path exactly.
     ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed,
+             ncclGinFenceLevel::Put | ncclGinFenceLevel::Get);
   }
   // RS phase 1a: CTA k sends tile k of EACH peer p's slice (from my sendbuf) into
   // p's scratch slot [rank*stride + (tile offset within p's slice)].
@@ -871,7 +877,8 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   const uint64_t agBase = gin.readSignal(sig);
   {
     ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed,
+             ncclGinFenceLevel::Put | ncclGinFenceLevel::Get);
   }
   if (tEnd > tBeg && threadIdx.x == 0) {
     const size_t off = recvoffset + tBeg * sizeof(T);
