@@ -553,9 +553,22 @@ GIN_SDMA_HD inline size_t reduceScatterScratchBytes(size_t maxSendBytesPerRank) 
 //       (A) direct-LSA read-reduce RS (reuses the ReduceScatter path) + GIN AG;
 //       (B) put-partials RS into the resource-window scratch + SM reduce + AG.
 // The tier compares TOTAL message bytes (AllReduce operates on the whole buffer,
-// unlike ReduceScatter's per-rank slice). Threshold provisional; retune by
-// measurement per the design plan.
-static constexpr size_t kAllReduceSdmaThresholdDefault = 262144;  // 256 KiB total (provisional)
+// unlike ReduceScatter's per-rank slice). Default measured on 8x MI355X
+// (2026-08-01, float sum, out-of-place): the one-shot direct-LSA read-reduce wins
+// up to ~4 MiB total (e.g. 4M: ~125 us one-shot vs ~168 us two-shot), and the
+// two-shot ReduceScatter+AllGather (which moves only 1/N of the volume per rank)
+// wins above (8M: ~186 us two-shot vs ~231 us one-shot). Crossover ~5-6 MiB; 4 MiB
+// keeps one-shot for the sizes it wins and hands larger OOP to two-shot. In-place
+// always uses two-shot regardless of this threshold.
+static constexpr size_t kAllReduceSdmaThresholdDefault = 4194304;  // 4 MiB total (measured)
+
+// Two-shot (large/in-place) CTA cap. The two-shot path issues a PER-CTA world GIN
+// barrier + AllGather puts; on 8x MI355X with NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 a
+// dense sweep at -V 32 deadlocks (cumulative GIN/SDMA resource pressure from 32
+// concurrent per-CTA barriers/puts), while -V 8 and -V 16 sweep cleanly to 128 MiB.
+// The two-shot grid is therefore capped to this many CTAs (extra CTAs return
+// early); the one-shot / LSA tiers are unaffected and keep the full launch grid.
+static constexpr int kAllReduceTwoShotMaxCtas = 16;
 
 enum class ARTier { LSA, Gin };
 

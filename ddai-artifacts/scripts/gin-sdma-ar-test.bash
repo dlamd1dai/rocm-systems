@@ -47,10 +47,13 @@ DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
 HOST_RANKS="${HOST_RANKS:-0}"
 GIN_RANKS="${GIN_RANKS:-2}"
-# Device (-D 5) knobs. DEVICE_CTA_COUNT (-V) also sets the per-CTA GIN signal
-# count the two-shot path needs (one signal per CTA); 32 mirrors the RS default.
-# NUM_CHANNELS: keep 1 (extra SDMA queues give no gain and can deadlock the GIN
-# put tier at chan>=2).
+# Device (-D 5) knobs. DEVICE_CTA_COUNT (-V) sets the launch grid the one-shot /
+# LSA tiers use and the per-CTA GIN signal count requested; 32 mirrors the RS
+# default. The two-shot (large/in-place) path internally caps its grid to
+# kAllReduceTwoShotMaxCtas (16) regardless of -V: at -V 32 its dense per-CTA world
+# barrier + AllGather puts deadlock on 8x MI355X (NUM_CHANNELS=1), while <=16 is
+# stable to 128 MiB. NUM_CHANNELS: keep 1 (extra SDMA queues give no gain and can
+# deadlock the GIN put tier at chan>=2).
 DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-32}"
 NUM_CHANNELS="${NUM_CHANNELS:-1}"
 FACTOR="${FACTOR:-2}"

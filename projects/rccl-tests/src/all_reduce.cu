@@ -785,8 +785,13 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   }
 
   // ---- TWO-SHOT (large OR in-place): per-CTA self-contained RS + AG.
-  const int nCTA = gridDim.x;
+  // Cap the two-shot grid: the per-CTA world GIN barrier + AllGather puts deadlock
+  // under a dense sweep at high CTA counts (see kAllReduceTwoShotMaxCtas). CTAs
+  // beyond the cap return before touching GIN, so no rank ever waits on their
+  // (never-issued) barrier/signal slots; tiling/accounting all use the capped nCTA.
+  const int nCTA = min((int)gridDim.x, gin_sdma::kAllReduceTwoShotMaxCtas);
   const int cta = blockIdx.x;
+  if (cta >= nCTA) return;
   const size_t strideBytes = gin_sdma::allReduceSliceStride(msgBytes, nRanks);
   const size_t mySliceOffElt = ((size_t)rank * strideBytes) / sizeof(T);
   size_t tBeg, tEnd; arTile<T>(msgBytes, strideBytes, rank, cta, nCTA, tBeg, tEnd);
