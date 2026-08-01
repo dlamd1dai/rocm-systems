@@ -265,8 +265,11 @@ ENV RCCL_INSTALL_PREFIX=${WORKDIR}/rccl
 # device kernels across the full size range. Broadcast has no direct/copy fast path so it always
 # needs the ring kernel; AllGather works small/medium via rcclDirectAllGather but falls through
 # to the ring kernel at large sizes (~>64M) where it would otherwise fault (ncclDevFuncId
-# not found for coll:2). Override at build time with --build-arg ONLY_FUNCS="..." (empty = all).
-ARG ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather"
+# not found for coll:2). "AllReduce" is included so the AllReduce host baseline
+# (all_reduce_perf -D 0, gin-sdma-ar-test.bash AR-C1) has its device kernels; the GIN -D 5
+# path uses the custom kernel and does not need it. Override at build time with
+# --build-arg ONLY_FUNCS="..." (empty = all).
+ARG ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce"
 ENV ONLY_FUNCS=${ONLY_FUNCS}
 RUN if [ "${USE_LOCAL_SRC}" = "1" ]; then \
       [ -d /tmp/local/projects/rccl ]       || { echo "ERROR: projects/rccl not in build context";       exit 1; }; \

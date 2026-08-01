@@ -22,10 +22,11 @@ TARGET_GPU_ARCH="${GPU_TARGETS:-gfx950}"
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
-# RCCL device-kernel set (ONLY_FUNCS). Includes Broadcast + AllGather so the host baselines
-# (broadcast_perf -D 0 / all_gather_perf -D 0) work across the full size range. Set
-# ONLY_FUNCS="" to build every collective (much slower), or override with a custom pattern.
-ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather}"
+# RCCL device-kernel set (ONLY_FUNCS). Includes Broadcast + AllGather + AllReduce so the host
+# baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
+# range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
+# pattern.
+ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
 DEV_ARTI_DIR="${GIT_CLONE_ROOT}/ddai-artifacts"
