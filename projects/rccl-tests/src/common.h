@@ -120,6 +120,13 @@ struct testColl {
       size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int implIndex, void* bias);
   testResult_t (*getAlgoProtoChannels)(ncclComm_t comm, size_t count, ncclDataType_t type, int* algo, int* proto, int* nchannels);
   testResult_t (*getSymkInfo)(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op, int* algo, int* proto, int* nchannels);
+  // Optional device-side (in-kernel wall_clock64) timing hook. Non-null only for
+  // collectives that implement it (currently AllToAll). Called once per size by
+  // BenchTime (out-of-place only) when NCCL_GIN_ANVIL_A2A_DEVICE_TIMING is set;
+  // it prints an extra device-only latency/busbw line alongside the normal
+  // graph/hipEvent numbers (report, not replace). Other collectives leave it
+  // nullptr via aggregate initialization, so no other struct needs to change.
+  testResult_t (*deviceTime)(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place);
 };
 extern struct testColl allReduceTest;
 extern struct testColl allGatherTest;

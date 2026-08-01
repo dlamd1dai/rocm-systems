@@ -438,8 +438,14 @@ __device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWind
 // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL tune this LSA<->SDMA cutover
 // independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
 // value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
+// Collective body, factored out of the __global__ entry so it can be invoked
+// either once (production kernel) or in a persistent skip+loop (device-timing
+// kernel). Behavior is byte-for-byte identical to the original kernel: every
+// tier reads/derives its own per-call sync state (LSA barrier session, GIN
+// signal snapshot, mode-2 persistent epoch) at entry, so calling this in a loop
+// yields a sequence of complete, correct alltoalls with no external bookkeeping.
 template <typename T>
-__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
+__device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
   const size_t size = count * sizeof(T);  // per-peer chunk bytes
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -561,6 +567,41 @@ __global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset,
 
   //TODO: this fence presumed redundant because: RDMA dest buffer visible after waitsignal; remote done writting after waitSignal; local done writting after flush, so we are already peerwise quiet with all peers, no need for a secondary barrier to enforce it.
   //bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
+}
+
+// Production entry: one collective call. Thin wrapper over the body so the
+// device-timed kernel and the production path share identical code.
+template <typename T>
+__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
+  ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle, a2aSyncMode, a2aFlagBuf);
+}
+
+// Device-side timing kernel (rocSHMEM AllToAll methodology, AICOMRCCL-1459).
+// A single persistent launch runs (skip + loop) back-to-back collectives and
+// brackets only the timed region with the GPU fixed-frequency wall clock
+// (wall_clock64()), so the reported span excludes host launch, teardown, and
+// stream/graph overhead -- it is the pure device-function execution time.
+//
+// skip warmup iterations run first (steady-state caches/queues, discarded).
+// At i == skip every CTA records its start stamp; after the final iteration
+// every CTA records its end stamp. The host reduces min(start)/max(end) across
+// CTAs (the grid's true busy window) and MAX across ranks (the slowest rank
+// closes the collective), then divides by loop for per-iteration latency.
+//
+// Because the body re-derives all per-call sync state at entry (GIN re-reads the
+// accumulated signal; LSA rebuilds its barrier session; mode 2 advances its
+// persistent epoch), looping is correct with no extra signal/epoch bookkeeping.
+template <typename T>
+__global__ void GinHybridAlltoAllTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf, int loop, int skip, long long* start_time, long long* end_time) {
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle, a2aSyncMode, a2aFlagBuf);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
 }
 
 // Hybrid LSA+GIN alltoall: CTA 0 handles remote peers via GIN,
@@ -762,6 +803,141 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
   return testSuccess;
 }
 
+// Device-side (in-kernel wall_clock64) timing for AllToAll, across all tiers
+// (LL / direct-LSA / GIN-SDMA). Opt-in via NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=1.
+// Launches the persistent timed kernel once for the current size, brackets only
+// the (skip+loop) steady-state collectives with the GPU wall clock, reduces the
+// grid busy window (min start .. max end over CTAs) and the slowest rank (MPI
+// MAX), and prints an augmented line. It does NOT alter the graph/hipEvent
+// numbers reported by BenchTime (report, not replace). rocSHMEM defaults:
+// loop=10, skip=10, auto-reduced for very large per-peer chunks.
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(A2A_HAVE_LL)
+testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
+  static const int devTiming = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
+    return (e && *e) ? atoi(e) : 0;
+  }();
+  if (!devTiming) return testSuccess;
+
+  static const int loopEnv = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP");
+    return (e && *e) ? atoi(e) : 10;  // rocSHMEM default
+  }();
+  static const int skipEnv = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVTIME_SKIP");
+    return (e && *e) ? atoi(e) : 10;  // rocSHMEM default
+  }();
+
+  const size_t count = args->nbytes / wordSize(type);
+  if (count == 0 || loopEnv < 1) return testSuccess;
+  const size_t perPeerBytes = count * wordSize(type);
+
+  static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", gin_sdma::kAllToAllSdmaThresholdDefault);
+  static const int a2aSyncMode = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
+    return (e && *e) ? atoi(e) : 3;
+  }();
+
+  // Auto-reduce iteration counts for very large chunks so the timed run stays
+  // bounded (the per-call copy time dominates; a handful of iters suffices).
+  int loop = loopEnv, skip = skipEnv;
+  if (perPeerBytes >= (size_t)64 * 1024 * 1024) { loop = loop < 2 ? loop : 2; skip = skip < 1 ? skip : 1; }
+  else if (perPeerBytes >= (size_t)8 * 1024 * 1024) { loop = loop < 4 ? loop : 4; skip = skip < 2 ? skip : 2; }
+
+  // GPU fixed-frequency wall-clock rate (kHz), queried once.
+  static int wallClkRateKhz = 0;
+  if (wallClkRateKhz == 0) {
+    int dev = 0;
+    CUDACHECK(cudaGetDevice(&dev));
+    CUDACHECK(hipDeviceGetAttribute(&wallClkRateKhz, hipDeviceAttributeWallClockRate, dev));
+    if (wallClkRateKhz <= 0) wallClkRateKhz = 1;
+  }
+
+  const int maxCtas = gin_sdma::kA2aLsaMaxCtas;
+  const char* tierName = "LSA";
+  int lastGridCtas = 0;
+  double localMaxUs = 0.0;  // slowest local GPU (nGpus is 1 in the -g1 gate)
+
+  // Fully isolate the timing run from the surrounding measurement flow. The
+  // timed kernel issues extra cross-rank collectives on the live buffers; a
+  // cross-rank barrier before and after guarantees every rank enters and leaves
+  // the hook in lockstep, so it can never race the next size's buffer re-init
+  // (mode 3 has no entry barrier; the GIN tier body has no exit barrier).
+  Barrier(args);
+
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    ncclDevComm* devComm = args->devComms + i;
+    const int nRanks = devComm->nRanks;
+
+    gin_sdma::A2ATier tier = gin_sdma::a2aKernelTier(perPeerBytes, a2aThr, g_a2aLLHandle.nSlots, nRanks, gin_sdma::kAllToAllLLMaxBytes);
+    int gridCtas = (tier == gin_sdma::A2ATier::Gin)
+                       ? gin_sdma::kA2aSdmaCtas
+                       : (tier == gin_sdma::A2ATier::LL)
+                             ? gin_sdma::kA2aLLCtas
+                             : gin_sdma::a2aLsaCtaCount(perPeerBytes, gin_sdma::kA2aLsaMaxCtas);
+    tierName = (tier == gin_sdma::A2ATier::Gin) ? "GIN" : (tier == gin_sdma::A2ATier::LL) ? "LL" : "LSA";
+    if (gridCtas < 1) gridCtas = 1;
+    if (gridCtas > maxCtas) gridCtas = maxCtas;
+    lastGridCtas = gridCtas;
+
+    auto kernel = SPECIALIZE_KERNEL(GinHybridAlltoAllTimedKernel, type, op);
+    if (kernel == nullptr) return testSuccess;
+
+    long long* d_start = nullptr;
+    long long* d_end = nullptr;
+    CUDACHECK(cudaMalloc(&d_start, (size_t)gridCtas * sizeof(long long)));
+    CUDACHECK(cudaMalloc(&d_end, (size_t)gridCtas * sizeof(long long)));
+
+    ncclWindow_t sendwin = (ncclWindow_t)args->sendRegHandles[i];
+    ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+    kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm, a2aThr, g_a2aLLHandle, a2aSyncMode, g_a2aFlagHandle, loop, skip, d_start, d_end);
+    CUDACHECK(cudaStreamSynchronize(args->streams[i]));
+
+    std::vector<long long> h_start(gridCtas), h_end(gridCtas);
+    CUDACHECK(cudaMemcpy(h_start.data(), d_start, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(h_end.data(), d_end, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaFree(d_start));
+    CUDACHECK(cudaFree(d_end));
+
+    long long mn = h_start[0], mx = h_end[0];
+    for (int c = 1; c < gridCtas; c++) {
+      if (h_start[c] < mn) mn = h_start[c];
+      if (h_end[c] > mx) mx = h_end[c];
+    }
+    // cycles -> us: cycles / (kHz) gives ms, *1e3 -> us; then per iteration.
+    double totalUs = (double)(mx - mn) / (double)wallClkRateKhz * 1.0e3;
+    double perIterUs = totalUs / (double)loop;
+    if (perIterUs > localMaxUs) localMaxUs = perIterUs;
+  }
+
+  // Barrier again so no rank returns to the next size's setup before every rank
+  // has finished (and quiesced) its timing collectives.
+  Barrier(args);
+
+  // Collective latency = slowest rank (the last to finish closes the alltoall).
+  double devUs = localMaxUs;
+  int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
+#ifdef MPI_SUPPORT
+  MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#endif
+
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)(perPeerBytes * (size_t)nRanksGlobal) / 1.0e9 / sec;
+    double busBw = algBw * ((double)(nRanksGlobal - 1) / (double)nRanksGlobal);
+    printf("#[a2a-devtime] size %12zu B  tier %-3s  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           perPeerBytes * (size_t)nRanksGlobal, tierName, lastGridCtas, loop, skip, devUs, algBw, busBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
+  return testSuccess;  // device API / LL path not available in this build
+}
+#endif
+
 struct testColl alltoAllTest = {
   "AlltoAll",
   AlltoAllGetCollByteCount,
@@ -769,7 +945,8 @@ struct testColl alltoAllTest = {
   AlltoAllGetBw,
   AlltoAllRunColl,
   NULL,
-  NULL
+  NULL,
+  AlltoAllDeviceTime
 };
 
 void AlltoAllGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {

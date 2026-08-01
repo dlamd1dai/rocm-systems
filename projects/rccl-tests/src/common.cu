@@ -995,6 +995,14 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   args->bw[0] += busBw;
   args->bw_count[0]++;
+
+  // Optional augmented device-side timing (in-kernel wall_clock64). Runs once
+  // per size, out-of-place only, and only when the collective provides the hook
+  // and NCCL_GIN_ANVIL_A2A_DEVICE_TIMING is set. It prints an extra line and
+  // does not touch the numbers reported above (report, not replace).
+  if (in_place == 0 && deviceImpl != 0 && args->collTest->deviceTime != nullptr) {
+    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place));
+  }
   return testSuccess;
 }
 
