@@ -825,8 +825,15 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   // ===== Variant B: put-partials into scratch + SM reduce, then GIN-put AG =====
   const size_t scratchOff = ncclGetResourceBufferOffset(scratchHandle);
   const uint64_t rsBase = gin.readSignal(sig);
-  ncclBarrier<ncclCoopCta>(ncclCoopCta(), ncclTeamTagWorld(), gin, (uint32_t)blockIdx.x,
-                           cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+  {
+    // Use the manual session+sync form (NOT the free-function ncclBarrier): the
+    // free function is a distinct template instantiation that defeats backend
+    // pruning and drags in the rocshmem_gda QueuePair symbols, which are not
+    // linked into all_reduce_perf (anvil-SDMA only). This matches the proven A2A
+    // and variant-A path exactly.
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+  }
   // RS phase 1a: CTA k sends tile k of EACH peer p's slice (from my sendbuf) into
   // p's scratch slot [rank*stride + (tile offset within p's slice)].
   if (threadIdx.x == 0) {
@@ -857,8 +864,10 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
 
   // AG phase: same as variant A (re-baseline the per-CTA signal after RS).
   const uint64_t agBase = gin.readSignal(sig);
-  ncclBarrier<ncclCoopCta>(ncclCoopCta(), ncclTeamTagWorld(), gin, (uint32_t)blockIdx.x,
-                           cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+  {
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
+  }
   if (tEnd > tBeg && threadIdx.x == 0) {
     const size_t off = recvoffset + tBeg * sizeof(T);
     const size_t bytes = (tEnd - tBeg) * sizeof(T);
