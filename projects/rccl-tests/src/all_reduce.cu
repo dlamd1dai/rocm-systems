@@ -789,6 +789,20 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   // under a dense sweep at high CTA counts (see kAllReduceTwoShotMaxCtas). CTAs
   // beyond the cap return before touching GIN, so no rank ever waits on their
   // (never-issued) barrier/signal slots; tiling/accounting all use the capped nCTA.
+  //
+  // KNOWN RESIDUAL (2026-08-01, 8x MI355X): a *very* long single-process op x type
+  // sweep (~220-300 result rows, i.e. thousands of two-shot launches) can still hit
+  // a probabilistic HW "GPU Hang" in the sustained SDMA/GIN put path. It is NOT a
+  // correctness bug (every completed row is #wrong=0) and does NOT affect realistic
+  // single-(op,type) usage: per-family sweeps run clean to 128 MiB. The landing point
+  // is random in op/type/size. Measured non-fixes (do not re-try without new info):
+  //   * Put|Get drain fence on the barriers  -> hangs FAR sooner (more GIN signal
+  //     ops) and corrupted integer prod/max in-place.
+  //   * LSA barrier instead of the GIN world barrier -> also hangs sooner.
+  //   * NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS 2/4  -> no consistent effect (2 passed once,
+  //     4 hung), so it is not simple single-queue serialization.
+  // This GIN-barrier + CTA-cap form is the most robust observed. A real fix needs
+  // SDMA/GIN firmware-level tracing of put/signal-completion recycling across launches.
   const int nCTA = min((int)gridDim.x, gin_sdma::kAllReduceTwoShotMaxCtas);
   const int cta = blockIdx.x;
   if (cta >= nCTA) return;
@@ -803,17 +817,8 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   if (scratchHandle == 0) {
     // ===== Variant A: direct-LSA read-reduce RS, then GIN-put AG =====
     const uint64_t sigBase = gin.readSignal(sig);   // baseline BEFORE the barrier (no puts yet)
-    // Baseline-consistency barrier: every rank must snapshot sigBase before ANY rank
-    // issues an AG put, else a peer's early put inflates our sigBase and desyncs the
-    // per-CTA expected count -> deadlock. Use an intra-node LSA barrier (single node),
-    // NOT a per-CTA GIN world barrier: the GIN barrier's cross-rank signal ops are what
-    // accumulate and eventually hang the SDMA/GIN engine under a dense op x type sweep
-    // (a Put|Get drain, which adds MORE such ops, made it hang far sooner). The AG
-    // puts + waitSignal below carry all the cross-rank GIN traffic that is actually
-    // required; the entry ordering only needs an all-ranks-arrived fence.
-    ncclTeam lsaTeam = ncclTeamLsa(devComm);
-    ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, lsaTeam, devComm.lsaBarrier, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
 
     // RS: reduce my tile from every peer's sendbuf into my recvbuf.
     arReduceTileLsa<T>(sendwin, sendoffset, recvwin, recvoffset, tBeg, tEnd, nRanks, redOp);
@@ -840,11 +845,13 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   const size_t scratchOff = ncclGetResourceBufferOffset(scratchHandle);
   const uint64_t rsBase = gin.readSignal(sig);
   {
-    // Intra-node LSA barrier for the RS-baseline snapshot (see variant A) -- avoids
-    // the per-CTA GIN world-barrier signal ops that accumulate and hang the engine.
-    ncclTeam lsaTeam = ncclTeamLsa(devComm);
-    ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, lsaTeam, devComm.lsaBarrier, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    // Use the manual session+sync form (NOT the free-function ncclBarrier): the
+    // free function is a distinct template instantiation that defeats backend
+    // pruning and drags in the rocshmem_gda QueuePair symbols, which are not
+    // linked into all_reduce_perf (anvil-SDMA only). This matches the proven A2A
+    // and variant-A path exactly.
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
   }
   // RS phase 1a: CTA k sends tile k of EACH peer p's slice (from my sendbuf) into
   // p's scratch slot [rank*stride + (tile offset within p's slice)].
@@ -877,10 +884,8 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   // AG phase: same as variant A (re-baseline the per-CTA signal after RS).
   const uint64_t agBase = gin.readSignal(sig);
   {
-    // Intra-node LSA barrier for the AG-baseline snapshot (see variant A).
-    ncclTeam lsaTeam = ncclTeamLsa(devComm);
-    ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, lsaTeam, devComm.lsaBarrier, blockIdx.x };
-    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+    bar.sync(ncclCoopCta(), cuda::memory_order_relaxed, ncclGinFenceLevel::Relaxed);
   }
   if (tEnd > tBeg && threadIdx.x == 0) {
     const size_t off = recvoffset + tBeg * sizeof(T);
