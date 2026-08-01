@@ -536,6 +536,76 @@ GIN_SDMA_HD inline size_t reduceScatterScratchBytes(size_t maxSendBytesPerRank) 
   return (maxSendBytesPerRank + 127) & ~(size_t)127;
 }
 
+// ------------------------------- AllReduce -------------------------------
+//
+// GIN-SDMA AllReduce is deviceImpl 5 (the upstream LSA/multimem demo kernels
+// keep -D 1..4). Standard one-shot(small)/two-shot(large) split:
+//   * small (<= threshold): one-shot direct LSA read-reduce -- every rank reads
+//     the whole message from each peer's sendbuf, folds in ascending source-rank
+//     order (bit-matching verifiable.cu via gin_sdma_reduce) and writes its own
+//     recvbuf. Single phase, entry+exit LSA barrier, no scratch/signals.
+//   * large (> threshold) OR in-place: two-shot ReduceScatter + AllGather. The
+//     message is split into N per-rank slices, each further tiled ACROSS CTAs so
+//     every CTA is self-contained (reduces then AllGather-puts the same tile),
+//     avoiding a grid-wide sync at the RS->AG boundary. AG uses a PER-CTA GIN
+//     signal (index = blockIdx.x). Two RS variants are prototyped and picked by
+//     measurement (see all_reduce.cu):
+//       (A) direct-LSA read-reduce RS (reuses the ReduceScatter path) + GIN AG;
+//       (B) put-partials RS into the resource-window scratch + SM reduce + AG.
+// The tier compares TOTAL message bytes (AllReduce operates on the whole buffer,
+// unlike ReduceScatter's per-rank slice). Threshold provisional; retune by
+// measurement per the design plan.
+static constexpr size_t kAllReduceSdmaThresholdDefault = 262144;  // 256 KiB total (provisional)
+
+enum class ARTier { LSA, Gin };
+
+// Shared by GinAllReduceKernel and the host unit tests. Compared against total
+// message bytes.
+GIN_SDMA_HD inline ARTier allReduceKernelTier(size_t msgBytes, size_t sdmaThreshold) {
+  return (msgBytes <= sdmaThreshold) ? ARTier::LSA : ARTier::Gin;
+}
+
+// GIN signal count for the -D 5 two-shot scheme. AG (and variant B's RS) use a
+// PER-CTA signal (index = blockIdx.x) so each CTA's completion count is
+// independent, so one signal per CTA is needed. Floored at 2 for the degenerate
+// single-CTA case.
+GIN_SDMA_HD inline int allReduceSignalCount(int deviceCtaCount) {
+  return (deviceCtaCount < 2) ? 2 : deviceCtaCount;
+}
+
+// devComm requirements for the -D 5 GIN-SDMA AllReduce kernel: one barrier +
+// lsaBarrier per CTA (small tier needs only the lsaBarrier; the large tier adds
+// the world barrier) and allReduceSignalCount GIN signals for the two-shot
+// phases. GIN required. The scratch window (variant B) is added separately in
+// the .cu (mirroring ReduceScatter), so DevReqs carries only the barrier/signal
+// shape.
+GIN_SDMA_HD inline DevReqs allReduceDevReqs(int deviceCtaCount) {
+  DevReqs r{deviceCtaCount, deviceCtaCount, allReduceSignalCount(deviceCtaCount), true, true};
+  return r;
+}
+
+// Per-slot byte stride for the two-shot slice split: ceil(msgBytes/nRanks)
+// rounded up to 16 B so every rank's slice starts 128-bit aligned (packed
+// read-reduce). Shared by the kernel (slice math) and the scratch sizing so the
+// writer's slot offset (source s -> slot s*stride) matches the allocation.
+GIN_SDMA_HD inline size_t allReduceSliceStride(size_t msgBytes, int nRanks) {
+  if (nRanks <= 0) return 0;
+  size_t per = (msgBytes + (size_t)nRanks - 1) / (size_t)nRanks;
+  return (per + 15) & ~(size_t)15;
+}
+
+// Bytes of scratch the large put-partials RS variant (B) needs per rank: it
+// stages N incoming per-source partials, each one slice-slot wide
+// (allReduceSliceStride), so N * stride. Sized once at the worst-case (max)
+// message and rounded up to the 128 B resource-buffer granularity. Because the
+// stride is monotonic in msgBytes, sizing at maxMsgBytes covers every smaller
+// message. Zero -> no scratch. Variant A needs no scratch.
+GIN_SDMA_HD inline size_t allReduceScratchBytes(size_t maxMsgBytes, int nRanks) {
+  if (maxMsgBytes == 0 || nRanks <= 0) return 0;
+  size_t total = allReduceSliceStride(maxMsgBytes, nRanks) * (size_t)nRanks;
+  return (total + 127) & ~(size_t)127;
+}
+
 }  // namespace gin_sdma
 
 #endif  // GIN_SDMA_COLLECTIVE_POLICY_H_
