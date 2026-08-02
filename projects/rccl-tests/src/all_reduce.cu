@@ -793,17 +793,85 @@ __device__ __forceinline__ void arAllGatherInPlaceLsa(
   bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel, ncclGinFenceLevel::Relaxed);
 }
 
+// TINY-message one-shot AllReduce -- a device kernel mirroring the host-initiated
+// single-round design (gather-all-contributions-then-reduce with minimal sync). ONE cross-
+// rank sync, then every rank reads the WHOLE message from all peers' sendbuf over xGMI LSA,
+// reduces locally in ascending source-rank order (bit-matching verifiable.cu via
+// gin_sdma_reduce) and writes its recvbuf. This collapses the RS + grid barrier + AllGather
+// (two cross-rank barriers) into a SINGLE barrier, removing the fixed latency that dominates
+// tiny messages. The one sync is a GIN world barrier so every launch performs exactly one
+// GIN world barrier (uniform GIN cadence, identical to the LSA/SDMA AllGather tiers), which
+// is what keeps the interleave hang-safe -- unlike the earlier no-GIN one-shot.
+//
+// OUT-OF-PLACE only: each rank reads all sendbufs and writes a DISJOINT recvbuf, so no exit
+// barrier is needed (nobody reads my recvbuf; sendbufs are stable across the collective). An
+// in-place one-shot would race peers' sendbuf reads against local recvbuf writes, so in-place
+// tiny stays on the RS+AG LSA tier. Reads N*msgBytes, so it is a WIN only while msgBytes is
+// tiny (latency-bound); above ~oneShotThreshold the RS+AG tier (moves ~2*msgBytes) is used.
+template <typename T>
+__device__ __forceinline__ void arAllReduceOneShotLsa(
+    ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+    size_t msgBytes, int rank, int nRanks, int redOp, struct ncclDevComm devComm) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+
+  // Single cross-rank sync (all peers' sendbufs are populated for this iteration).
+  ncclGin gin { devComm, 0 };
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel, ncclGinFenceLevel::Relaxed);
+
+  constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
+  struct alignas(16) Pack { T e[VEC]; };
+  const size_t nElts  = msgBytes / sizeof(T);
+  const size_t nPacks = nElts / (size_t)VEC;
+  Pack* dstP = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);
+  for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
+    Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[pk];
+    T acc[VEC];
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
+    for (int s = 1; s < nRanks; s++) {
+      Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[pk];
+      #pragma unroll
+      for (int e = 0; e < VEC; e++)
+        acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+    }
+    Pack o;
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+    dstP[pk] = o;
+  }
+  const size_t tailBeg = nPacks * (size_t)VEC;           // scalar tail (non-16B-multiple sizes)
+  T* dstS = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+  for (size_t i = tailBeg + (size_t)tid; i < nElts; i += (size_t)nthreads) {
+    T acc = gin_sdma_reduce::preOp(redOp, ((const T*)ncclGetLsaPointer(sendwin, sendoffset, 0))[i], nRanks);
+    for (int s = 1; s < nRanks; s++)
+      acc = gin_sdma_reduce::combine(redOp, acc,
+              gin_sdma_reduce::preOp(redOp, ((const T*)ncclGetLsaPointer(sendwin, sendoffset, s))[i], nRanks));
+    dstS[i] = gin_sdma_reduce::postOp(redOp, acc, nRanks);
+  }
+}
+
 // -D 5 SINGLE-LAUNCH: RS -> in-kernel device-wide barrier -> AG, all in one kernel.
+// (Tiny out-of-place messages take the one-shot LSA read-reduce fast path above instead.)
 template <typename T>
 __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
                                    ncclWindow_t recvwin, size_t recvoffset, size_t count,
                                    int root, struct ncclDevComm devComm,
                                    size_t sdmaThresholdOverride, int redOp,
-                                   ncclDevResourceHandle scratchHandle) {
+                                   ncclDevResourceHandle scratchHandle,
+                                   size_t oneShotThresholdOverride) {
   const int nRanks = devComm.nRanks;
   const int rank = devComm.rank;
   const size_t msgBytes = count * sizeof(T);
   const size_t strideBytes = gin_sdma::allReduceSliceStride(msgBytes, nRanks);
+
+  // Tiny out-of-place fast path: single-barrier one-shot LSA read-reduce (host-mirroring).
+  const bool inPlace = (sendwin == recvwin) && (sendoffset == recvoffset);
+  if (!inPlace && msgBytes < oneShotThresholdOverride) {
+    arAllReduceOneShotLsa<T>(sendwin, sendoffset, recvwin, recvoffset, msgBytes, rank, nRanks, redOp, devComm);
+    return;
+  }
 
   // Entry cross-rank barrier: every rank's sendbuf is populated (LSA).
   ncclTeam lsa = ncclTeamLsa(devComm);
@@ -896,15 +964,18 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
   case 5: {
     if (count == 0) return testSuccess;
-    // GIN-SDMA AllReduce, SINGLE-LAUNCH (default): ONE kernel with two non-overlapping
-    // phases (ReduceScatter -> device-wide arGridBarrier() -> in-place AllGather) for ALL
-    // sizes. Grid is size-adaptive (arTunedGridCtas). arThr selects the AllGather tier:
-    // msgBytes < arThr uses the low-latency LSA peer-store tier, >= arThr uses the SDMA put
-    // tier (override via NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE; default 4 MiB).
+    // GIN-SDMA AllReduce, SINGLE-LAUNCH (default): ONE kernel that runs (a) a tiny
+    // out-of-place one-shot LSA read-reduce below arOneShot, else (b) ReduceScatter ->
+    // device-wide arGridBarrier() -> in-place AllGather. Grid is size-adaptive
+    // (arTunedGridCtas). arThr selects the AllGather tier for (b): msgBytes < arThr uses the
+    // low-latency LSA peer-store tier, >= arThr uses the SDMA put tier. Overrides:
+    // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE (default 16 MiB),
+    // NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE (default 256 KiB).
     static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
+    static const size_t arOneShot = testResolveSdmaThreshold("NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceOneShotThresholdDefault);
     const int arGctas = arTunedGridCtas(count * wordSize(type), kArMaxCtas);
     TESTCHECK(testLaunchDeviceKernelThresholdScratchCtas(SPECIALIZE_REDUCE_KERNEL(GinAllReduceKernel, type, op),
-               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle, arGctas));
+               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle, arGctas, arOneShot));
     return testSuccess;
   }
   case 6: {

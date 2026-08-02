@@ -555,6 +555,14 @@ GIN_SDMA_HD inline size_t reduceScatterScratchBytes(size_t maxSendBytesPerRank) 
 // wins from 16 MiB up (16M ~209 vs 198). 16 MiB keeps LSA for the sizes it wins.
 static constexpr size_t kAllReduceSdmaThresholdDefault = 16777216;  // 16 MiB total (measured)
 
+// TINY out-of-place AllReduce one-shot cutoff (total bytes). Below this, -D 5 uses a
+// single-barrier LSA read-reduce (arAllReduceOneShotLsa) that mirrors the host-initiated
+// single-round design -- one GIN world barrier then read all peers' sendbuf and reduce
+// locally -- to cut the fixed latency that dominates tiny messages. It reads N*msgBytes, so
+// it only wins while latency-bound; above this the RS+AG tier (moves ~2*msgBytes) takes over.
+// Override with NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE. Measured crossover on 8x MI355X.
+static constexpr size_t kAllReduceOneShotThresholdDefault = 262144;  // 256 KiB total (measured)
+
 // Two-shot (large/in-place) CTA cap. The two-shot path issues a PER-CTA world GIN
 // barrier + AllGather puts; on 8x MI355X with NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 a
 // dense sweep at -V 32 deadlocks (cumulative GIN/SDMA resource pressure from 32
