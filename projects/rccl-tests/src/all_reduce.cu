@@ -578,14 +578,19 @@ __global__ void allReduceMultimemVectorizedKernel(ncclWindow_t sendwin, size_t s
 //
 // NOTE (2026-08-01, 8x MI355X): a one-shot direct-LSA read-reduce fast path for the
 // small out-of-place tier was prototyped and dropped. Interleaving those LSA-only
-// launches between the GIN AllGather launches deterministically re-triggered the
-// cumulative "GPU Hang" on the full type x op x size sweep (hung 2/2 runs), whereas
-// split-for-all-sizes ran clean 3/3 (2x -D 6 + 1x -D 5 THRESHOLD=0, 1400 rows each,
-// #wrong=0). The one-shot has no GIN of its own, so this is a backend GIN
-// signal-completion-pipeline disturbance from the irregular LSA/GIN launch cadence,
-// not a signal-op-volume effect (the one-shot mix issues FEWER AG launches yet hung).
-// Keep AllReduce on the uniform split; do not reintroduce a non-GIN fast path without
-// a backend fix for GIN completion recycling.
+// launches (NO GIN at all) between the GIN AllGather launches deterministically
+// re-triggered the cumulative "GPU Hang" on the full type x op x size sweep (hung 2/2
+// runs), whereas split-for-all-sizes ran clean 3/3 (1400 rows each, #wrong=0). The one-shot
+// has no GIN of its own, so this is a backend GIN signal-completion-pipeline disturbance
+// from the irregular LSA/GIN launch cadence, not a signal-op-volume effect.
+//
+// NOTE (2026-08-02): small-message latency IS now improved via a size-adaptive AllGather
+// TIER (arAllGatherInPlaceLsa) selected by NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE. The
+// crucial difference from the dropped one-shot: the LSA tier still performs EXACTLY ONE
+// GIN world barrier per launch (as its release), identical to the SDMA tier -- only the
+// data movement changes (LSA peer-stores vs SDMA puts + waitSignal). So the per-launch GIN
+// completion cadence stays uniform across the sweep, which is what the one-shot violated.
+// The RS phase is unchanged (LSA). Soak-tested on the full omni sweep for hang regression.
 
 // ---------------------------------------------------------------------------
 // GIN-SDMA AllReduce: ReduceScatter + AllGather (all sizes)
@@ -742,6 +747,52 @@ __device__ __forceinline__ void arAllGatherInPlace(
   if (tid == 0) *shadowPtr = sigBase + (uint64_t)expected;   // persist ledger (single grid-wide writer)
 }
 
+// Phase 2 body, SMALL-MESSAGE tier: in-place AllGather over pure xGMI LSA instead of
+// SDMA puts. Each rank STORES its reduced slice directly into every OTHER peer's matching
+// recvbuf slot (peers are load/store-accessible intra-node), then a SINGLE GIN world
+// barrier releases -- so my stores are visible before any rank reuses the buffer, AND every
+// launch still performs exactly one GIN world barrier (same as the SDMA tier), keeping the
+// GIN completion cadence uniform across the sweep. This is the key difference from the
+// dropped no-GIN one-shot: we drop the SDMA put + waitSignal round-trip (the small-message
+// latency killer) WITHOUT dropping GIN entirely. Peer store order uses the AllToAll F2+F3
+// rotation (peer = (rank+blockIdx.x+pp) % nRanks) so different ranks/CTAs drive different
+// xGMI egress links concurrently instead of incasting one link. No signal 0 / shadow ledger
+// use here (that stays exclusive to the SDMA tier, so its baseline is undisturbed).
+template <typename T>
+__device__ __forceinline__ void arAllGatherInPlaceLsa(
+    ncclWindow_t recvwin, size_t recvoffset, size_t msgBytes, size_t strideBytes,
+    int rank, int nRanks, struct ncclDevComm devComm) {
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+  const size_t begByte = (size_t)rank * strideBytes;
+  const bool iSend = begByte < msgBytes;
+  const size_t myBytes = iSend ? ((strideBytes < msgBytes - begByte) ? strideBytes : (msgBytes - begByte)) : 0;
+
+  if (iSend) {
+    constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
+    struct alignas(16) Pack { T e[VEC]; };
+    const size_t nElts  = myBytes / sizeof(T);          // myBytes is a multiple of sizeof(T)
+    const size_t nPacks = nElts / (size_t)VEC;          // begByte is 16 B aligned -> Pack aligned
+    const size_t tailBeg = nPacks * (size_t)VEC;        // only the last owned slice can have a tail
+    const Pack* srcP = (const Pack*)ncclGetLocalPointer(recvwin, recvoffset + begByte);
+    const T*    srcS = (const T*)   ncclGetLocalPointer(recvwin, recvoffset + begByte);
+    for (int pp = 0; pp < nRanks; pp++) {
+      const int p = (rank + blockIdx.x + pp) % nRanks;  // F2+F3 link-spreading rotation
+      if (p == rank) continue;                          // my slice is already in place
+      Pack* dstP = (Pack*)ncclGetLsaPointer(recvwin, recvoffset + begByte, p);
+      for (size_t k = (size_t)tid; k < nPacks; k += (size_t)nthreads) dstP[k] = srcP[k];
+      if (tailBeg < nElts) {
+        T* dstS = (T*)ncclGetLsaPointer(recvwin, recvoffset + begByte, p);
+        for (size_t i = tailBeg + (size_t)tid; i < nElts; i += (size_t)nthreads) dstS[i] = srcS[i];
+      }
+    }
+  }
+  __threadfence_system();                               // publish my peer stores before the release
+  ncclGin gin { devComm, 0 };
+  ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_acq_rel, ncclGinFenceLevel::Relaxed);
+}
+
 // -D 5 SINGLE-LAUNCH: RS -> in-kernel device-wide barrier -> AG, all in one kernel.
 template <typename T>
 __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
@@ -765,7 +816,13 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
   __threadfence_system();     // publish this rank's reduced-slice stores
   arGridBarrier();
 
-  arAllGatherInPlace<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
+  // Size-adaptive AllGather: small messages take the low-latency LSA peer-store tier
+  // (drops the SDMA put + waitSignal round-trip), large messages keep the SDMA put tier
+  // for bandwidth. Both perform exactly one GIN world barrier (uniform GIN cadence).
+  if (msgBytes < sdmaThresholdOverride)
+    arAllGatherInPlaceLsa<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
+  else
+    arAllGatherInPlace<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
 }
 
 // -D 6 TWO-LAUNCH, phase 1: standalone ReduceScatter. The RS->AG boundary is the
@@ -803,7 +860,10 @@ __global__ void GinAllReduceAGKernel(ncclWindow_t sendwin, size_t sendoffset,
   const int rank = devComm.rank;
   const size_t msgBytes = count * sizeof(T);
   const size_t strideBytes = gin_sdma::allReduceSliceStride(msgBytes, nRanks);
-  arAllGatherInPlace<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
+  if (msgBytes < sdmaThresholdOverride)
+    arAllGatherInPlaceLsa<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
+  else
+    arAllGatherInPlace<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
 }
 #endif
 
@@ -837,9 +897,10 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   case 5: {
     if (count == 0) return testSuccess;
     // GIN-SDMA AllReduce, SINGLE-LAUNCH (default): ONE kernel with two non-overlapping
-    // phases (ReduceScatter -> device-wide arGridBarrier() -> single-signal in-place
-    // AllGather) for ALL sizes. Grid is size-adaptive (arTunedGridCtas). arThr is passed
-    // for signature parity only; the kernel ignores it.
+    // phases (ReduceScatter -> device-wide arGridBarrier() -> in-place AllGather) for ALL
+    // sizes. Grid is size-adaptive (arTunedGridCtas). arThr selects the AllGather tier:
+    // msgBytes < arThr uses the low-latency LSA peer-store tier, >= arThr uses the SDMA put
+    // tier (override via NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE; default 4 MiB).
     static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
     const int arGctas = arTunedGridCtas(count * wordSize(type), kArMaxCtas);
     TESTCHECK(testLaunchDeviceKernelThresholdScratchCtas(SPECIALIZE_REDUCE_KERNEL(GinAllReduceKernel, type, op),
@@ -851,7 +912,8 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     // GIN-SDMA AllReduce, TWO-LAUNCH alternative: same two phases as -D 5 but as two
     // kernels back-to-back on the SAME stream (RS then AG), so the RS->AG boundary is the
     // kernel-launch boundary. No co-residency requirement / cannot deadlock on grid size,
-    // at the cost of a second host launch. Same size-adaptive grid. arThr: parity only.
+    // at the cost of a second host launch. Same size-adaptive grid and AllGather-tier
+    // selection (arThr): LSA peer-store tier below arThr, SDMA put tier at/above.
     static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
     const int arGctas = arTunedGridCtas(count * wordSize(type), kArMaxCtas);
     TESTCHECK(testLaunchDeviceKernelAR2SplitCtas(SPECIALIZE_REDUCE_KERNEL(GinAllReduceRSKernel, type, op),

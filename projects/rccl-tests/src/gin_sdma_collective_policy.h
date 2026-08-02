@@ -538,29 +538,22 @@ GIN_SDMA_HD inline size_t reduceScatterScratchBytes(size_t maxSendBytesPerRank) 
 
 // ------------------------------- AllReduce -------------------------------
 //
-// GIN-SDMA AllReduce is deviceImpl 5 (the upstream LSA/multimem demo kernels
-// keep -D 1..4). Standard one-shot(small)/two-shot(large) split:
-//   * small (<= threshold): one-shot direct LSA read-reduce -- every rank reads
-//     the whole message from each peer's sendbuf, folds in ascending source-rank
-//     order (bit-matching verifiable.cu via gin_sdma_reduce) and writes its own
-//     recvbuf. Single phase, entry+exit LSA barrier, no scratch/signals.
-//   * large (> threshold) OR in-place: two-shot ReduceScatter + AllGather. The
-//     message is split into N per-rank slices, each further tiled ACROSS CTAs so
-//     every CTA is self-contained (reduces then AllGather-puts the same tile),
-//     avoiding a grid-wide sync at the RS->AG boundary. AG uses a PER-CTA GIN
-//     signal (index = blockIdx.x). Two RS variants are prototyped and picked by
-//     measurement (see all_reduce.cu):
-//       (A) direct-LSA read-reduce RS (reuses the ReduceScatter path) + GIN AG;
-//       (B) put-partials RS into the resource-window scratch + SM reduce + AG.
-// The tier compares TOTAL message bytes (AllReduce operates on the whole buffer,
-// unlike ReduceScatter's per-rank slice). Default measured on 8x MI355X
-// (2026-08-01, float sum, out-of-place): the one-shot direct-LSA read-reduce wins
-// up to ~4 MiB total (e.g. 4M: ~125 us one-shot vs ~168 us two-shot), and the
-// two-shot ReduceScatter+AllGather (which moves only 1/N of the volume per rank)
-// wins above (8M: ~186 us two-shot vs ~231 us one-shot). Crossover ~5-6 MiB; 4 MiB
-// keeps one-shot for the sizes it wins and hands larger OOP to two-shot. In-place
-// always uses two-shot regardless of this threshold.
-static constexpr size_t kAllReduceSdmaThresholdDefault = 4194304;  // 4 MiB total (measured)
+// GIN-SDMA AllReduce is deviceImpl 5 (single-launch) / 6 (two-launch); the upstream
+// LSA/multimem demo kernels keep -D 1..4. Both realizations run ReduceScatter (LSA
+// read-reduce) then an in-place AllGather, and this threshold selects the AllGather TIER
+// by TOTAL message bytes (AllReduce operates on the whole buffer):
+//   * small (< threshold): LSA AllGather -- each rank STORES its reduced slice directly
+//     into every peer's recvbuf slot over xGMI (F2+F3 link spreading), released by a
+//     single GIN world barrier. Drops the SDMA put + waitSignal round-trip, cutting
+//     small/mid-message latency, while keeping exactly one GIN barrier per launch (so the
+//     GIN completion cadence stays uniform -- see the hang NOTE in all_reduce.cu).
+//   * large (>= threshold): SDMA AllGather -- one put of the reduced slice to each peer on
+//     a single recycled GIN signal + waitSignal. Bandwidth-optimal; LSA store-gather
+//     collapses at large sizes (128M: ~218 vs ~366 GB/s), so SDMA is kept for the tail.
+// Default measured on 8x MI355X (2026-08-02, float sum): LSA AllGather wins out-of-place
+// up to ~8 MiB (4M ~108 vs 101 GB/s, 8M ~158 vs 153) and in-place a bit higher, while SDMA
+// wins from 16 MiB up (16M ~209 vs 198). 16 MiB keeps LSA for the sizes it wins.
+static constexpr size_t kAllReduceSdmaThresholdDefault = 16777216;  // 16 MiB total (measured)
 
 // Two-shot (large/in-place) CTA cap. The two-shot path issues a PER-CTA world GIN
 // barrier + AllGather puts; on 8x MI355X with NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 a
