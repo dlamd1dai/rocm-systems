@@ -593,6 +593,21 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
   return testSuccess;
 }
 
+// Two-launch variant for the AllReduce -D 6 alternative: launches a ReduceScatter kernel
+// then an AllGather kernel back-to-back on the SAME stream, so the RS->AG boundary is
+// enforced by stream ordering (a true global sync that fully drains the grid) instead of
+// an in-kernel grid barrier. Both kernels share the reduction-collective signature.
+template <typename F>
+testResult_t testLaunchDeviceKernelAR2Split(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle) {
+  if (rsKernel == nullptr || agKernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  rsKernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  agKernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -664,6 +679,10 @@ testResult_t testLaunchDeviceKernelThresholdLLCtasFlag(F kernel, void* sendbuff,
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelAR2Split(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
