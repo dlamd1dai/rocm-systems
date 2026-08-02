@@ -593,18 +593,31 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
   return testSuccess;
 }
 
-// Two-launch variant for the AllReduce -D 6 alternative: launches a ReduceScatter kernel
-// then an AllGather kernel back-to-back on the SAME stream, so the RS->AG boundary is
-// enforced by stream ordering (a true global sync that fully drains the grid) instead of
-// an in-kernel grid barrier. Both kernels share the reduction-collective signature.
+// Single-launch variant with an EXPLICIT grid size (gridCtas) instead of the global
+// deviceCtaCount. Used by the GIN-SDMA AllReduce -D 5 to pick a size-adaptive CTA count
+// (few CTAs for small messages, more for large; see arTunedGridCtas). gridCtas must be
+// <= the barrier/signal slot count registered in AllReduceGetDevCommRequirements.
 template <typename F>
-testResult_t testLaunchDeviceKernelAR2Split(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle) {
+testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
+// Two-launch variant (AllReduce -D 6) with an EXPLICIT grid size: launches a ReduceScatter
+// kernel then an AllGather kernel back-to-back on the SAME stream, so the RS->AG boundary
+// is the kernel-launch boundary. Both kernels share the reduction-collective signature.
+template <typename F>
+testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
   if (rsKernel == nullptr || agKernel == nullptr) return testNotImplemented;
   ncclDevComm* devComm = (ncclDevComm*)comm;
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
-  rsKernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
-  agKernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  rsKernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  agKernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
   return testSuccess;
 }
 
@@ -682,7 +695,11 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
   return testNotImplemented;
 }
 template <typename F, typename H>
-testResult_t testLaunchDeviceKernelAR2Split(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle) {
+testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr

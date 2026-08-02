@@ -92,6 +92,23 @@ void AllReduceGetBw(size_t count, int typesize, double sec, double* algBw, doubl
   *busBw = baseBw * factor;
 }
 
+// Empirically-tuned CTA count for the GIN-SDMA AllReduce (-D 5/-D 6) on 8x MI355X (xGMI).
+// The ReduceScatter reduction is memory-bandwidth bound and keeps scaling with CTAs up to
+// ~64 for large messages, but small messages prefer FEW CTAs (barrier/launch overhead
+// dominates and over-subscription hurts). So the grid is chosen per message size at launch,
+// while barrier/signal slots are registered for the max (kArMaxCtas). Measured busbw
+// (float,sum): 128M 313->369 GB/s, 64M 292->328, 1M 34->40, 64K 2.7->3.2 vs the old fixed
+// 32-CTA grid. Beyond 64 CTAs large-message BW regresses (co-residency pressure).
+static constexpr int kArMaxCtas = 64;
+static inline int arTunedGridCtas(size_t msgBytes, int cap) {
+  int g = (msgBytes < ((size_t)512 << 10)) ? 8      // <512 KiB
+        : (msgBytes < ((size_t)8   << 20)) ? 16     // <8 MiB
+        : (msgBytes < ((size_t)32  << 20)) ? 32     // <32 MiB
+        : 64;                                       // >=32 MiB
+  if (g > cap) g = cap;
+  return (g < 1) ? 1 : g;
+}
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
  // set devComm reqs for allreduce device kernels
 testResult_t AllReduceGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
@@ -118,7 +135,8 @@ testResult_t AllReduceGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      gin_sdma::DevReqs dr = gin_sdma::allReduceDevReqs(deviceCtaCount);
+      // Register for the MAX grid we might launch (size-adaptive up to kArMaxCtas).
+      gin_sdma::DevReqs dr = gin_sdma::allReduceDevReqs(deviceCtaCount > kArMaxCtas ? deviceCtaCount : kArMaxCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -151,7 +169,7 @@ testResult_t AllReduceGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 5:   // GinAllReduceKernel:            single-launch RS + AllGather (all sizes)
     case 6: { // GinAllReduceRSKernel/AGKernel: two-launch  RS + AllGather (all sizes)
-      gin_sdma::DevReqs dr = gin_sdma::allReduceDevReqs(deviceCtaCount);
+      gin_sdma::DevReqs dr = gin_sdma::allReduceDevReqs(deviceCtaCount > kArMaxCtas ? deviceCtaCount : kArMaxCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -820,10 +838,12 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     if (count == 0) return testSuccess;
     // GIN-SDMA AllReduce, SINGLE-LAUNCH (default): ONE kernel with two non-overlapping
     // phases (ReduceScatter -> device-wide arGridBarrier() -> single-signal in-place
-    // AllGather) for ALL sizes. arThr is passed for signature parity only; kernel ignores it.
+    // AllGather) for ALL sizes. Grid is size-adaptive (arTunedGridCtas). arThr is passed
+    // for signature parity only; the kernel ignores it.
     static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
-    TESTCHECK(testLaunchDeviceKernelThresholdScratch(SPECIALIZE_REDUCE_KERNEL(GinAllReduceKernel, type, op),
-               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle));
+    const int arGctas = arTunedGridCtas(count * wordSize(type), kArMaxCtas);
+    TESTCHECK(testLaunchDeviceKernelThresholdScratchCtas(SPECIALIZE_REDUCE_KERNEL(GinAllReduceKernel, type, op),
+               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle, arGctas));
     return testSuccess;
   }
   case 6: {
@@ -831,11 +851,12 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     // GIN-SDMA AllReduce, TWO-LAUNCH alternative: same two phases as -D 5 but as two
     // kernels back-to-back on the SAME stream (RS then AG), so the RS->AG boundary is the
     // kernel-launch boundary. No co-residency requirement / cannot deadlock on grid size,
-    // at the cost of a second host launch. arThr is passed for signature parity only.
+    // at the cost of a second host launch. Same size-adaptive grid. arThr: parity only.
     static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
-    TESTCHECK(testLaunchDeviceKernelAR2Split(SPECIALIZE_REDUCE_KERNEL(GinAllReduceRSKernel, type, op),
+    const int arGctas = arTunedGridCtas(count * wordSize(type), kArMaxCtas);
+    TESTCHECK(testLaunchDeviceKernelAR2SplitCtas(SPECIALIZE_REDUCE_KERNEL(GinAllReduceRSKernel, type, op),
                SPECIALIZE_REDUCE_KERNEL(GinAllReduceAGKernel, type, op),
-               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle));
+               sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, arThr, g_arScratchHandle, arGctas));
     return testSuccess;
   }
 #endif
