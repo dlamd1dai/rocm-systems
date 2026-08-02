@@ -11,6 +11,7 @@
 #include "nccl_device.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include "rccl_vector_types.h"
+#include "gin_sdma_devtime.h"  // shared device-side (wall_clock64) timing scaffold
 #endif
 
 // LL (low-latency, packed data+flag) small-message AllToAll path. Mirrors the
@@ -816,7 +817,8 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(A2A_HAVE_LL)
 testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
   static const int devTiming = []() {
-    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
+    const char* e = getenv("NCCL_GIN_ANVIL_DEVICE_TIMING");          // generic (all collectives)
+    if (!(e && *e)) e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");  // legacy A2A-specific name
     return (e && *e) ? atoi(e) : 0;
   }();
   if (!devTiming) return testSuccess;
@@ -855,83 +857,37 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
     else if (perPeerBytes >= (size_t)8 * 1024 * 1024) { loop = loop < 4 ? loop : 4; skip = skip < 2 ? skip : 2; }
   }
 
-  // GPU fixed-frequency wall-clock rate (kHz), queried once.
-  static int wallClkRateKhz = 0;
-  if (wallClkRateKhz == 0) {
-    int dev = 0;
-    CUDACHECK(cudaGetDevice(&dev));
-    CUDACHECK(hipDeviceGetAttribute(&wallClkRateKhz, hipDeviceAttributeWallClockRate, dev));
-    if (wallClkRateKhz <= 0) wallClkRateKhz = 1;
-  }
-
+  // Tier/grid depend only on nRanks + size (identical across the -g1 GPUs), so pick
+  // them once. The timed kernel's body re-selects the same tier internally per call.
   const int maxCtas = gin_sdma::kA2aLsaMaxCtas;
-  const char* tierName = "LSA";
-  int lastGridCtas = 0;
-  double localMaxUs = 0.0;  // slowest local GPU (nGpus is 1 in the -g1 gate)
+  const int nRanks0 = args->devComms[0].nRanks;
+  gin_sdma::A2ATier tier = gin_sdma::a2aKernelTier(perPeerBytes, a2aThr, g_a2aLLHandle.nSlots, nRanks0, gin_sdma::kAllToAllLLMaxBytes);
+  int gridCtas = (tier == gin_sdma::A2ATier::Gin)
+                     ? gin_sdma::kA2aSdmaCtas
+                     : (tier == gin_sdma::A2ATier::LL)
+                           ? gin_sdma::kA2aLLCtas
+                           : gin_sdma::a2aLsaCtaCount(perPeerBytes, gin_sdma::kA2aLsaMaxCtas);
+  const char* tierName = (tier == gin_sdma::A2ATier::Gin) ? "GIN" : (tier == gin_sdma::A2ATier::LL) ? "LL" : "LSA";
+  if (gridCtas < 1) gridCtas = 1;
+  if (gridCtas > maxCtas) gridCtas = maxCtas;
+  const int lastGridCtas = gridCtas;
 
-  // Fully isolate the timing run from the surrounding measurement flow. The
-  // timed kernel issues extra cross-rank collectives on the live buffers; a
-  // cross-rank barrier before and after guarantees every rank enters and leaves
-  // the hook in lockstep, so it can never race the next size's buffer re-init
-  // (mode 3 has no entry barrier; the GIN tier body has no exit barrier).
-  Barrier(args);
+  auto kernel = SPECIALIZE_KERNEL(GinHybridAlltoAllTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
 
-  for (int i = 0; i < args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
-    ncclDevComm* devComm = args->devComms + i;
-    const int nRanks = devComm->nRanks;
+  // Shared scaffold: allocates per-CTA start/end stamps, launches the timed kernel,
+  // reduces min(start)..max(end) over CTAs and MPI-MAX across ranks -> per-iter us.
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)args->sendRegHandles[i];
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm, a2aThr, g_a2aLLHandle, a2aSyncMode, g_a2aFlagHandle, loop, skip, d_start, d_end);
+      },
+      &devUs));
 
-    gin_sdma::A2ATier tier = gin_sdma::a2aKernelTier(perPeerBytes, a2aThr, g_a2aLLHandle.nSlots, nRanks, gin_sdma::kAllToAllLLMaxBytes);
-    int gridCtas = (tier == gin_sdma::A2ATier::Gin)
-                       ? gin_sdma::kA2aSdmaCtas
-                       : (tier == gin_sdma::A2ATier::LL)
-                             ? gin_sdma::kA2aLLCtas
-                             : gin_sdma::a2aLsaCtaCount(perPeerBytes, gin_sdma::kA2aLsaMaxCtas);
-    tierName = (tier == gin_sdma::A2ATier::Gin) ? "GIN" : (tier == gin_sdma::A2ATier::LL) ? "LL" : "LSA";
-    if (gridCtas < 1) gridCtas = 1;
-    if (gridCtas > maxCtas) gridCtas = maxCtas;
-    lastGridCtas = gridCtas;
-
-    auto kernel = SPECIALIZE_KERNEL(GinHybridAlltoAllTimedKernel, type, op);
-    if (kernel == nullptr) return testSuccess;
-
-    long long* d_start = nullptr;
-    long long* d_end = nullptr;
-    CUDACHECK(cudaMalloc(&d_start, (size_t)gridCtas * sizeof(long long)));
-    CUDACHECK(cudaMalloc(&d_end, (size_t)gridCtas * sizeof(long long)));
-
-    ncclWindow_t sendwin = (ncclWindow_t)args->sendRegHandles[i];
-    ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
-    kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm, a2aThr, g_a2aLLHandle, a2aSyncMode, g_a2aFlagHandle, loop, skip, d_start, d_end);
-    CUDACHECK(cudaStreamSynchronize(args->streams[i]));
-
-    std::vector<long long> h_start(gridCtas), h_end(gridCtas);
-    CUDACHECK(cudaMemcpy(h_start.data(), d_start, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaMemcpy(h_end.data(), d_end, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaFree(d_start));
-    CUDACHECK(cudaFree(d_end));
-
-    long long mn = h_start[0], mx = h_end[0];
-    for (int c = 1; c < gridCtas; c++) {
-      if (h_start[c] < mn) mn = h_start[c];
-      if (h_end[c] > mx) mx = h_end[c];
-    }
-    // cycles -> us: cycles / (kHz) gives ms, *1e3 -> us; then per iteration.
-    double totalUs = (double)(mx - mn) / (double)wallClkRateKhz * 1.0e3;
-    double perIterUs = totalUs / (double)loop;
-    if (perIterUs > localMaxUs) localMaxUs = perIterUs;
-  }
-
-  // Barrier again so no rank returns to the next size's setup before every rank
-  // has finished (and quiesced) its timing collectives.
-  Barrier(args);
-
-  // Collective latency = slowest rank (the last to finish closes the alltoall).
-  double devUs = localMaxUs;
   int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
-#ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-#endif
 
   // Mode 2 (device-time-only): hand the per-iteration latency (seconds) back to
   // BenchTime, which reports it as THE time/busbw metric on the normal result

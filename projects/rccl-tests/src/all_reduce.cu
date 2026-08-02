@@ -34,6 +34,7 @@
 #include "rccl_float8.h"
 #endif
 #include "gin_sdma_reduce.h"  // device preOp/combine/postOp, mirrors verifiable.cu exactly
+#include "gin_sdma_devtime.h" // shared device-side (wall_clock64) timing scaffold
 
 // GIN-SDMA AllReduce (-D 5 / -D 6). The upstream LSA/multimem demo kernels keep -D 1..4.
 // Both are the GIN-SDMA reduction (ReduceScatter then single-signal in-place AllGather,
@@ -1052,79 +1053,32 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
 // from NCCL_GIN_ANVIL_AR_DEVTIME_LOOP/_SKIP (default 10/10, the rocSHMEM default).
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 testResult_t AllReduceDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
-  static const int loopEnv = []() {
-    const char* e = getenv("NCCL_GIN_ANVIL_AR_DEVTIME_LOOP");
-    return (e && *e) ? atoi(e) : 10;
-  }();
-  static const int skipEnv = []() {
-    const char* e = getenv("NCCL_GIN_ANVIL_AR_DEVTIME_SKIP");
-    return (e && *e) ? atoi(e) : 10;
-  }();
+  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_AR_DEVTIME_LOOP", 10);
+  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_AR_DEVTIME_SKIP", 10);
 
   const size_t count = args->nbytes / wordSize(type);
-  if (count == 0 || loopEnv < 1) return testSuccess;
+  if (count == 0 || loop < 1) return testSuccess;
   const size_t msgBytes = count * wordSize(type);
-  const int loop = loopEnv, skip = skipEnv;
 
   static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
   static const size_t arOneShot = testResolveSdmaThreshold("NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceOneShotThresholdDefault);
 
-  static int wallClkRateKhz = 0;
-  if (wallClkRateKhz == 0) {
-    int dev = 0;
-    CUDACHECK(cudaGetDevice(&dev));
-    CUDACHECK(hipDeviceGetAttribute(&wallClkRateKhz, hipDeviceAttributeWallClockRate, dev));
-    if (wallClkRateKhz <= 0) wallClkRateKhz = 1;
-  }
+  auto kernel = SPECIALIZE_REDUCE_KERNEL(GinAllReduceTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
 
   const int gridCtas = arTunedGridCtas(msgBytes, kArMaxCtas);
-  double localMaxUs = 0.0;
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm,
+                 arThr, (int)op, g_arScratchHandle, arOneShot, loop, skip, d_start, d_end);
+      },
+      &devUs));
 
-  // Isolate the timing run: cross-rank barriers before and after guarantee every rank enters
-  // and leaves the hook in lockstep so it can never race the next size's buffer re-init.
-  Barrier(args);
-
-  for (int i = 0; i < args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
-    ncclDevComm* devComm = args->devComms + i;
-
-    auto kernel = SPECIALIZE_REDUCE_KERNEL(GinAllReduceTimedKernel, type, op);
-    if (kernel == nullptr) return testSuccess;
-
-    long long* d_start = nullptr;
-    long long* d_end = nullptr;
-    CUDACHECK(cudaMalloc(&d_start, (size_t)gridCtas * sizeof(long long)));
-    CUDACHECK(cudaMalloc(&d_end, (size_t)gridCtas * sizeof(long long)));
-
-    ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
-    ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
-    kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm,
-             arThr, (int)op, g_arScratchHandle, arOneShot, loop, skip, d_start, d_end);
-    CUDACHECK(cudaStreamSynchronize(args->streams[i]));
-
-    std::vector<long long> h_start(gridCtas), h_end(gridCtas);
-    CUDACHECK(cudaMemcpy(h_start.data(), d_start, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaMemcpy(h_end.data(), d_end, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaFree(d_start));
-    CUDACHECK(cudaFree(d_end));
-
-    long long mn = h_start[0], mx = h_end[0];
-    for (int c = 1; c < gridCtas; c++) {
-      if (h_start[c] < mn) mn = h_start[c];
-      if (h_end[c] > mx) mx = h_end[c];
-    }
-    double totalUs = (double)(mx - mn) / (double)wallClkRateKhz * 1.0e3;  // cycles/kHz -> ms -> us
-    double perIterUs = totalUs / (double)loop;
-    if (perIterUs > localMaxUs) localMaxUs = perIterUs;
-  }
-
-  Barrier(args);
-
-  double devUs = localMaxUs;
   int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
-#ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-#endif
 
   // Mode 2 (device-time-only): hand per-iteration latency (seconds) back to BenchTime, which
   // reports it as THE time/busbw metric. Stay silent so the result line is not split.

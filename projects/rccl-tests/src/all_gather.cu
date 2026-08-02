@@ -12,6 +12,7 @@
 #include "nccl_device.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
 #include "rccl_vector_types.h"
+#include "gin_sdma_devtime.h"  // shared device-side (wall_clock64) timing scaffold
 #endif
 
 // LL (low-latency, packed data+flag) small-message AllGather path. The device
@@ -287,7 +288,7 @@ __device__ void AllGatherLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWin
 // independently; TEST_SDMA_THRESHOLD_UNSET falls back to the shared backend
 // value (rsCtx->sdmaThreshold from NCCL_GIN_ANVIL_SDMA_THRESHOLD).
 template <typename T>
-__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+__device__ __forceinline__ void ginAllGatherBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
   const size_t chunkBytes = count * sizeof(T);
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -356,6 +357,34 @@ __global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset
   gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
   gin.flush(ncclCoopCta());
 }
+
+// -D 3 production kernel: one AllGather (LL / single-CTA LSA / vectorized LSA / GIN puts).
+template <typename T>
+__global__ void GinHybridAllGatherKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+  (void)root;
+  ginAllGatherBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, sdmaThresholdOverride, llHandle);
+}
+
+// Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
+// AllGather bodies under ONE persistent launch, bracketing only the timed region with
+// wall_clock64() per CTA. Every body re-selects its tier and re-derives its sync at
+// entry (LSA rebuilds its barrier; LL advances its epoch; the GIN tier re-reads the
+// accumulated signal), so looping is correct with no extra bookkeeping. For the
+// single-CTA tiers (LL / small LSA) only CTA 0 does work and CTAs>0 fall straight
+// through to their end stamp, so min(start)..max(end) still captures CTA 0's window.
+template <typename T>
+__global__ void GinHybridAllGatherTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int loop, int skip, long long* start_time, long long* end_time) {
+  (void)root;
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginAllGatherBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, sdmaThresholdOverride, llHandle);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
+}
 #endif
 #endif
 
@@ -390,6 +419,58 @@ testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   return testSuccess;
 }
 
+// Device-side (in-kernel wall_clock64) timing for the GIN-SDMA AllGather (-D 3), via
+// the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING (legacy
+// NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra #[ag-devtime] line next
+// to the graph numbers), 2=device-time-only (report the in-kernel latency as the
+// out-of-place metric; in-place keeps normal timing). loop/skip via
+// NCCL_GIN_ANVIL_AG_DEVTIME_LOOP/_SKIP (default 10/10).
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+testResult_t AllGatherDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_AG_DEVTIME_LOOP", 10);
+  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_AG_DEVTIME_SKIP", 10);
+
+  const size_t count = args->nbytes / wordSize(type);   // per-rank send-chunk count
+  if (count == 0 || loop < 1) return testSuccess;
+
+  static const size_t agThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", gin_sdma::kAllGatherSdmaThresholdDefault);
+
+  auto kernel = SPECIALIZE_KERNEL(GinHybridAllGatherTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
+
+  const int gridCtas = (deviceCtaCount > 0) ? deviceCtaCount : 16;
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        size_t sendoff = in_place ? args->sendInplaceOffset * (size_t)devComm->rank : 0;
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, sendoff, recvwin, 0, count, root, *devComm,
+                 agThr, g_agLLHandle, loop, skip, d_start, d_end);
+      },
+      &devUs));
+
+  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
+    const size_t totalBytes = count * wordSize(type) * (size_t)nRanksGlobal;
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)totalBytes / 1.0e9 / sec;
+    double busBw = algBw * ((double)(nRanksGlobal - 1) / (double)nRanksGlobal);
+    printf("#[ag-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           totalBytes, gridCtas, loop, skip, devUs, algBw, busBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t AllGatherDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  return testSuccess;  // device API path not available in this build
+}
+#endif
+
 struct testColl allGatherTest = {
   "AllGather",
   AllGatherGetCollByteCount,
@@ -397,7 +478,8 @@ struct testColl allGatherTest = {
   AllGatherGetBw,
   AllGatherRunColl,
   AllGatherGetAlgoProtoChannels,
-  AllGatherGetSymkInfo
+  AllGatherGetSymkInfo,
+  AllGatherDeviceTime
 };
 
 void AllGatherGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {

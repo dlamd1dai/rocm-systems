@@ -15,6 +15,7 @@
 #include "rccl_float8.h"
 #endif
 #include "gin_sdma_reduce.h"  // device Apply<op,T>, mirrors verifiable.cu exactly
+#include "gin_sdma_devtime.h" // shared device-side (wall_clock64) timing scaffold
 
 // ReduceScatter (-D 3): the first reduction collective. Single tier -- balanced
 // LSA read-reduce for all sizes. Every rank reads its owned output slice
@@ -174,9 +175,7 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // (see the file-top note). The sdmaThreshold/scratch launch args are retained for
 // ABI compatibility but unused.
 template <typename T>
-__global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
-  (void)sdmaThresholdOverride;
-  (void)scratchHandle;
+__device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, int redOp) {
   const int nRanks = devComm.nRanks;
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const int nthreads = blockDim.x * gridDim.x;
@@ -364,6 +363,31 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
 
   lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
 }
+
+// -D 3 production kernel: one ReduceScatter. sdmaThreshold/scratch args retained for ABI.
+template <typename T>
+__global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
+  (void)sdmaThresholdOverride; (void)scratchHandle; (void)root;
+  ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+}
+
+// Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
+// ReduceScatter bodies under ONE persistent launch, bracketing only the timed region
+// with wall_clock64() per CTA. Every body re-derives its entry/exit LSA barrier, so
+// looping is correct with no extra bookkeeping (pure LSA -> no GIN cadence concern).
+template <typename T>
+__global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int loop, int skip, long long* start_time, long long* end_time) {
+  (void)root;
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
+}
 #endif
 
 testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
@@ -389,6 +413,57 @@ testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvb
   return testSuccess;
 }
 
+// Device-side (in-kernel wall_clock64) timing for the GIN-SDMA ReduceScatter (-D 3),
+// via the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING
+// (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra #[rs-devtime]
+// line next to the graph numbers), 2=device-time-only (report the in-kernel latency
+// as the out-of-place metric; in-place keeps normal timing). loop/skip via
+// NCCL_GIN_ANVIL_RS_DEVTIME_LOOP/_SKIP (default 10/10).
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_LOOP", 10);
+  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_SKIP", 10);
+
+  const size_t count = args->nbytes / wordSize(type);   // per-rank output-slice count
+  if (count == 0 || loop < 1) return testSuccess;
+
+  auto kernel = SPECIALIZE_REDUCE_KERNEL(GinReduceScatterTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
+
+  const int gridCtas = (deviceCtaCount > 0) ? deviceCtaCount : 16;
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        size_t sendoff = in_place ? args->sendInplaceOffset * (size_t)devComm->rank : 0;
+        size_t recvoff = in_place ? args->recvInplaceOffset * (size_t)devComm->rank : 0;
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, sendoff, recvwin, recvoff, count, root, *devComm,
+                 (int)op, loop, skip, d_start, d_end);
+      },
+      &devUs));
+
+  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
+    const size_t totalBytes = count * wordSize(type) * (size_t)nRanksGlobal;
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)totalBytes / 1.0e9 / sec;
+    double busBw = algBw * ((double)(nRanksGlobal - 1) / (double)nRanksGlobal);
+    printf("#[rs-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           totalBytes, gridCtas, loop, skip, devUs, algBw, busBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  return testSuccess;  // device API path not available in this build
+}
+#endif
+
 struct testColl reduceScatterTest = {
   "ReduceScatter",
   ReduceScatterGetCollByteCount,
@@ -396,7 +471,8 @@ struct testColl reduceScatterTest = {
   ReduceScatterGetBw,
   ReduceScatterRunColl,
   ReduceScatterGetAlgoProtoChannels,
-  ReduceScatterGetSymkInfo
+  ReduceScatterGetSymkInfo,
+  ReduceScatterDeviceTime
 };
 
 void ReduceScatterGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {
