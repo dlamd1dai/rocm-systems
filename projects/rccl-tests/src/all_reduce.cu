@@ -852,15 +852,17 @@ __device__ __forceinline__ void arAllReduceOneShotLsa(
   }
 }
 
-// -D 5 SINGLE-LAUNCH: RS -> in-kernel device-wide barrier -> AG, all in one kernel.
-// (Tiny out-of-place messages take the one-shot LSA read-reduce fast path above instead.)
+// -D 5 body: one full AllReduce (tiny one-shot fast path, else RS -> device-wide barrier
+// -> size-adaptive AllGather). Factored out of the kernel so the production kernel runs it
+// once and the device-timing kernel can loop it (skip+loop) under a single persistent launch.
+// Every call re-derives its sync state at entry (LSA rebuilds its barrier session; the GIN
+// world barrier re-reads the accumulated signal; arGridBarrier sense-reverses), so looping is
+// correct with no extra bookkeeping -- the same property the AllToAll timed kernel relies on.
 template <typename T>
-__global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
-                                   ncclWindow_t recvwin, size_t recvoffset, size_t count,
-                                   int root, struct ncclDevComm devComm,
-                                   size_t sdmaThresholdOverride, int redOp,
-                                   ncclDevResourceHandle scratchHandle,
-                                   size_t oneShotThresholdOverride) {
+__device__ __forceinline__ void ginAllReduceBody(
+    ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset,
+    size_t count, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp,
+    size_t oneShotThresholdOverride) {
   const int nRanks = devComm.nRanks;
   const int rank = devComm.rank;
   const size_t msgBytes = count * sizeof(T);
@@ -891,6 +893,47 @@ __global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
     arAllGatherInPlaceLsa<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
   else
     arAllGatherInPlace<T>(recvwin, recvoffset, msgBytes, strideBytes, rank, nRanks, devComm);
+}
+
+// -D 5 SINGLE-LAUNCH: RS -> in-kernel device-wide barrier -> AG, all in one kernel.
+// (Tiny out-of-place messages take the one-shot LSA read-reduce fast path above instead.)
+template <typename T>
+__global__ void GinAllReduceKernel(ncclWindow_t sendwin, size_t sendoffset,
+                                   ncclWindow_t recvwin, size_t recvoffset, size_t count,
+                                   int root, struct ncclDevComm devComm,
+                                   size_t sdmaThresholdOverride, int redOp,
+                                   ncclDevResourceHandle scratchHandle,
+                                   size_t oneShotThresholdOverride) {
+  ginAllReduceBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm,
+                      sdmaThresholdOverride, redOp, oneShotThresholdOverride);
+}
+
+// Device-side timing kernel (rocSHMEM AllToAll methodology, mirrored for AllReduce). A single
+// persistent launch runs (skip + loop) back-to-back AllReduce bodies and brackets only the
+// timed region with the GPU fixed-frequency wall clock (wall_clock64()), so the reported span
+// excludes host launch, teardown, and stream/graph overhead -- the pure device-function time.
+// skip warmup iterations run first (steady-state, discarded); at i == skip every CTA records
+// its start stamp, and after the final iteration every CTA records its end stamp. The host
+// reduces min(start)/max(end) across CTAs (the grid's true busy window) and MAX across ranks
+// (slowest rank closes the collective), then divides by loop for per-iteration latency.
+template <typename T>
+__global__ void GinAllReduceTimedKernel(ncclWindow_t sendwin, size_t sendoffset,
+                                        ncclWindow_t recvwin, size_t recvoffset, size_t count,
+                                        int root, struct ncclDevComm devComm,
+                                        size_t sdmaThresholdOverride, int redOp,
+                                        ncclDevResourceHandle scratchHandle,
+                                        size_t oneShotThresholdOverride,
+                                        int loop, int skip, long long* start_time, long long* end_time) {
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginAllReduceBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm,
+                        sdmaThresholdOverride, redOp, oneShotThresholdOverride);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
 }
 
 // -D 6 TWO-LAUNCH, phase 1: standalone ReduceScatter. The RS->AG boundary is the
@@ -999,6 +1042,116 @@ testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   return testNotImplemented;
 }
 
+// Device-side (in-kernel wall_clock64) timing for the GIN-SDMA AllReduce (-D 5), mirroring
+// the AllToAll methodology. Opt-in via NCCL_GIN_ANVIL_DEVICE_TIMING (or the legacy
+// NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (extra line next to the graph numbers),
+// 2=device-time-only (report the in-kernel latency AS the metric; out-of-place pass only).
+// Launches the persistent timed kernel once per size, brackets only the (skip+loop)
+// steady-state bodies with the GPU wall clock, reduces the grid busy window (min start ..
+// max end over CTAs) and the slowest rank (MPI MAX), then divides by loop. loop/skip come
+// from NCCL_GIN_ANVIL_AR_DEVTIME_LOOP/_SKIP (default 10/10, the rocSHMEM default).
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+testResult_t AllReduceDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  static const int loopEnv = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_AR_DEVTIME_LOOP");
+    return (e && *e) ? atoi(e) : 10;
+  }();
+  static const int skipEnv = []() {
+    const char* e = getenv("NCCL_GIN_ANVIL_AR_DEVTIME_SKIP");
+    return (e && *e) ? atoi(e) : 10;
+  }();
+
+  const size_t count = args->nbytes / wordSize(type);
+  if (count == 0 || loopEnv < 1) return testSuccess;
+  const size_t msgBytes = count * wordSize(type);
+  const int loop = loopEnv, skip = skipEnv;
+
+  static const size_t arThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceSdmaThresholdDefault);
+  static const size_t arOneShot = testResolveSdmaThreshold("NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE", gin_sdma::kAllReduceOneShotThresholdDefault);
+
+  static int wallClkRateKhz = 0;
+  if (wallClkRateKhz == 0) {
+    int dev = 0;
+    CUDACHECK(cudaGetDevice(&dev));
+    CUDACHECK(hipDeviceGetAttribute(&wallClkRateKhz, hipDeviceAttributeWallClockRate, dev));
+    if (wallClkRateKhz <= 0) wallClkRateKhz = 1;
+  }
+
+  const int gridCtas = arTunedGridCtas(msgBytes, kArMaxCtas);
+  double localMaxUs = 0.0;
+
+  // Isolate the timing run: cross-rank barriers before and after guarantee every rank enters
+  // and leaves the hook in lockstep so it can never race the next size's buffer re-init.
+  Barrier(args);
+
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    ncclDevComm* devComm = args->devComms + i;
+
+    auto kernel = SPECIALIZE_REDUCE_KERNEL(GinAllReduceTimedKernel, type, op);
+    if (kernel == nullptr) return testSuccess;
+
+    long long* d_start = nullptr;
+    long long* d_end = nullptr;
+    CUDACHECK(cudaMalloc(&d_start, (size_t)gridCtas * sizeof(long long)));
+    CUDACHECK(cudaMalloc(&d_end, (size_t)gridCtas * sizeof(long long)));
+
+    ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+    ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+    kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm,
+             arThr, (int)op, g_arScratchHandle, arOneShot, loop, skip, d_start, d_end);
+    CUDACHECK(cudaStreamSynchronize(args->streams[i]));
+
+    std::vector<long long> h_start(gridCtas), h_end(gridCtas);
+    CUDACHECK(cudaMemcpy(h_start.data(), d_start, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(h_end.data(), d_end, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaFree(d_start));
+    CUDACHECK(cudaFree(d_end));
+
+    long long mn = h_start[0], mx = h_end[0];
+    for (int c = 1; c < gridCtas; c++) {
+      if (h_start[c] < mn) mn = h_start[c];
+      if (h_end[c] > mx) mx = h_end[c];
+    }
+    double totalUs = (double)(mx - mn) / (double)wallClkRateKhz * 1.0e3;  // cycles/kHz -> ms -> us
+    double perIterUs = totalUs / (double)loop;
+    if (perIterUs > localMaxUs) localMaxUs = perIterUs;
+  }
+
+  Barrier(args);
+
+  double devUs = localMaxUs;
+  int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
+#ifdef MPI_SUPPORT
+  MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#endif
+
+  // Mode 2 (device-time-only): hand per-iteration latency (seconds) back to BenchTime, which
+  // reports it as THE time/busbw metric. Stay silent so the result line is not split.
+  if (outDeltaSec != nullptr) {
+    *outDeltaSec = devUs * 1.0e-6;
+    return testSuccess;
+  }
+
+  // Mode 1 (augment): print an extra device-only line next to the graph numbers.
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)msgBytes / 1.0e9 / sec;
+    double busBw = algBw * (2.0 * (double)(nRanksGlobal - 1) / (double)nRanksGlobal);
+    const char* tierName = (!in_place && msgBytes < arOneShot) ? "1SHOT"
+                         : (msgBytes < arThr) ? "LSA" : "SDMA";
+    printf("#[ar-devtime] size %12zu B  tier %-5s  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           msgBytes, tierName, gridCtas, loop, skip, devUs, algBw, busBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t AllReduceDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  return testSuccess;  // device API path not available in this build
+}
+#endif
+
 struct testColl allReduceTest = {
   "AllReduce",
   AllReduceGetCollByteCount,
@@ -1006,7 +1159,8 @@ struct testColl allReduceTest = {
   AllReduceGetBw,
   AllReduceRunColl,
   AllReduceGetAlgoProtoChannels,
-  AllReduceGetSymkInfo
+  AllReduceGetSymkInfo,
+  AllReduceDeviceTime
 };
 
 void AllReduceGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {

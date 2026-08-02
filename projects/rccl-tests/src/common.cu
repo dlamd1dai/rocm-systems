@@ -810,7 +810,8 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   // augments with an extra line; mode 0 is off.
   int devTimeMode = 0;
   if (deviceImpl != 0 && args->collTest->deviceTime != nullptr) {
-    const char* e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
+    const char* e = getenv("NCCL_GIN_ANVIL_DEVICE_TIMING");            // generic (any collective)
+    if (!(e && *e)) e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");    // legacy A2A-specific name
     devTimeMode = (e && *e) ? atoi(e) : 0;
   }
   // Device-time-only applies to the out-of-place pass (the reported gin-sdma
