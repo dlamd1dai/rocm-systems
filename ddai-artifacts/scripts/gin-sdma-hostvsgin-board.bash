@@ -57,23 +57,34 @@ parse_busbw() {  # $1 = raw log
        }' "$1"
 }
 
+# Cold-start guard (verified 2026-08-03): the FIRST mpirun in a fresh container
+# runs ~2-3x slow (e.g. host scatter @2M ~40 cold vs ~114 warm), and the per-run
+# `-w` warmup iterations do NOT cure it -- the ramp is at the container/clock
+# level, across mpirun launches. So run each measured sweep TWICE and keep only
+# the second; the discarded first run warms the GPUs. Without this the host leg
+# (first of the host/gin pair) is cold-penalized vs the warm gin leg, inflating
+# gin/host%.  $1 = log to capture the (second) measured run; $2.. = command.
+run_warm() {
+  local log="$1"; shift
+  "$@" >/dev/null 2>&1 || true                      # warmup (discarded)
+  "$@" 2>&1 | tee "$log" | grep -E "^[[:space:]]*[0-9]+[[:space:]]+[0-9]+|Avg bus" || echo "RC=$?"
+}
+
 for c in "${COLLS[@]}"; do
   bin="$(bin_of "$c")"; exe="${BIN_DIR}/${bin}"
   if [[ ! -x "$exe" ]]; then echo "SKIP $c: $exe not found"; continue; fi
   extra="$(flags_of "$c") $(root_of "$c")"
   hlog="$OUTDIR/${c}.host.log"; glog="$OUTDIR/${c}.gin.log"
 
-  echo "########## $c : HOST (-D 0) ##########"
+  echo "########## $c : HOST (-D 0)  [warm: 1 discarded + 1 measured] ##########"
   # shellcheck disable=SC2086
-  mpirun -n "$NP" "${MPI_OPT[@]}" "${COMMON[@]}" \
-    "$exe" -b "$B" -e "$E" -f "$F" -g 1 -R 2 -D 0 -c 0 -n "$N" -w "$W" -z 0 $extra \
-    2>&1 | tee "$hlog" | grep -E "^[[:space:]]*[0-9]+[[:space:]]+[0-9]+|Avg bus" || echo "HOST_RC=$?"
+  run_warm "$hlog" mpirun -n "$NP" "${MPI_OPT[@]}" "${COMMON[@]}" \
+    "$exe" -b "$B" -e "$E" -f "$F" -g 1 -R 2 -D 0 -c 0 -n "$N" -w "$W" -z 0 $extra
 
-  echo "########## $c : GIN-SDMA (-D 3) ##########"
+  echo "########## $c : GIN-SDMA (-D 3)  [warm: 1 discarded + 1 measured] ##########"
   # shellcheck disable=SC2086
-  mpirun -n "$NP" "${MPI_OPT[@]}" "${COMMON[@]}" "${GINENV[@]}" \
-    "$exe" -b "$B" -e "$E" -f "$F" -g 1 -R 2 -V "$CTA" -D 3 -c 0 -n "$N" -w "$W" -z 0 $extra \
-    2>&1 | tee "$glog" | grep -E "^[[:space:]]*[0-9]+[[:space:]]+[0-9]+|Avg bus" || echo "GIN_RC=$?"
+  run_warm "$glog" mpirun -n "$NP" "${MPI_OPT[@]}" "${COMMON[@]}" "${GINENV[@]}" \
+    "$exe" -b "$B" -e "$E" -f "$F" -g 1 -R 2 -V "$CTA" -D 3 -c 0 -n "$N" -w "$W" -z 0 $extra
 
   echo ""
   echo "===== GAP BOARD: $c  (size  host_GBs  gin_GBs  gin/host%) ====="
