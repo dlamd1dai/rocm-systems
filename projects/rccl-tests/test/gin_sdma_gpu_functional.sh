@@ -28,7 +28,7 @@
 # Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter> <bin_dir> <np> [launcher]
 set -euo pipefail
 
-COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter)}"
+COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter|reduce)}"
 BIN_DIR="${2:?build dir containing *_perf}"
 NP="${3:-8}"
 LAUNCHER="${4:-mpirun}"
@@ -41,6 +41,7 @@ case "$COLL" in
   gather)     BIN="gather_perf" ;;
   sendrecv)   BIN="sendrecv_perf" ;;
   reduce_scatter) BIN="reduce_scatter_perf" ;;
+  reduce)     BIN="reduce_perf" ;;
   *) echo "unknown collective: $COLL" >&2; exit 2 ;;
 esac
 
@@ -214,6 +215,36 @@ case "$COLL" in
       "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
       "$EXE" -b "$RS_MIN" -e 64K -f 4 -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o all -d all -z 0
+    set +x
+    ;;
+  reduce)
+    # Reduce as reduce-scatter-to-root: each rank folds its owned slice from
+    # every peer's sendbuff (ascending source order, verifiable oracle) and
+    # writes the reduced slice into the root's recvbuff; non-root recvbuffs are
+    # untouched. Exercise rank==root and non-root write paths on root 0 and the
+    # last rank, both out-of-place and in-place, plus an op x type matrix. Start
+    # at NP*16 B so the count aligns to the NP*VEC (16 B line) boundary.
+    RED_MIN=$(( NP * 16 )); [[ "$MIN_BYTES" -gt "$RED_MIN" ]] && RED_MIN="$MIN_BYTES"
+    for root in 0 $((NP - 1)); do
+      for zp in 0 1; do
+        echo "=== [$COLL] sweep root=$root op=sum $( [[ $zp == 0 ]] && echo out-of-place || echo in-place ) ==="
+        set -x
+        "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+          "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+          "$EXE" -b "$RED_MIN" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+          -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -r "$root" -o sum -z "$zp"
+        set +x
+      done
+    done
+    # Op x type matrix on a small range (root 0): every supported op and type
+    # must match the verifiable oracle. fp8 prod and PreMulSum ("mulsum") are
+    # skipped by the driver on the device path (SPECIALIZE_REDUCE_KERNEL nullptr).
+    echo "=== [$COLL] op x type matrix, small range (-o all -d all, root 0) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+      "$EXE" -b "$RED_MIN" -e 64K -f 4 -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o all -d all -r 0 -z 0
     set +x
     ;;
   sendrecv)
