@@ -28,7 +28,7 @@
 # Usage: gin_sdma_gpu_functional.sh <broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter> <bin_dir> <np> [launcher]
 set -euo pipefail
 
-COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter|reduce)}"
+COLL="${1:?collective (broadcast|all_gather|alltoall|scatter|gather|sendrecv|reduce_scatter|reduce|all_reduce)}"
 BIN_DIR="${2:?build dir containing *_perf}"
 NP="${3:-8}"
 LAUNCHER="${4:-mpirun}"
@@ -42,6 +42,7 @@ case "$COLL" in
   sendrecv)   BIN="sendrecv_perf" ;;
   reduce_scatter) BIN="reduce_scatter_perf" ;;
   reduce)     BIN="reduce_perf" ;;
+  all_reduce) BIN="all_reduce_perf" ;;
   *) echo "unknown collective: $COLL" >&2; exit 2 ;;
 esac
 
@@ -245,6 +246,47 @@ case "$COLL" in
       "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
       "$EXE" -b "$RED_MIN" -e 64K -f 4 -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP" -o all -d all -r 0 -z 0
+    set +x
+    ;;
+  all_reduce)
+    # P3 reduction collective; the GIN path is -D 5 (single-launch RS+AG compose),
+    # NOT the -D 3 that run() hardcodes, so this case launches directly. Size-hybrid:
+    # small out-of-place -> one-shot direct LSA read-reduce; large OR in-place ->
+    # two-shot ReduceScatter+AllGather (grid self-caps to 16 CTAs regardless of -V).
+    # all_reduce_perf runs in-place and out-of-place per size, so a full sweep covers
+    # one-shot (small OOP), two-shot IP (small), and two-shot both (large).
+    for zp in 0 1; do
+      echo "=== [$COLL] sweep op=sum $( [[ $zp == 0 ]] && echo out-of-place || echo in-place ) (-D 5) ==="
+      set -x
+      "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+        "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+        "$EXE" -b "$MIN_BYTES" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+        -D 5 -c 1 -n "$ITERS" -w "$WARMUP" -o sum -z "$zp"
+      set +x
+    done
+    # Force the all-GIN two-shot tier (threshold=0) so the RS+AG kernel path stays
+    # covered even below the tuned cutover. Start at 1 MiB (like reduce_scatter): a
+    # forced-GIN sweep from very small sizes hits the pre-existing GIN/SDMA
+    # cold-start hang common to ALL GIN collectives, so tiny forced-GIN is out of
+    # scope. The two-shot path is stable at realistic sizes.
+    AR_GIN_MIN="${GIN_SDMA_AR_GIN_MIN:-1048576}"
+    [[ "$AR_GIN_MIN" -lt "$MIN_BYTES" ]] && AR_GIN_MIN="$MIN_BYTES"
+    echo "=== [$COLL] GIN two-shot forced (NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE=0, -b ${AR_GIN_MIN}) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE=0 \
+      "$EXE" -b "$AR_GIN_MIN" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 5 -c 1 -n "$ITERS" -w "$WARMUP" -o sum -z 0
+    set +x
+    # Op x type matrix on a small range: every supported op and type must match the
+    # verifiable oracle. fp8 {prod,avg} and PreMulSum ("mulsum") are skipped by the
+    # driver on the device path (SPECIALIZE_REDUCE_KERNEL nullptr).
+    echo "=== [$COLL] op x type matrix, small range (-o all -d all) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" \
+      "$EXE" -b "$MIN_BYTES" -e 64K -f 4 -g 1 -R 2 -V "$CTA" \
+      -D 5 -c 1 -n "$ITERS" -w "$WARMUP" -o all -d all -z 0
     set +x
     ;;
   sendrecv)
