@@ -23,7 +23,7 @@
 // the N contributions with gin_sdma_reduce (ascending source-rank order, matching
 // the verifier bit-for-bit) and writes its local recvbuff. This is the same
 // direct-parallel-pull algorithm RCCL's symmetric ReduceScatter LD kernel uses.
-// Balanced egress, no scratch/signals -- entry + exit LSA barrier only. Reads are
+// Balanced egress, no scratch/signals -- entry LSA barrier only. Reads are
 // 128-bit packed and pack-unrolled (see GinReduceScatterKernel) to keep the xGMI
 // read pipe full.
 //
@@ -141,8 +141,9 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // Single tier: balanced LSA read-reduce. Each rank reads its owned output slice
 // [rank*count] directly from EVERY peer's sendbuff via ncclGetLsaPointer, folds
 // the N contributions in ascending source-rank order (matching verifiable.cu
-// bit-for-bit via gin_sdma_reduce), and writes its local recvbuff. Entry + exit
-// LSA barrier only -- no scratch, signals, or GIN puts.
+// bit-for-bit via gin_sdma_reduce), and writes its local recvbuff. Entry LSA
+// barrier only (own-writes-local pull, no exit barrier) -- no scratch, signals,
+// or GIN puts.
 //
 // Reads are 128-bit packed (Pack = 16 bytes = VEC elements). The load SCHEDULE is
 // chosen by total message size (both schedules fold identically, bit-for-bit):
@@ -361,10 +362,18 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
     }
   }
 
-  lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
+  // NO exit barrier: this is an own-writes-local pull (each rank writes ONLY its
+  // local recvbuff and reads peers' read-only sendbuffs), so there is no cross-
+  // rank write to publish and no memset race to fence -- the same reasoning that
+  // makes the AllGather LSA pull tier entry-only. The entry barrier already
+  // guarantees every peer's sendbuff is filled before any read; a rank that
+  // finishes early cannot corrupt what a slow peer still reads (sendbuff is never
+  // written by the kernel), and the next collective's entry barrier resynchronizes
+  // before sendbuff is re-read. In the looped timed kernel each iteration's entry
+  // barrier is itself a full inter-iteration sync, so entry-only stays lockstep.
 }
 
-// -D 3 production kernel: one ReduceScatter. sdmaThreshold/scratch args retained for ABI.
+// -D 3 kernel: one ReduceScatter. sdmaThreshold/scratch args retained for ABI.
 template <typename T>
 __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
   (void)sdmaThresholdOverride; (void)scratchHandle; (void)root;
@@ -373,8 +382,9 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
 
 // Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
 // ReduceScatter bodies under ONE persistent launch, bracketing only the timed region
-// with wall_clock64() per CTA. Every body re-derives its entry/exit LSA barrier, so
-// looping is correct with no extra bookkeeping (pure LSA -> no GIN cadence concern).
+// with wall_clock64() per CTA. Every body re-derives its entry LSA barrier, which
+// is itself a full inter-iteration sync, so looping is correct with no extra
+// bookkeeping (pure LSA -> no GIN cadence concern).
 template <typename T>
 __global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int loop, int skip, long long* start_time, long long* end_time) {
   (void)root;
