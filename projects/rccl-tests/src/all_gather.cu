@@ -388,6 +388,31 @@ __global__ void GinHybridAllGatherTimedKernel(ncclWindow_t sendwin, size_t sendo
 #endif
 #endif
 
+// AllGather is pure data movement: the element type only sets the per-element
+// byte width (no reduction arithmetic), so bf16 (2B) and the fp8 types (1B) are
+// gathered bit-exactly by the already-instantiated same-width specializations
+// (half / uint8_t). The shared SPECIALIZE_KERNEL deliberately omits bf16/fp8
+// because it is also used by the reduction collectives (e.g. AllReduce), whose
+// kernels would then need real bf16/fp8 arithmetic instantiations. Handling
+// them locally lets `-d all` cover bf16/fp8 for AllGather (matching RS, which
+// gets them via SPECIALIZE_REDUCE_KERNEL) without aborting the sweep on the
+// first bf16 launch, and without touching the arithmetic-bearing kernels.
+#if HAVE_BF16
+#define AG_BF16_CASE(kernel, type) (type) == ncclBfloat16 ? kernel<half> :
+#else
+#define AG_BF16_CASE(kernel, type)
+#endif
+#if HAVE_FP8
+#define AG_FP8_CASE(kernel, type) (type) == ncclFloat8e4m3 ? kernel<uint8_t> : (type) == ncclFloat8e5m2 ? kernel<uint8_t> :
+#else
+#define AG_FP8_CASE(kernel, type)
+#endif
+#define SPECIALIZE_AG_KERNEL(kernel, type, op) \
+  ( (op) != ncclSum ? nullptr : \
+    AG_BF16_CASE(kernel, type) \
+    AG_FP8_CASE(kernel, type) \
+    SPECIALIZE_KERNEL(kernel, type, op) )
+
 testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
   if (deviceImpl == 0) {
     char* sptr = (char*)sendbuff + sendoffset;
@@ -405,9 +430,9 @@ testResult_t AllGatherRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t agThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", gin_sdma::kAllGatherSdmaThresholdDefault);
 #if defined(AG_HAVE_LL)
-        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr, g_agLLHandle));
+        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_AG_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr, g_agLLHandle));
 #else
-        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr));
+        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_AG_KERNEL(GinHybridAllGatherKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, agThr));
 #endif
         return testSuccess;
       }
@@ -435,7 +460,7 @@ testResult_t AllGatherDeviceTime(struct threadArgs* args, ncclDataType_t type, n
 
   static const size_t agThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", gin_sdma::kAllGatherSdmaThresholdDefault);
 
-  auto kernel = SPECIALIZE_KERNEL(GinHybridAllGatherTimedKernel, type, op);
+  auto kernel = SPECIALIZE_AG_KERNEL(GinHybridAllGatherTimedKernel, type, op);
   if (kernel == nullptr) return testSuccess;
 
   const int gridCtas = (deviceCtaCount > 0) ? deviceCtaCount : 16;
