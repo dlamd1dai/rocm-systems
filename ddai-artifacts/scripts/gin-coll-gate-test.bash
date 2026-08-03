@@ -18,7 +18,7 @@ if ! make -j"$(nproc)"; then
 fi
 echo "BUILD_OK"
 
-COLLS=(broadcast all_gather alltoall scatter gather sendrecv reduce all_reduce)
+COLLS=(broadcast all_gather alltoall scatter gather sendrecv reduce_scatter reduce all_reduce)
 declare -A RC
 for c in "${COLLS[@]}"; do
   echo ""
