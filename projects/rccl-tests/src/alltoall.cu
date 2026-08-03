@@ -152,7 +152,14 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       // is selected. Sized for kA2aLsaMaxCtas CTAs x nRanks sources x kA2aFlagSlots.
       {
         const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-        g_a2aSyncMode = (e && *e) ? atoi(e) : 3;  // default: single exit barrier
+        // Default 0: entry + exit barriers. The direct-LSA tier PUSHES into peers'
+        // recvbufs, so an entry barrier is required to order every rank's prior
+        // writes to its own recvbuf (the harness initData memset, or a previous
+        // op) before any remote rank pushes into it. Mode 3 (exit-only) skipped
+        // that entry barrier and intermittently lost writes to the peer memset
+        // (~33% of gate runs, random mid-size rows); it is retained below as an
+        // unsafe diagnostic. See ginHybridAlltoAllBody for the per-mode contract.
+        g_a2aSyncMode = (e && *e) ? atoi(e) : 0;  // default: entry+exit barriers (correctness)
         if (g_a2aSyncMode == 2) {
           size_t nFlags = (size_t)gin_sdma::kA2aLsaMaxCtas *
                           (1 + (size_t)commProperties->nRanks * gin_sdma::kA2aFlagSlots);
@@ -467,14 +474,22 @@ __device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, n
       return;
     }
 
-    /* small messages: direct LSA all-peers copy (all CTAs). a2aSyncMode selects
-     * the cross-rank sync:
-     *   3 = DEFAULT: single exit barrier only. The exit barrier both completes the
-     *       call (all ranks done writing before any returns) and guards the *next*
-     *       call's writes into this recvbuf, so a separate entry barrier is
-     *       redundant; the first call's memset race is covered by the one-time
-     *       connect/init sync. +9-17% busbw across the LSA band vs mode 0.
-     *   0 = the two LSA barriers (legacy: redundant entry barrier + exit barrier).
+    /* small messages: direct LSA all-peers copy (all CTAs), PUSH model: this rank
+     * writes its slice into every peer's recvbuf. a2aSyncMode selects the
+     * cross-rank sync:
+     *   0 = DEFAULT: entry + exit barriers. The entry barrier orders every rank's
+     *       prior writes to its own recvbuf (initData memset or a previous op)
+     *       *before* any remote rank pushes into it; the exit barrier completes
+     *       the call (all ranks done writing before any returns). Both are
+     *       required for a push-based A2A.
+     *   3 = UNSAFE (exit barrier only). Skips the entry barrier on the theory that
+     *       the previous call's exit barrier already guards this recvbuf. That
+     *       fails whenever recvbuf is (re)written between calls with no intervening
+     *       cross-rank sync (e.g. the harness memsets recvbuf per size after the
+     *       prior exit barrier): a fast peer pushes into this recvbuf before the
+     *       local memset lands, and the memset then clobbers the pushed data ->
+     *       intermittent wrong mid-size rows (~33% of gate runs). Was +9-17% busbw
+     *       across the LSA band but is not correctness-safe; kept as a diagnostic.
      *   1 = NONE (diagnostic: barrier-free ceiling of the 1-pass copy; correct
      *       only under the harness's external per-iteration rank sync).
      *   2 = per-call point-to-point done-flag completion. Each CTA writes its
@@ -773,11 +788,14 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
             gridCtas = llCtaOverride < gin_sdma::kA2aLLCtas ? llCtaOverride : gin_sdma::kA2aLLCtas;
         }
         // LSA-tier cross-rank sync mode (NCCL_GIN_ANVIL_A2A_SYNC_MODE):
-        //   3 (DEFAULT) = single exit barrier (the exit barrier both completes the
-        //       call and guards the next call's writes; the first call's memset
-        //       race is covered by the one-time connect/init sync). +9-17% busbw
-        //       across the LSA band vs the legacy two-barrier path, #wrong==0.
-        //   0 = two LSA barriers (legacy: redundant entry barrier + exit barrier).
+        //   0 (DEFAULT) = entry + exit LSA barriers. The direct-LSA tier PUSHES
+        //       into peers' recvbufs, so the entry barrier is required to order
+        //       every rank's prior recvbuf writes (initData memset or a previous
+        //       op) before any remote push; the exit barrier completes the call.
+        //   3 = UNSAFE: exit barrier only. Skips the entry barrier, so a fast peer
+        //       pushes into this recvbuf before the local memset lands and the
+        //       memset clobbers it -> intermittent wrong mid-size rows. Was +9-17%
+        //       busbw across the LSA band but is not correctness-safe (diagnostic).
         //   1 = none (diagnostic ceiling: barrier-free 1-pass copy; correct only
         //       under an external per-iteration sync -- beats host by 10-21%).
         //   2 = point-to-point done-flag completion (diagnostic: a correct per-call
@@ -785,7 +803,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         //       since a 1-pass copy's completion is inherently a cross-rank sync).
         static const int a2aSyncMode = []() {
           const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-          return (e && *e) ? atoi(e) : 3;
+          return (e && *e) ? atoi(e) : 0;
         }();
         TESTCHECK(testLaunchDeviceKernelThresholdLLCtasFlag(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas, a2aSyncMode, g_a2aFlagHandle));
 #else
@@ -839,7 +857,7 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
   static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", gin_sdma::kAllToAllSdmaThresholdDefault);
   static const int a2aSyncMode = []() {
     const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-    return (e && *e) ? atoi(e) : 3;
+    return (e && *e) ? atoi(e) : 0;  // default: entry+exit barriers (see production launch)
   }();
 
   // By default use the exact skip/loop counts at every size so the device-timing
