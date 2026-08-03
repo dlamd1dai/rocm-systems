@@ -47,26 +47,6 @@ static size_t g_a2aLLMaxBytes = 0;  // resolved from env at requirements time
 static ncclLLA2AHandle g_a2aLLHandle = {};
 static ncclDevResourceRequirements g_a2aLLReq = {};
 
-// Option A (barrier-free LSA completion) scratch: a per-rank flag inbox in the
-// resource window. Allocated only when NCCL_GIN_ANVIL_A2A_SYNC_MODE==2. Layout
-// per slab (uint64): [epoch[c]] for c in [0,kA2aLsaMaxCtas) then
-// [done[c][s][slot]] indexed (kA2aLsaMaxCtas + ((c*nRanks + s)*kA2aFlagSlots + slot)).
-static int g_a2aSyncMode = 0;                      // resolved from env at requirements time
-static ncclDevResourceHandle_t g_a2aFlagHandle = 0;
-static ncclDevResourceRequirements g_a2aFlagReq = {};
-
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-// System-scope release store / acquire load of a single 64-bit flag to/from a
-// peer's (or our own) resource-window inbox. System scope + release/acquire give
-// the cross-GPU ordering (data writes -> fence -> done flag; peer: acquire flag
-// -> data visible) without a collective barrier.
-__device__ __forceinline__ void a2aFlagStore(uint64_t* p, uint64_t v) {
-  __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-__device__ __forceinline__ uint64_t a2aFlagLoad(uint64_t* p) {
-  return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
-}
-#endif
 #endif
 
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -148,29 +128,10 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
           reqs->resourceRequirementsList = &g_a2aLLReq;
         }
       }
-      // Option A: allocate the barrier-free completion flag inbox when sync mode 2
-      // is selected. Sized for kA2aLsaMaxCtas CTAs x nRanks sources x kA2aFlagSlots.
-      {
-        const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-        // Default 0: entry + exit barriers. The direct-LSA tier PUSHES into peers'
-        // recvbufs, so an entry barrier is required to order every rank's prior
-        // writes to its own recvbuf (the harness initData memset, or a previous
-        // op) before any remote rank pushes into it. Mode 3 (exit-only) skipped
-        // that entry barrier and intermittently lost writes to the peer memset
-        // (~33% of gate runs, random mid-size rows); it is retained below as an
-        // unsafe diagnostic. See ginHybridAlltoAllBody for the per-mode contract.
-        g_a2aSyncMode = (e && *e) ? atoi(e) : 0;  // default: entry+exit barriers (correctness)
-        if (g_a2aSyncMode == 2) {
-          size_t nFlags = (size_t)gin_sdma::kA2aLsaMaxCtas *
-                          (1 + (size_t)commProperties->nRanks * gin_sdma::kA2aFlagSlots);
-          memset(&g_a2aFlagReq, 0, sizeof(g_a2aFlagReq));
-          g_a2aFlagReq.bufferSize = nFlags * sizeof(uint64_t);
-          g_a2aFlagReq.bufferAlign = 16;
-          g_a2aFlagReq.outBufferHandle = &g_a2aFlagHandle;
-          g_a2aFlagReq.next = reqs->resourceRequirementsList;
-          reqs->resourceRequirementsList = &g_a2aFlagReq;
-        }
-      }
+      // The direct-LSA tier is PULL (reads peers' read-only sendbufs, writes only
+      // its own recvbuf) and needs a single entry LSA barrier -- no extra
+      // resource-window scratch. (The push-era point-to-point done-flag inbox was
+      // removed with the push variant.)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -229,22 +190,25 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
 // shared scalar AlltoAll implementation used by both kernels
 template <typename T>
 __device__ void AlltoAllScalarImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int rank, int nRanks, int tid, int nthreads) {
-  T* sendPtr = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
+  // PULL model: read this rank's slice from every peer's sendbuf and write only
+  // this rank's own recvbuf. No rank writes a peer's recvbuf, so the recvbuf is
+  // touched locally only (no cross-rank recvbuf-memset race).
+  T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, rank);
 
   // F2+F3 peer schedule: peer = (rank + blockIdx.x + pp) % nRanks. F2 rotates by
-  // rank so different ranks target distinct peers at the same step (no cross-rank
-  // xGMI incast). F3 adds blockIdx.x so different CTAs of the *same* rank are on
-  // different peers at the same instant -- otherwise every CTA marches through
-  // the peers in lock-step and the rank drives only one xGMI egress link at a
-  // time, cycling the 7 links serially; the phase shift spreads the CTAs across
-  // all peers so every link runs concurrently (host-RING channel parallelism).
-  // Coverage is unchanged: each thread still visits every peer once per offset.
+  // rank so different ranks read from distinct peers at the same step (no
+  // cross-rank xGMI read incast). F3 adds blockIdx.x so different CTAs of the
+  // *same* rank pull from different peers at the same instant -- otherwise every
+  // CTA marches through the peers in lock-step and the rank drives only one xGMI
+  // ingress link at a time, cycling the 7 links serially; the phase shift spreads
+  // the CTAs across all peers so every link runs concurrently (host-RING channel
+  // parallelism). Coverage is unchanged: each thread still visits every peer once
+  // per offset.
   for (size_t offset = tid; offset < count; offset += nthreads) {
     for (int pp = 0; pp < nRanks; pp++) {
       int peer = (rank + blockIdx.x + pp) % nRanks;
-      T value = sendPtr[peer * count + offset];
-      T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, peer);
-      recvPtr[rank * count + offset] = value;
+      const T* peerSendPtr = (const T*)ncclGetLsaPointer(sendwin, sendoffset, peer);
+      recvPtr[peer * count + offset] = peerSendPtr[rank * count + offset];
     }
   }
 }
@@ -259,11 +223,18 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
   constexpr int UNROLL_FACTOR = 128/sizeof(TN);
   constexpr int PEER_UNROLL = 2;
 
-  T* sendPtr = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
+  // PULL model: read this rank's slice from every peer's sendbuf, write only this
+  // rank's own recvbuf. recvPtr (local dest) is the base we store to; sendPtrLocal
+  // is this rank's own sendbuf base, used only as the alignment witness for the
+  // peer sendbufs (the symmetric window gives every rank the same base alignment).
+  T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, rank);
+  T* sendPtrLocal = (T*)ncclGetLsaPointer(sendwin, sendoffset, rank);
 
-  // alignment check: can we use vectorized operations?
+  // alignment check: can we use vectorized operations? Require both the local
+  // recv base (dest) and the send base (representative of the remote src) aligned.
   bool canVectorize = (sizeof(TN) > sizeof(T)) &&  // Only if vectorization helps
-                      (reinterpret_cast<uintptr_t>(sendPtr) % sizeof(TN) == 0) &&  // Base aligned
+                      (reinterpret_cast<uintptr_t>(recvPtr) % sizeof(TN) == 0) &&  // Dest base aligned
+                      (reinterpret_cast<uintptr_t>(sendPtrLocal) % sizeof(TN) == 0) &&  // Src base aligned
                       ((count * sizeof(T)) % sizeof(TN) == 0);  // Stride compatible
 
   if (canVectorize) {
@@ -284,8 +255,8 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
           // all xGMI egress links busy instead of one at a time. See
           // AlltoAllScalarImpl for the full rationale.
           int peer = (rank + blockIdx.x + peerBase + p) % nRanks;
-          TN* sendVecPtr = (TN*)(sendPtr + peer * count);
-          TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + rank * count);
+          TN* recvVecPtr = (TN*)(recvPtr + peer * count);
+          TN* sendVecPtr = (TN*)((T*)ncclGetLsaPointer(sendwin, sendoffset, peer) + rank * count);
           TN values[UNROLL_FACTOR];
 
           // split load/store into separate loops for better overlap and ILP
@@ -307,8 +278,8 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
     for (size_t base_offset = aligned_vector_count + tid; base_offset < vector_count; base_offset += nthreads) {
       for (int pp = 0; pp < nRanks; pp++) {
         int peer = (rank + blockIdx.x + pp) % nRanks;  // F2+F3: rotated + per-CTA phase
-        TN* sendVecPtr = (TN*)(sendPtr + peer * count);
-        TN* recvVecPtr = (TN*)((T*)ncclGetLsaPointer(recvwin, recvoffset, peer) + rank * count);
+        TN* recvVecPtr = (TN*)(recvPtr + peer * count);
+        TN* sendVecPtr = (TN*)((T*)ncclGetLsaPointer(sendwin, sendoffset, peer) + rank * count);
         recvVecPtr[base_offset] = sendVecPtr[base_offset];
       }
     }
@@ -318,9 +289,8 @@ __device__ void AlltoAllVectorizedImpl(ncclWindow_t sendwin, size_t sendoffset, 
     for (size_t offset = scalar_start + tid; offset < count; offset += nthreads) {
       for (int pp = 0; pp < nRanks; pp++) {
         int peer = (rank + blockIdx.x + pp) % nRanks;  // F2+F3: rotated + per-CTA phase
-        T value = sendPtr[peer * count + offset];
-        T* recvPtr = (T*)ncclGetLsaPointer(recvwin, recvoffset, peer);
-        recvPtr[rank * count + offset] = value;
+        const T* peerSendPtr = (const T*)ncclGetLsaPointer(sendwin, sendoffset, peer);
+        recvPtr[peer * count + offset] = peerSendPtr[rank * count + offset];
       }
     }
   } else {
@@ -450,10 +420,10 @@ __device__ void AlltoAllLLImpl(ncclWindow_t sendwin, size_t sendoffset, ncclWind
 // either once (production kernel) or in a persistent skip+loop (device-timing
 // kernel). Behavior is byte-for-byte identical to the original kernel: every
 // tier reads/derives its own per-call sync state (LSA barrier session, GIN
-// signal snapshot, mode-2 persistent epoch) at entry, so calling this in a loop
-// yields a sequence of complete, correct alltoalls with no external bookkeeping.
+// signal snapshot) at entry, so calling this in a loop yields a sequence of
+// complete, correct alltoalls with no external bookkeeping.
 template <typename T>
-__device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
+__device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
   const size_t size = count * sizeof(T);  // per-peer chunk bytes
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
                                    ? sdmaThresholdOverride
@@ -474,81 +444,33 @@ __device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, n
       return;
     }
 
-    /* small messages: direct LSA all-peers copy (all CTAs), PUSH model: this rank
-     * writes its slice into every peer's recvbuf. a2aSyncMode selects the
-     * cross-rank sync:
-     *   0 = DEFAULT: entry + exit barriers. The entry barrier orders every rank's
-     *       prior writes to its own recvbuf (initData memset or a previous op)
-     *       *before* any remote rank pushes into it; the exit barrier completes
-     *       the call (all ranks done writing before any returns). Both are
-     *       required for a push-based A2A.
-     *   3 = UNSAFE (exit barrier only). Skips the entry barrier on the theory that
-     *       the previous call's exit barrier already guards this recvbuf. That
-     *       fails whenever recvbuf is (re)written between calls with no intervening
-     *       cross-rank sync (e.g. the harness memsets recvbuf per size after the
-     *       prior exit barrier): a fast peer pushes into this recvbuf before the
-     *       local memset lands, and the memset then clobbers the pushed data ->
-     *       intermittent wrong mid-size rows (~33% of gate runs). Was +9-17% busbw
-     *       across the LSA band but is not correctness-safe; kept as a diagnostic.
-     *   1 = NONE (diagnostic: barrier-free ceiling of the 1-pass copy; correct
-     *       only under the harness's external per-iteration rank sync).
-     *   2 = per-call point-to-point done-flag completion. Each CTA writes its
-     *       slice, fences (release, system scope), signals every peer one done
-     *       flag, then waits for all sources -> me. Correct, but measured ~= the
-     *       two-barrier cost: a 1-pass copy's completion is inherently a
-     *       cross-rank sync (barrier-free completion would need in-band flags,
-     *       i.e. a second pass). Kept as a documented diagnostic. */
+    /* small messages: direct LSA all-peers copy (all CTAs), PULL model: each rank
+     * READS its slice from every peer's (read-only) sendbuf and writes only its
+     * own recvbuf (AlltoAllVectorizedImpl). Because no rank writes a peer's
+     * recvbuf, the recvbuf-memset race the push variant suffered is structurally
+     * impossible: recvbuf is touched locally only and is ordered with its initData
+     * memset by same-stream program order.
+     *
+     * The one cross-rank hazard left is reading a peer's sendbuf before that
+     * peer's initData fill is visible across xGMI (the cudaDeviceSynchronize in
+     * initData is device-local; it does not publish the fill to peers). A single
+     * entry LSA barrier -- each rank arrives only after its own sendbuf fill and
+     * departs only once every peer has arrived -- establishes that ordering, so
+     * every peer-sendbuf read after the barrier observes initialized data.
+     *
+     * No exit barrier is needed: sendbuf is not modified within the call and
+     * recvbuf is local, so nothing a peer still reads can change before this rank
+     * returns; completion is just kernel/stream completion. (A caller that reuses
+     * its sendbuf immediately after the collective -- outside this harness -- would
+     * additionally need an exit barrier to fence lingering sendbuf readers.) */
     ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
-    if (a2aSyncMode == 0) lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+    lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     const int rank = devComm.rank, nRanks = devComm.nRanks;
     const int tid = threadIdx.x + blockDim.x * blockIdx.x;
     const int nthreads = blockDim.x * gridDim.x;
 
-    // Mode 2: read the per-CTA persistent epoch (raw+1 so epoch>=1 never matches
-    // a zero-initialized flag slot) and pick the double-buffer slot.
-    __shared__ uint64_t s_a2aEpoch;
-    uint64_t a2aEpoch = 0;
-    int a2aSlot = 0;
-    uint64_t* a2aMyFlags = nullptr;
-    if (a2aSyncMode == 2) {
-      a2aMyFlags = (uint64_t*)ncclGetResourceBufferLocalPointer(devComm, a2aFlagBuf);
-      if (threadIdx.x == 0) s_a2aEpoch = a2aMyFlags[blockIdx.x] + 1;
-      __syncthreads();
-      a2aEpoch = s_a2aEpoch;
-      a2aSlot = (int)(a2aEpoch % (uint64_t)gin_sdma::kA2aFlagSlots);
-    }
-
     AlltoAllVectorizedImpl<T>(sendwin, sendoffset, recvwin, recvoffset, count, rank, nRanks, tid, nthreads);
-
-    if (a2aSyncMode == 0 || a2aSyncMode == 3) {
-      // mode 3: exit barrier only (skip entry). One optimized team barrier per
-      // call provides both completion and the *next* call's readiness guard; the
-      // very first call's memset race is covered by the harness's initial sync.
-      lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
-    } else if (a2aSyncMode == 2) {
-      // Publish this CTA's writes to system scope before signaling any done flag:
-      // syncthreads (all block writes complete) -> per-thread system fence ->
-      // syncthreads (all fences retired) so no done flag is stored before every
-      // thread's recvbuf writes are globally visible.
-      __syncthreads();
-      __threadfence_system();
-      __syncthreads();
-      const int maxCtas = gin_sdma::kA2aLsaMaxCtas;
-      const int SLOTS = gin_sdma::kA2aFlagSlots;
-      const size_t doneBase = (size_t)maxCtas;
-      // One lane per peer/source: lane l signals "I am done writing peer l" into
-      // peer l's inbox, then waits for "source l is done writing me" in my inbox.
-      if (threadIdx.x < nRanks) {
-        const int l = threadIdx.x;
-        uint64_t* peerFlags = (uint64_t*)ncclGetResourceBufferPeerPointer(devComm, a2aFlagBuf, lsa, l);
-        a2aFlagStore(peerFlags + doneBase + ((size_t)blockIdx.x * nRanks + rank) * SLOTS + a2aSlot, a2aEpoch);
-        uint64_t* mine = a2aMyFlags + doneBase + ((size_t)blockIdx.x * nRanks + l) * SLOTS + a2aSlot;
-        while (a2aFlagLoad(mine) < a2aEpoch) { /* spin */ }
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) a2aMyFlags[blockIdx.x] = a2aEpoch;  // persist for next call
-    }
     return;
   }
 
@@ -588,8 +510,8 @@ __device__ void ginHybridAlltoAllBody(ncclWindow_t sendwin, size_t sendoffset, n
 // Production entry: one collective call. Thin wrapper over the body so the
 // device-timed kernel and the production path share identical code.
 template <typename T>
-__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf) {
-  ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle, a2aSyncMode, a2aFlagBuf);
+__global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+  ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle);
 }
 
 // Device-side timing kernel (rocSHMEM AllToAll methodology, AICOMRCCL-1459).
@@ -605,16 +527,16 @@ __global__ void GinHybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset,
 // closes the collective), then divides by loop for per-iteration latency.
 //
 // Because the body re-derives all per-call sync state at entry (GIN re-reads the
-// accumulated signal; LSA rebuilds its barrier session; mode 2 advances its
-// persistent epoch), looping is correct with no extra signal/epoch bookkeeping.
+// accumulated signal; LSA rebuilds its barrier session), looping is correct with
+// no extra signal bookkeeping.
 template <typename T>
-__global__ void GinHybridAlltoAllTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int a2aSyncMode, ncclDevResourceHandle_t a2aFlagBuf, int loop, int skip, long long* start_time, long long* end_time) {
+__global__ void GinHybridAlltoAllTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int loop, int skip, long long* start_time, long long* end_time) {
   for (int i = 0; i < skip + loop; i++) {
     if (i == skip) {
       __syncthreads();
       if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
     }
-    ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle, a2aSyncMode, a2aFlagBuf);
+    ginHybridAlltoAllBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, sdmaThresholdOverride, llHandle);
   }
   __syncthreads();
   if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
@@ -787,25 +709,9 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
           if (llCtaOverride > 0)
             gridCtas = llCtaOverride < gin_sdma::kA2aLLCtas ? llCtaOverride : gin_sdma::kA2aLLCtas;
         }
-        // LSA-tier cross-rank sync mode (NCCL_GIN_ANVIL_A2A_SYNC_MODE):
-        //   0 (DEFAULT) = entry + exit LSA barriers. The direct-LSA tier PUSHES
-        //       into peers' recvbufs, so the entry barrier is required to order
-        //       every rank's prior recvbuf writes (initData memset or a previous
-        //       op) before any remote push; the exit barrier completes the call.
-        //   3 = UNSAFE: exit barrier only. Skips the entry barrier, so a fast peer
-        //       pushes into this recvbuf before the local memset lands and the
-        //       memset clobbers it -> intermittent wrong mid-size rows. Was +9-17%
-        //       busbw across the LSA band but is not correctness-safe (diagnostic).
-        //   1 = none (diagnostic ceiling: barrier-free 1-pass copy; correct only
-        //       under an external per-iteration sync -- beats host by 10-21%).
-        //   2 = point-to-point done-flag completion (diagnostic: a correct per-call
-        //       barrier-free-completion attempt; measured ~= the two-barrier cost,
-        //       since a 1-pass copy's completion is inherently a cross-rank sync).
-        static const int a2aSyncMode = []() {
-          const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-          return (e && *e) ? atoi(e) : 0;
-        }();
-        TESTCHECK(testLaunchDeviceKernelThresholdLLCtasFlag(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas, a2aSyncMode, g_a2aFlagHandle));
+        // The direct-LSA tier is PULL with a single entry LSA barrier (see
+        // ginHybridAlltoAllBody); no runtime sync-mode selector is needed.
+        TESTCHECK(testLaunchDeviceKernelThresholdLLCtas(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr, g_a2aLLHandle, gridCtas));
 #else
         TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2aThr));
 #endif
@@ -855,10 +761,6 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
   const size_t perPeerBytes = count * wordSize(type);
 
   static const size_t a2aThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL", gin_sdma::kAllToAllSdmaThresholdDefault);
-  static const int a2aSyncMode = []() {
-    const char* e = getenv("NCCL_GIN_ANVIL_A2A_SYNC_MODE");
-    return (e && *e) ? atoi(e) : 0;  // default: entry+exit barriers (see production launch)
-  }();
 
   // By default use the exact skip/loop counts at every size so the device-timing
   // measurement window matches the host tests' -w/-n (same loop/skip across
@@ -901,7 +803,7 @@ testResult_t AlltoAllDeviceTime(struct threadArgs* args, ncclDataType_t type, nc
         ncclDevComm* devComm = args->devComms + i;
         ncclWindow_t sendwin = (ncclWindow_t)args->sendRegHandles[i];
         ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
-        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm, a2aThr, g_a2aLLHandle, a2aSyncMode, g_a2aFlagHandle, loop, skip, d_start, d_end);
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm, a2aThr, g_a2aLLHandle, loop, skip, d_start, d_end);
       },
       &devUs));
 
