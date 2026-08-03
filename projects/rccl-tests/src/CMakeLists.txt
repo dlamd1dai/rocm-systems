@@ -204,10 +204,16 @@ add_rccl_test(all_reduce_bias)
 # Phase-3 adds all_reduce_perf (GIN-SDMA AllReduce, -D 5): its GIN device puts
 # reference the rocshmem-gda QueuePair device bitcode, so it must link
 # ${ROCSHMEM_LIBRARY} with -fgpu-rdc --hip-link just like the others.
+# Phase-4 adds reduce_perf (GIN-SDMA Reduce, -D 3). It must also be here even for
+# the -D 0 host baseline: librccl (ENABLE_ROCSHMEM_GIN) leaves rocshmem host
+# symbols (e.g. rocshmem::envvar::log_flags) undefined, to be resolved at runtime
+# from the executable that links librocshmem.a. ncclReduce is the one collective
+# whose librccl host path references those symbols, so reduce_perf must pull and
+# -rdynamic-export them or it aborts with "undefined symbol" the moment Reduce runs.
 if (ENABLE_ROCSHMEM AND ROCSHMEM_LIBRARY)
     find_library(_DRM drm HINTS ${ROCM_PATH}/lib/rocm_sysdeps/lib)
     find_library(_DRM_AMDGPU drm_amdgpu HINTS ${ROCM_PATH}/lib/rocm_sysdeps/lib)
-    foreach(_gin_move_target scatter_perf gather_perf sendrecv_perf reduce_scatter_perf all_reduce_perf)
+    foreach(_gin_move_target scatter_perf gather_perf sendrecv_perf reduce_scatter_perf all_reduce_perf reduce_perf)
         target_compile_definitions(${_gin_move_target} PRIVATE ENABLE_ROCSHMEM ENABLE_ROCSHMEM_GIN)
         target_compile_options(${_gin_move_target} PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
         target_link_libraries(${_gin_move_target} PRIVATE ${ROCSHMEM_LIBRARY} ibverbs hsa-runtime64 hsakmt numa ${_DRM} ${_DRM_AMDGPU})
