@@ -26,7 +26,7 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
 # range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
 # pattern.
-ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce}"
+ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
 DEV_ARTI_DIR="${GIT_CLONE_ROOT}/ddai-artifacts"

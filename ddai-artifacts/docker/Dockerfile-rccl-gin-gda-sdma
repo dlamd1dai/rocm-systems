@@ -267,9 +267,12 @@ ENV RCCL_INSTALL_PREFIX=${WORKDIR}/rccl
 # to the ring kernel at large sizes (~>64M) where it would otherwise fault (ncclDevFuncId
 # not found for coll:2). "AllReduce" is included so the AllReduce host baseline
 # (all_reduce_perf -D 0, gin-sdma-ar-test.bash AR-C1) has its device kernels; the GIN -D 5
-# path uses the custom kernel and does not need it. Override at build time with
+# path uses the custom kernel and does not need it. "Reduce" is included so the Reduce host
+# baseline (reduce_perf -D 0) and the GIN -D 3 devcomm/symk query for ncclFuncReduce resolve
+# via generated kernels; without it Reduce falls through to the rocshmem-GDA GIN factory and
+# aborts on undefined rocshmem symbols. Override at build time with
 # --build-arg ONLY_FUNCS="..." (empty = all).
-ARG ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce"
+ARG ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce"
 ENV ONLY_FUNCS=${ONLY_FUNCS}
 RUN if [ "${USE_LOCAL_SRC}" = "1" ]; then \
       [ -d /tmp/local/projects/rccl ]       || { echo "ERROR: projects/rccl not in build context";       exit 1; }; \
