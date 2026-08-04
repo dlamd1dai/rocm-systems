@@ -170,13 +170,15 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
 | **gather** | strong (150–214 %) | 108–121 % | 100–107 % | 99.6 % @ 2 GiB | Healthy — no action |
 | **sendrecv** | strong (142–200 %) | 102–113 % | 99–102 % | 98.8 % @ 2 GiB | Healthy — ~62 GB/s ring ceiling |
 | **reduce_scatter** _(post exit-drop)_ | 100–132 % | 94 % @2 MiB, **82–98 %** 2–33 MiB | parity (98–101 %) | **81.6 % @ 33 MiB** | Exit-barrier drop lifted mid-band (was §9.4) |
-| **reduce** | excellent (up to 278 %) | 103–262 % | **75–84 %** | 75.4 % @ 2 GiB | Large RS+Gather plateau ~214 GB/s (host 284) |
+| **reduce** | excellent (up to 278 %) | 103–262 % | **100–116 %** (multi-ring) | 75 % @ 32 MiB (fused fallback) | Multi-ring beats host ≥128 MiB (330 GB/s = 116 % @2 GiB); see §9.5.3 |
 
 **Key synthesis:**
-- **Biggest, most coherent gap = the large-size composition plateau shared by Broadcast (≥8 MiB, →71 %)
-  and Reduce (≥64 MiB, →75 %).** Both plateau ~215–230 GB/s while their building-block collectives
-  reach the fabric ceiling (AllGather 424 GB/s, Gather 437 GB/s at large). The scatter/gather phase of
-  the SAG / RS+Gather composition is serialized against the egress/ingress root, not pipelined.
+- **Reduce large-tier is RESOLVED (§9.5.3): the deep-pipelined edge-disjoint multi-ring now beats host
+  (up to 116 % @2 GiB), default-on ≥64 MiB.** The remaining large-size composition plateau is
+  **Broadcast (≥8 MiB, →71 %)**, still ~229 GB/s while its building blocks reach the fabric ceiling
+  (AllGather 424 GB/s, Gather 437 GB/s). The broadcast scatter/gather phase is serialized against the
+  egress root, not pipelined — the multi-ring streaming-write technique that won Reduce is the candidate
+  lever there too.
 - **Two clean quick wins:** Scatter's **2 MiB threshold cliff** (57.6 % — a misplaced LSA↔GIN crossover)
   and AllGather's **mid LSA-band dip** (68 % @128 KiB — the entry-only/exit-barrier candidate, mirrors
   the A2A pull win).
@@ -283,6 +285,11 @@ per-GPU egress), a global backend change (fixed at 1 channel, with a known chan�
 is out of scope for a per-collective quick win. **Recommend closing the root-egress plateau line
 (Broadcast §5(a), Scatter, Reduce §5(a)) as "structural / needs multi-channel backend"** and moving
 remaining effort to the exit-barrier / threshold quick wins (attack order #1) instead.
+
+> **Superseded for Reduce (see §9.5.3):** Reduce was later shown *not* structurally capped — the
+> deep-pipelined multi-ring routes traffic over N−1 edge-disjoint cycles with streaming writes and
+> **beats host** (116 % @2 GiB) on a single SDMA channel, so its plateau was pipeline starvation, not
+> per-peer egress. Broadcast/Scatter root-egress remains the open structural item.
 
 **Multi-channel probe — TESTED, no gain (2026-08-03, `gin-mc-probe.bash`).** Directly swept the "more
 SDMA channels" lever above on broadcast @256 MiB (`-D 3`, warm), `NUM_CHANNELS × -V`:
@@ -668,7 +675,7 @@ Net: the mid-band dip is substantially closed (2 MiB 78→94, 8 MiB 80→98) and
 large returns to parity. The residual 16–33 MiB trough (~82–86 %) is the same root-egress class as the
 other reduction collectives, not a barrier issue. One barrier saved, race-immune, gate green.
 
-### 9.5 Reduce large-tier deep-dive (M3) — in progress (2026-08-04, `smci355`, NP=8)
+### 9.5 Reduce large-tier deep-dive (M3) — RESOLVED: multi-ring (deep-pipelined) BEATS host, up to 116% (2026-08-04, `smci355`, NP=8)
 
 #### CTA-count re-baseline — the broadcast free-win does NOT transfer; the global `-V` default regressed Reduce
 
@@ -723,7 +730,7 @@ kernel's root-write is an **SM store over the single r→root xGMI link** (~58 G
 per-link SM-store rate the broadcast campaign measured), so the ~256 MiB/rank write costs ~4.4 ms on top
 of the 4.9 ms read-reduce.
 
-#### Design (implementing): pipelined SM-reduce ∥ SDMA-put (different HW units overlap)
+#### Design (implemented → NEGATIVE, see §9.5.1): pipelined SM-reduce ∥ SDMA-put (different HW units overlap)
 
 The two phases run on **different hardware**: read-reduce is SM/LSA, the fast root delivery is SDMA
 (GIN put, the gather path that hits 500 GB/s). Unlike the broadcast SAG chunk-pipelining dead-end (both
@@ -740,3 +747,149 @@ device side stages via `ncclGetResourceBufferLocalPointer` and GIN-puts from `co
 puts. **OOP large only**; in-place and small/mid keep the fused direct-to-root kernel (small Reduce is
 already up to 278% of host). Fold order along the pull is unchanged (ascending source rank); the
 verifier tolerates it regardless (the host tree/ring path passes the same gate).
+
+#### 9.5.1 Pipelined Reduce — IMPLEMENTED + TESTED, NEGATIVE (2026-08-04, `smci355-…-17`, NP=8)
+
+Built the pipelined large tier (`ginReducePipelinedBody` / `GinReducePipelinedKernel` in `reduce.cu`,
+`testLaunchDeviceKernelReducePipelined` in `common.h`). Simplification vs the design above: staging
+reuses the rank's **own recvbuff slice** (OOP-safe — no peer reads slice `[r*base]` of rank r's buffer;
+multi-iteration-safe — sendbuff is never touched) instead of a resource window, so no
+`resourceRequirementsList` wiring; each non-root flushes then re-zeros its slice so the verifier still
+sees a zero non-root recvbuff. Per-CTA GIN signals (`sig=blockIdx.x`, covered by the existing
+`reduceScatterDevReqs` allocation); entry LSA barrier; `__threadfence_system()` before each sub-chunk
+put (matches the AllReduce RS→AG publish); sub-chunk count via `NCCL_GIN_ANVIL_REDUCE_PIPE_CHUNKS`
+(default 4).
+
+**Gate: PASS** — `#wrong==0` and "Out of bounds : 0 OK" across the root sweep (0, N−1), the full
+type × {sum,prod,max,min,avg} matrix, and both OOP and in-place, sizes to 256 MiB.
+
+**Warm A/B (`gin-reduce-pipe-ab.bash`, `-V 32`, float sum, OOP busbw GB/s). Host `-D 0` runs with the
+CLEAN env (COMMON only); the GIN runs add the GIN env. Applying the GIN env to the host path (as a first,
+buggy version of the script did) cripples `ncclReduce` to ~52 GB/s — the host baseline MUST be clean, and
+the correct host number ≈ 285 GB/s reproduces the §9.5 CTA-re-baseline table.**
+
+| total | host `-D 0` (clean) | GIN pipe **ON** (pipelined) | GIN **fused** |
+|------:|--------------------:|----------------------------:|--------------:|
+| 128M  | **242.7** | 181.4 | 205.0 |
+| 256M  | **272.5** | 190.4 | 210.3 |
+| 512M  | **276.2** | 197.0 | 212.9 |
+| 1G    | **284.6** | 200.6 | 214.0 |
+| 2G    | **284.9** | 202.0 | 214.2 |
+
+Two conclusions: (1) the pipeline **loses to the fused read-reduce at every size** (2G −5.6%, 128M
+−11.6%) — in-place (always fused) matches fused OOP exactly, confirming the A/B is clean; and (2) the
+fused kernel at 214 GB/s is **~75% of host (285)**, i.e. Reduce large-tier is still **below** host, and
+the pipeline made the gap *worse*, not better.
+
+> **Superseded (see §9.5.3):** the "large-tier below host" conclusion held only for the pipeline/flat
+> options explored here. The later deep-pipelined multi-ring **beats host** (up to 116 % @2 GiB) and is
+> now the default large-OOP path; the fused kernel remains the fallback below 64 MiB and for in-place.
+
+**Why the overlap hypothesis failed.** The phase-isolation diagnostic (§9.5) measured a *2-kernel*
+decomposition (RS 4.9 ms + gather 4.3 ms) and inferred a serialized phase to hide. But the **fused
+single-kernel** does one read-reduce-write pass that already sits at the read-reduce roofline (OOP 214 ≈
+in-place 215 GB/s) — there is no serialized RS→gather boundary inside it, so there is nothing for the
+pipeline to overlap away. Meanwhile the pipeline *adds* cost the fused path avoids: staging stores,
+`__threadfence_system()` per sub-chunk (system-scope, serializing), many tiny per-CTA SDMA puts on the
+single (`NUM_CHANNELS=1`) channel, a `flush`, and a re-zero pass. Net: overhead > overlap benefit.
+
+**Disposition.** Pipeline **disabled by default** (`reducePipeMinBytes()` returns 0 → dispatch always
+takes the fused kernel), preserving the 214 GB/s (≈75% of host) OOP result and avoiding the −5–12%
+pipeline regression. The kernel is retained as an env-gated experiment
+(`NCCL_GIN_ANVIL_REDUCE_PIPE_MIN_BYTES=<bytes>` to enable) for future tuning.
+
+#### 9.5.2 Diagnostic spike — pipeline dead, host is channel-scaling, multi-ring is the lever (2026-08-04)
+
+Cheap env-only spike (`gin-reduce-spike.bash`, no kernel changes) to bound headroom before any rewrite.
+
+**Part A — device pipeline is dead.** Enabled the pipeline via env and swept
+`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS ∈ {1,2,4}` × `REDUCE_PIPE_CHUNKS ∈ {2,4,8}` at `-V 16`, 512M/2G:
+OOP busbw stayed **111–121 GB/s for every combination** (channels had ~0 effect; no deadlock; chunks
+barely moved it). So the "1-channel SDMA is the blocker" theory is false — multi-channel SDMA does not
+unlock the overlap. Confirms the pipeline as a dead end and the fused kernel (214) as the device best.
+
+**Part B — host reduce is ~linear in channel count and algorithm-agnostic** (clean env, 2G busbw):
+
+| host config | 2G GB/s |
+|---|---|
+| `NCCL_MAX_NCHANNELS=8`  | 50.4 |
+| `NCCL_MAX_NCHANNELS=16` | 101.4 |
+| default (`nc=64`, WarpSpeed) | 284.6 |
+| `NCCL_ALGO=Tree` | 284.3 |
+| `NCCL_ALGO=Ring` | 284.2 |
+
+Host scales ~linearly with channels (≈6 GB/s/channel until link saturation) and Tree ≈ Ring ≈ default —
+so host's 285 is **channel/link parallelism, not the tree structure**.
+
+**Consequence — the real lever is link-spreading, not a tree or the pipeline.** At *equal* channel count
+GIN already ~2× host (16 CTAs → 214 vs host 16ch → 101), but GIN **plateaus at 214** (flat V32→V128)
+because the flat read-reduce doesn't spread across the 7 xGMI links, while host's 64 channels each ride a
+distinct link routing. The proven way to make device CTAs scale as independent link-spread channels is
+the **edge-disjoint multi-ring** design that already took **Broadcast 238→350** (§9.4). A tree buys
+nothing here; the SDMA pipeline is dead. So the candidate large-tier lever for Reduce is a multi-ring
+(edge-disjoint Hamiltonian) reduce toward the root that stripes CTAs across all links — implemented and
+tested in §9.5.3.
+
+#### 9.5.3 Multi-ring Reduce — IMPLEMENTED + TESTED, **POSITIVE (beats host)** (2026-08-04)
+
+Built the edge-disjoint multi-ring reduce (`ginRingReduceBody`/`GinRingReduceKernel` in `reduce.cu`,
+`testLaunchDeviceKernelReduceRing` in `common.h`): the SAME K_N* → N-1 arc-disjoint Hamiltonian-cycle
+decomposition as the broadcast ring (host backtracker → constant-memory `pred`/`pos` tables), CTA b runs
+ring b%nRings on buffer stripe b, data flows toward the root (pos N-1→…→0), each hop adds its local
+contribution (SM read-reduce) and forwards the partial to its predecessor's recvbuff via streaming
+nontemporal b128 stores; root writes the final (postOp'd) result, non-roots re-zero their stripe.
+Per-step grid-wide LSA barrier (release) as the cross-GPU publish (the table variant that beat P2P for
+broadcast); OOP-only.
+
+**The fix that flipped it: pipeline depth.** The first pass reported NEGATIVE (~150 vs fused 214). The
+cause was a *parameterization bug*, not the architecture: the ring is an (N-1)-hop pipeline whose
+fill/drain efficiency is `C/(C+N-1)`, but chunks defaulted to **C=4** on a 7-hop pipeline → ~36%
+efficiency, mostly fill/drain, never reaching steady state. The earlier A/B swept CTAs but never chunks.
+Sweeping chunk depth (env-only, `..._RING_CHUNKS`) exposed the true behavior:
+
+| ring chunks | 2G OOP GB/s |
+|---:|---:|
+| 4 (old default) | 149 |
+| 8  | 206 |
+| 16 | 254 |
+| 32 | 292 |
+| 64 | 314 |
+| 128 | 327 |
+| 256 | 330 |
+
+Best throughput sits at **~64 KiB per chunk per CTA**; deeper wastes on barrier/coalescing at small
+sizes (16 KiB chunks tanked 512M to 218). Shipped default is therefore **size-adaptive**
+(`reduceRingAutoChunks`: target 64 KiB/chunk, clamp [16,256]) with 128 CTAs. Env `..._RING_CHUNKS`
+(default 0=auto) forces a fixed count.
+
+**Gate: PASS** — `#wrong==0` / "Out of bounds : 0 OK" across the root sweep, full type×op matrix (incl.
+fp8/bf16 — the verifiable framework's inputs are order-independent so the ring fold is safe), OOP +
+in-place, re-run with ring **default-on + adaptive deep chunks**.
+
+**Final crossover A/B (`gin-reduce-ring-final-ab.bash`, float sum, OOP busbw GB/s):**
+
+| total | host `-D 0` | GIN fused (ring off) | **ring (shipped: adaptive, 128 CTA)** | ring/host |
+|------:|----:|----:|----:|----:|
+| 32M  | 180 | **189** | 163 (→ falls back to fused) | — |
+| 64M  | 230 | 192 | **229** | 1.00 |
+| 128M | 241 | 204 | **249** | 1.03 |
+| 256M | 272 | 211 | **289** | 1.06 |
+| 512M | 275 | 213 | **311** | 1.13 |
+| 1G   | 284 | 211 | **323** | 1.14 |
+| 2G   | 284 | 213 | **330** | 1.16 |
+
+The ring **beats host at every size ≥ 128M** (up to **116% of host, 154% of fused at 2G**) and matches
+host at 64M. Only at 32M does the adaptive chunk floor (16 chunks) get too small and lose to fused, so
+the default threshold is **`NCCL_GIN_ANVIL_REDUCE_RING_MIN_BYTES` = 64 MiB** (below it → flat fused).
+
+**Why deep chunks make the ring win (correcting the earlier "asymmetry" claim).** The earlier writeup
+concluded the reduce ring's per-hop cross-GPU producer→consumer dependency was a fundamental barrier
+serialization ceiling. That was wrong — it was pipeline starvation. With enough in-flight chunks the
+(N-1)-deep pipeline fills, all links forward simultaneously, and the ring's **streaming nontemporal b128
+writes** extract *more* per-link bandwidth than the flat kernel's SM-LSA reads. Unlike broadcast (where
+the flat fan-out is root-egress-bound so the ring's win is about relieving incast), reduce's flat kernel
+is already load-balanced — yet the ring still wins because streaming writes + a full pipeline beat
+cached remote reads. The barrier cost is negligible at these sizes (tens of µs vs multi-ms transfers).
+
+**Disposition.** Ring is now the **default large-OOP Reduce path (≥64 MiB)**; fused remains the fallback
+for smaller OOP and all in-place. This is the first lever to **beat host** on large Reduce.
