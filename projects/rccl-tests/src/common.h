@@ -515,6 +515,25 @@ testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t se
   return testSuccess;
 }
 
+// Like ...Threshold, but the caller picks the grid (CTA count) instead of the
+// global deviceCtaCount (-V). Used by the Broadcast GIN ring, whose pipelined
+// throughput is CTA-bound: it launches its own power-of-2 CTA count (~128 to
+// saturate all xGMI links) decoupled from -V. The requested grid must be <= the
+// lsaBarrier count registered in BroadcastGetDevCommRequirements (which is sized
+// to max(deviceCtaCount, ring CTAs)); the kernel indexes devComm.lsaBarrier by
+// blockIdx.x, so launching more CTAs than allocated barriers would corrupt/hang.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride);
+  return testSuccess;
+}
+
 // Variant that also forwards an LL (low-latency, packed data+flag) handle as the
 // last kernel argument. Used by the AllGather GIN kernel for its tiny-message
 // LL fast path; the handle is a small POD ({bufHandle, nSlots}) assigned during
@@ -677,6 +696,10 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
 }
 template <typename F>
 testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, int gridCtas) {
   return testNotImplemented;
 }
 template <typename F, typename H>

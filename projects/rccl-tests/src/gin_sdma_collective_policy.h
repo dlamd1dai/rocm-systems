@@ -53,6 +53,20 @@ static constexpr size_t kBroadcastScatterAgMinDefault  = 2ull * 1024 * 1024;  //
 // Broadcast LL fast path: compile ceiling + default runtime cutover.
 static constexpr size_t kBroadcastLLMaxBytes           = 65536;         // 64 KiB
 static constexpr size_t kBroadcastLLDefaultMaxBytes    = 2048;          // 2 KiB
+// Broadcast pipelined-ring (large tier) minimum; 0 disables. Enabled by default at
+// the 2 MiB SAG crossover: with the ring's self-selected CTA count (~128, see
+// bcastRingCtas) a warm A/B on 8x MI355X (default CTAs, -c 0) shows the ring beats
+// SAG at every size >=2 MiB -- 2M 31 vs 17, 8M 93 vs 55, 32M 180 vs 128, 128M 238
+// vs 198, 512M 342 vs 228, 2G 350 vs 237 GB/s (=119% of host's 294). The ring gate
+// is checked before SAG, so this makes the ring the large-tier default and leaves
+// SAG as the opt-out fallback (NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES=0). Below 2 MiB
+// the flat/LSA/LL hybrid still handles the message.
+static constexpr size_t kBroadcastRingMinDefault       = 2ull * 1024 * 1024;  // 2 MiB
+// Target bytes per ring pipeline chunk; the chunk (pipeline-depth) count is
+// clamp(msgBytes / target, 2, kBroadcastRingMaxChunks). Deeper pipeline hides
+// more fill latency but adds per-chunk put/waitSignal overhead.
+static constexpr size_t kBroadcastRingTargetChunk      = 2ull * 1024 * 1024;  // 2 MiB
+static constexpr int    kBroadcastRingMaxChunks        = 64;
 
 // AllGather LSA<->GIN default; compared against the per-rank chunk bytes.
 static constexpr size_t kAllGatherSdmaThresholdDefault = 262144;        // 256 KiB/rank
@@ -235,6 +249,30 @@ GIN_SDMA_HD inline bool bcastUseScatterAllgather(size_t msgBytes, size_t count,
                                                  int nRanks, size_t sagMin) {
   return sagMin != 0 && nRanks >= 2 && msgBytes >= sagMin &&
          count >= (size_t)nRanks;
+}
+
+// Host gate: use the pipelined-ring large tier (highest priority when enabled).
+// Opt-in via ringMin (NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES); needs >=2 ranks,
+// message at/above the cutover, and count >= nRanks so every ring chunk is
+// non-empty on every rank.
+GIN_SDMA_HD inline bool bcastUseRing(size_t msgBytes, size_t count,
+                                     int nRanks, size_t ringMin) {
+  return ringMin != 0 && nRanks >= 2 && msgBytes >= ringMin &&
+         count >= (size_t)nRanks;
+}
+
+// Ring pipeline depth (chunk count). Env override (envChunks) wins when set;
+// otherwise derive from the target chunk size, clamped to [2, max]. The kernel
+// further clamps to <= count so no chunk is empty.
+GIN_SDMA_HD inline int bcastRingChunks(size_t msgBytes, size_t envChunks) {
+  if (envChunks != kThresholdUnset && envChunks > 0) {
+    return (envChunks > (size_t)kBroadcastRingMaxChunks)
+               ? kBroadcastRingMaxChunks : (int)envChunks;
+  }
+  size_t c = (msgBytes + kBroadcastRingTargetChunk - 1) / kBroadcastRingTargetChunk;
+  if (c < 2) c = 2;
+  if (c > (size_t)kBroadcastRingMaxChunks) c = (size_t)kBroadcastRingMaxChunks;
+  return (int)c;
 }
 
 // In-kernel LL eligibility (inside the msgBytes<=sdmaThreshold branch):

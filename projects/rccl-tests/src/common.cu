@@ -145,7 +145,7 @@ int deviceImpl = 0;  // exposed (common.h) so per-coll RunTest can gate device-o
 int unalign = 0;
 int memory_report = 0;
 
-int deviceCtaCount = 16; // Default number of CTAs for device implementation
+int deviceCtaCount = 128; // Default number of CTAs for device implementation (max, also -V default)
 
 // Report average iteration time: (0=RANK0,1=AVG,2=MIN,3=MAX)
 static int average = 1;
@@ -1809,8 +1809,8 @@ int main(int argc, char* argv[], char **envp) {
           deviceCtaCount = (int)strtol(optarg, NULL, 0);
           if (deviceCtaCount <= 0 || deviceCtaCount > 128) {
             fprintf(stderr, "device_cta_count (-V) must be positive and less than 128, got %d. "
-                    "Using default value 16.\n", deviceCtaCount);
-            deviceCtaCount = 16;
+                    "Using default value 128.\n", deviceCtaCount);
+            deviceCtaCount = 128;
           }
         } else {
           fprintf(stderr, "Option -V (device CTA count) requires NCCL >= 2.28.0\n");
@@ -1856,7 +1856,7 @@ int main(int argc, char* argv[], char **envp) {
             "[-R,--local_register <0/1/2> enable local (1) or symmetric (2) buffer registration on send/recv buffers (default: disable (0))] \n\t"
             "[-x,--cta_policy <0/1/2> set CTA policy (NCCL_CTA_POLICY_DEFAULT (0), NCCL_CTA_POLICY_EFFICIENCY (1), NCCL_CTA_POLICY_ZERO (2)) (default: do not set)] \n\t"
             "[-D,--device_implementation <implementation number> enable device implementation (default: 0, use NCCL implementation; requires -R 2 if > 0)] \n\t"
-            "[-V,--device_cta_count <number> set number of CTAs for device implementation (default: 16)] \n\t"
+            "[-V,--device_cta_count <number> set number of CTAs for device implementation (default: 128)] \n\t"
             "[-M,--memory_report <0/1> enable memory usage report (default: 0)] \n\t"
             "[-u,--unalign <index of first element> Misalign source and destination buffers (default: 0)] \n\t"
             "[-Y,--memory_type <coarse/fine/host/managed>] \n\t"                                                    //RCCL
