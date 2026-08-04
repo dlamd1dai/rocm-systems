@@ -7,6 +7,7 @@
 
 #include "cuda_runtime.h"
 #include "common.h"
+#include "gin_sdma_devtime.h"  // shared device-side (wall_clock64) timing scaffold
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
@@ -769,8 +770,17 @@ __constant__ int c_bcastRingSucc[BCAST_RING_MAXR * BCAST_RING_MAXN];  // [ring*N
 __constant__ int c_bcastRingPos[BCAST_RING_MAXR * BCAST_RING_MAXN];   // [ring*N + rank] -> position in cycle
 __constant__ int c_bcastStream;  // 1 => peer writes use nontemporal system-scope b128 stores
 
+// Set by BroadcastRunColl once the edge-disjoint ring decomposition for the current
+// rank count is built + uploaded to constant memory; read by BroadcastDeviceTime to
+// gate whether in-kernel timing can run the ring body (needs the tables present).
+static int g_bcastBuiltN = -1;
+static int g_bcastBuiltNRings = 0;
+
+// Body extracted so the device-timing kernel below can run it skip+loop times
+// under one persistent launch. Each call re-creates its LSA barrier session and
+// re-syncs (like the AllGather timed body), so looping is self-contained.
 template <typename T>
-__global__ void GinRingSmTableBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t nChunksArg) {
+__device__ void ginRingSmTableBroadcastBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm& devComm, size_t nChunksArg) {
   const int N = devComm.nRanks;
   const int rank = devComm.rank;
   const int tid = threadIdx.x;
@@ -825,6 +835,29 @@ __global__ void GinRingSmTableBroadcastKernel(ncclWindow_t sendwin, size_t sendo
     bar.sync(ncclCoopCta(), cuda::memory_order_release);
   }
 }
+
+template <typename T>
+__global__ void GinRingSmTableBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t nChunksArg) {
+  ginRingSmTableBroadcastBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, nChunksArg);
+}
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+// Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
+// ring bodies under ONE persistent launch, bracketing only the timed region with
+// wall_clock64() per CTA. min(start)..max(end) over CTAs is the grid busy window.
+template <typename T>
+__global__ void GinRingSmTableBroadcastTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t nChunksArg, int loop, int skip, long long* start_time, long long* end_time) {
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginRingSmTableBroadcastBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, nChunksArg);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // POINT-TO-POINT edge-disjoint ring broadcast: same 7-ring decomposition as the
@@ -1045,8 +1078,9 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
           const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, bcastRingChunksEnv);
           // Full edge-disjoint decomposition (all N-1 links) built + uploaded
           // once per N; falls back to the coprime-stride kernel if unavailable.
-          static int builtN = -1;
-          static int builtNRings = 0;
+          // File-scope so BroadcastDeviceTime can see whether the tables exist.
+          int& builtN = g_bcastBuiltN;
+          int& builtNRings = g_bcastBuiltNRings;
           if (bcastRingSm && bcastRingMulti && builtN != sagRanks) {
             static int h_succ[BCAST_RING_MAXR * BCAST_RING_MAXN];
             static int h_pos[BCAST_RING_MAXR * BCAST_RING_MAXN];
@@ -1102,6 +1136,67 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
   return testSuccess;
 }
 
+// Device-side (in-kernel wall_clock64) timing for the GIN-SDMA Broadcast (-D 3),
+// via the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING
+// (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra
+// #[bcast-devtime] line next to the graph numbers), 2=device-time-only (report the
+// in-kernel latency as the out-of-place metric; in-place keeps normal timing).
+// loop/skip via NCCL_GIN_ANVIL_BCAST_DEVTIME_LOOP/_SKIP (default 10/10). Times the
+// default large tier -- the SM edge-disjoint ring -- so it only runs when the ring
+// is the active tier (message >= cutover, decomposition built during warmup);
+// otherwise it leaves the host-timed metric untouched.
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+testResult_t BroadcastDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_BCAST_DEVTIME_LOOP", 10);
+  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_BCAST_DEVTIME_SKIP", 10);
+
+  const size_t count = args->nbytes / wordSize(type);   // broadcast message count
+  if (count == 0 || loop < 1) return testSuccess;
+  const size_t msgBytes = count * wordSize(type);
+
+  static const size_t bcastRingMin = []() {
+    size_t v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES");
+    return (v == TEST_SDMA_THRESHOLD_UNSET) ? gin_sdma::kBroadcastRingMinDefault : v;
+  }();
+  const int nRanks = (int)(args->devComms[0].nRanks);
+  // Only device-time the ring when it is the active tier and its tables are built.
+  if (!gin_sdma::bcastUseRing(msgBytes, count, nRanks, bcastRingMin)) return testSuccess;
+  if (g_bcastBuiltNRings <= 0) return testSuccess;
+
+  auto kernel = SPECIALIZE_KERNEL(GinRingSmTableBroadcastTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
+
+  static const size_t chunksEnv = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_RING_CHUNKS");
+  const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, chunksEnv);
+  const int gridCtas = bcastRingCtas();
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, 0, recvwin, 0, count, root, *devComm,
+                 nChunks, loop, skip, d_start, d_end);
+      },
+      &devUs));
+
+  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)msgBytes / 1.0e9 / sec;   // broadcast busbw factor = 1
+    printf("#[bcast-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           msgBytes, gridCtas, loop, skip, devUs, algBw, algBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t BroadcastDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  return testSuccess;  // device API path not available in this build
+}
+#endif
+
 struct testColl broadcastTest = {
   "Broadcast",
   BroadcastGetCollByteCount,
@@ -1109,7 +1204,8 @@ struct testColl broadcastTest = {
   BroadcastGetBw,
   BroadcastRunColl,
   BroadcastGetAlgoProtoChannels,
-  NULL
+  NULL,
+  BroadcastDeviceTime
 };
 
 void BroadcastGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {
