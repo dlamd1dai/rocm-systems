@@ -93,14 +93,18 @@ void BroadcastGetBw(size_t count, int typesize, double sec, double* algBw, doubl
 // CTA (stripe) count for the GIN ring broadcast kernels. The ring picks its own
 // count (its throughput is CTA-bound -- it needs enough CTAs to saturate all xGMI
 // links; measured on 8x MI355X @2 GiB: 32 CTAs = 238 GB/s, 64 = 345, 128 = 350;
-// SAG does not scale this way), but respects the -V/deviceCtaCount value as the
-// MAX (which itself defaults to 128). So the preferred count (128, or the
-// NCCL_GIN_ANVIL_BCAST_RING_CTAS override) is clamped to deviceCtaCount. Only
-// power-of-2 counts avoid a wave-quantization cliff (non-pow2 like 96 collapse to
-// ~140 GB/s), so the result is rounded DOWN to a power of 2 in [1,128]. Read
-// identically here and in BroadcastGetDevCommRequirements so the launched grid
-// never exceeds the allocated lsaBarrier count (kernels index devComm.lsaBarrier
-// by blockIdx.x, so over-launching would corrupt/hang).
+// SAG does not scale this way). This count is DECOUPLED from -V/deviceCtaCount:
+// -V defaults to 16 (tuned for every OTHER collective, several of which regress
+// with more CTAs -- e.g. Reduce), so clamping the ring to -V would have starved
+// it (16 CTAs ~= 140 GB/s). Instead the ring always self-selects 128 (or the
+// NCCL_GIN_ANVIL_BCAST_RING_CTAS override), so the promoted 350 GB/s holds under
+// the bare default AND under the gate/board's -V 32. Only power-of-2 counts avoid
+// a wave-quantization cliff (non-pow2 like 96 collapse to ~140 GB/s), so the
+// result is rounded DOWN to a power of 2 in [1,128]. Read identically here and in
+// BroadcastGetDevCommRequirements, which allocates max(deviceCtaCount, this) LSA
+// barriers so the launched grid never exceeds the allocated lsaBarrier count
+// (kernels index devComm.lsaBarrier by blockIdx.x, so over-launching would
+// corrupt/hang).
 static inline int bcastRingCtas() {
   int pref = 128;
   const char* e = getenv("NCCL_GIN_ANVIL_BCAST_RING_CTAS");
@@ -108,8 +112,7 @@ static inline int bcastRingCtas() {
     long p = strtol(e, nullptr, 0);
     if (p >= 1) pref = (int)p;
   }
-  int cap = deviceCtaCount;               // -V value (max), defaults to 128
-  int v = pref < cap ? pref : cap;        // respect -V as the ceiling
+  int v = pref;                           // ring's own count, independent of -V
   if (v < 1) v = 1;
   if (v > 128) v = 128;                   // hard cap (barrier resource / tested range)
   int p2 = 1;
