@@ -591,6 +591,33 @@ store path is fundamentally faster per link and scales across all 7. SM ring sta
 ring is retained only as an `SM=0` A/B baseline. (`ch=8` failed to run — likely an invalid channel count
 on this backend — but ch≤4 already bounds the answer.)
 
+#### In-device (wall_clock64) timing — DONE (broadcast joins the shared scaffold)
+
+Broadcast was the only GIN-SDMA collective without a `deviceTime` hook (so `NCCL_GIN_ANVIL_DEVICE_TIMING`
+could not measure it). Added it via the shared `gin_sdma_devtime.h` scaffold, mirroring AllGather: the
+table-ring body was extracted into a `__device__` `ginRingSmTableBroadcastBody` reused by both the normal
+kernel and a new persistent `GinRingSmTableBroadcastTimedKernel` (runs skip+loop bodies under one launch,
+brackets the timed region with `wall_clock64` per CTA); `BroadcastDeviceTime` drives it through
+`gin_devtime::measure` at the ring's own CTA count and only when the ring is the active tier (gated on
+`bcastUseRing` + built decomposition, `g_bcastBuiltNRings`). Registered as the 8th `broadcastTest` field.
+loop/skip via `NCCL_GIN_ANVIL_BCAST_DEVTIME_LOOP/_SKIP` (default 10/10).
+
+Device-timed vs host/graph-timed (8× MI355X, default ring, `-c 0`, busbw GB/s):
+
+| size | host/graph | in-kernel wall_clock64 (mode 2) |
+|------|-----------|----------------------------------|
+| 512 MiB | 340 | 315 |
+| 1 GiB   | 346 | 321 |
+| 2 GiB   | 349 | **324** |
+
+The device metric (min(start)..max(end) grid busy window, per iteration, MPI-MAX across ranks) is ~8%
+below the host wall-clock — expected, since it excludes host launch/stream/teardown and includes CTA
+start/finish skew. This is the stricter "pure device-function" number the other GIN-SDMA collectives
+report; **evaluate broadcast with `NCCL_GIN_ANVIL_DEVICE_TIMING=2`** (mode 1 augments with a
+`#[bcast-devtime]` line). Refactor verified behavior-preserving: gate `#wrong=0` OOP + in-place (mode 0)
+and in the device-only path (mode 2). File: `broadcast.cu` (body extraction, timed kernel, hook,
+`gin_sdma_devtime.h` include, ops-struct field).
+
 > Environment note: GIN (`-D 3`) would not initialize on `smci350` with the pre-existing images
 > (`rocshmem-api: buffer register failed size 2097152` on the 13-day image; `librccl.so.1: undefined
 > symbol rocshmem::envvar::log_flags` on the 9-day image — a rocSHMEM/RCCL version skew). A **fresh
