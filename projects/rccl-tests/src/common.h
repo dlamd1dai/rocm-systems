@@ -613,6 +613,21 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
   return testSuccess;
 }
 
+// Variant for the pipelined large-tier Reduce (-D 3, OOP): same reduction-collective
+// signature as ...ThresholdScratch plus a trailing sub-chunk count (nSub) that sets
+// the double-buffer depth of the SM-reduce || SDMA-put overlap. Launched with the
+// global deviceCtaCount grid; the per-CTA GIN signal index is blockIdx.x, so the grid
+// must be <= the ginSignalCount registered in ReduceGetDevCommRequirements.
+template <typename F>
+testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int nSub) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle, nSub);
+  return testSuccess;
+}
+
 // Single-launch variant with an EXPLICIT grid size (gridCtas) instead of the global
 // deviceCtaCount. Used by the GIN-SDMA AllReduce -D 5 to pick a size-adaptive CTA count
 // (few CTAs for small messages, more for large; see arTunedGridCtas). gridCtas must be
@@ -720,6 +735,10 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas, size_t oneShotThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int nSub) {
   return testNotImplemented;
 }
 template <typename F, typename H>

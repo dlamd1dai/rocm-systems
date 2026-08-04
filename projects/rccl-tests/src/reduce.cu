@@ -37,6 +37,41 @@
 // The sdmaThreshold/scratch launch args are retained for ABI compatibility with
 // the reduction-collective kernel signature but are unused.
 static ncclDevResourceHandle g_reduceScratchHandle = 0;  // unused (no scratch); passed to kernel as 0
+
+// ---- Pipelined large-tier Reduce (OOP): SM read-reduce || SDMA put-to-root ----
+// (plan section 9.5). The fused GinReduceKernel serializes the read-reduce (SM,
+// ~440 GB/s) and the root write (SM store over one xGMI link, ~58 GB/s), so at
+// 2 GiB it costs read+write ~= 10 ms (215 GB/s). The read-reduce (SM) and the
+// fast root delivery (SDMA GIN put, the gather path that hits ~500 GB/s) use
+// DIFFERENT hardware, so a chunk-pipelined kernel overlaps them: each CTA
+// SM-reduces sub-chunk k+1 of its slice stripe into its LOCAL recvbuff while the
+// SDMA engine puts sub-chunk k's reduced result to the root. Staging in the
+// rank's own recvbuff slice is OOP-safe (no other rank reads slice [r*base] of
+// rank r's buffer) and multi-iteration-safe (sendbuff is never modified); after
+// flushing its puts each non-root re-zeros its slice so the verifier still sees
+// an untouched (zero) recvbuff.
+//
+// MEASURED (8x MI355X, warm A/B -V 32, float sum, OOP; plan 9.5.1): the pipeline
+// LOSES to the fused read-reduce at every size -- 2G 202 vs 214 GB/s (-5.6%),
+// 128M 181 vs 205 (-11.6%). The fused kernel does ONE read-reduce-write pass that
+// already sits at the read-reduce roofline (OOP 214 ~= in-place 215 GB/s), so
+// there is no serialized RS->gather phase for the pipeline to hide; the staging +
+// per-sub-chunk __threadfence_system() + tiny per-CTA SDMA puts (1 channel) +
+// re-zero overhead exceeds any overlap benefit. So the pipeline is DISABLED by
+// default (reducePipeMinBytes()==0 -> always fused) and kept only as an env-gated
+// experiment: set NCCL_GIN_ANVIL_REDUCE_PIPE_MIN_BYTES=<bytes> to enable it for
+// OOP totals >= that size (sub-chunk count via reducePipeChunks()). In-place is
+// never pipelined (staging would clobber the in-place input).
+static inline size_t reducePipeMinBytes() {
+  const char* e = getenv("NCCL_GIN_ANVIL_REDUCE_PIPE_MIN_BYTES");
+  if (e && e[0]) return (size_t)strtoull(e, nullptr, 0);
+  return 0;  // default OFF (fused wins); set the env to opt into the pipeline
+}
+static inline int reducePipeChunks() {
+  const char* e = getenv("NCCL_GIN_ANVIL_REDUCE_PIPE_CHUNKS");
+  if (e && e[0]) { int v = (int)strtol(e, nullptr, 0); if (v >= 1) return v; }
+  return 4;
+}
 #endif
 
 void ReduceGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -308,6 +343,101 @@ __global__ void GinReduceKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWin
   ginReduceBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, redOp);
 }
 
+// Pipelined large-tier body (OOP only; see the file-top note). Each CTA owns a
+// contiguous stripe of THIS rank's output slice [rank*base] and pipelines it in
+// nSub sub-chunks: reduce sub-chunk (SM, all peers) into the local recvbuff, then
+// (tid 0) GIN-put it to the root's recvbuff[rank*base + ...] with a per-CTA signal
+// increment, then move to the next sub-chunk while the SDMA put drains. The root
+// reduces its OWN slice locally (no put) and waits for the (nRanks-1) peers' puts
+// on its per-CTA signal; non-roots flush then re-zero their stripe. Fold order is
+// ascending source rank (bit-identical to ReduceScatter; verifier tolerant).
+template <typename T>
+__device__ __forceinline__ void ginReducePipelinedBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int nSub) {
+  const int nRanks = devComm.nRanks;
+  const int rank = devComm.rank;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const size_t base = (nRanks > 0) ? (count / (size_t)nRanks) : count;  // this rank's slice elems
+
+  constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
+  struct alignas(16) Pack { T e[VEC]; };
+  const size_t nPacks = base / (size_t)VEC;                     // packs in this rank's slice
+  const size_t sliceBaseP = ((size_t)rank * base) / (size_t)VEC; // pack idx of my slice in the full array
+
+  // Per-CTA contiguous stripe of the slice.
+  const size_t stripePacks = (nPacks + (size_t)gridDim.x - 1) / (size_t)gridDim.x;
+  const size_t pb0 = (size_t)blockIdx.x * stripePacks;
+  const size_t pb1 = (pb0 + stripePacks < nPacks) ? (pb0 + stripePacks) : nPacks;
+  const size_t stripeLen = (pb1 > pb0) ? (pb1 - pb0) : 0;
+  const size_t subPacks = (stripeLen == 0) ? 1
+                          : ((stripeLen + (size_t)nSub - 1) / (size_t)nSub);
+
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+  ncclGin gin { devComm, /*context=*/0 };
+  const unsigned int sig = blockIdx.x;
+  const uint64_t sigBase = gin.readSignal(sig);
+
+  // Entry barrier: every peer's sendbuff is filled before any read (single-node LSA).
+  lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  Pack* dstLocal = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);  // my recvbuff (full array)
+
+  int nSubDone = 0;
+  for (size_t cp0 = pb0; cp0 < pb1; cp0 += subPacks) {
+    const size_t cp1 = (cp0 + subPacks < pb1) ? (cp0 + subPacks) : pb1;
+    // ---- SM read-reduce sub-chunk [cp0,cp1) from all peers into local recvbuff ----
+    for (size_t pk = cp0 + (size_t)tid; pk < cp1; pk += (size_t)nthreads) {
+      const size_t sp = sliceBaseP + pk;
+      Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[sp];
+      T acc[VEC];
+      #pragma unroll
+      for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
+      for (int s = 1; s < nRanks; s++) {
+        Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[sp];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+      }
+      Pack o;
+      #pragma unroll
+      for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+      dstLocal[sp] = o;
+    }
+    __threadfence_system();  // publish this sub-chunk's stores so the SDMA engine reads them (system scope, matches AllReduce RS->AG)
+    __syncthreads();         // all CTA threads done + fenced
+    if (rank != root && tid == 0 && cp1 > cp0) {
+      const size_t byteOff = recvoffset + (sliceBaseP + cp0) * (size_t)VEC * sizeof(T);
+      const size_t chunkBytes = (cp1 - cp0) * (size_t)VEC * sizeof(T);
+      ginPutChunked(gin, ncclTeamWorld(devComm), root,
+          recvwin, byteOff, recvwin, byteOff, chunkBytes, ncclGin_SignalInc{sig});
+    }
+    __syncthreads();     // keep the CTA lockstep across sub-chunks (put issued from tid 0)
+    nSubDone++;
+  }
+
+  if (rank == root) {
+    // My own slice is reduced locally above; wait for every non-root's stripe puts.
+    gin.waitSignal(ncclCoopCta(), sig, sigBase + (uint64_t)(nRanks - 1) * (uint64_t)nSubDone);
+  } else {
+    gin.flush(ncclCoopCta());     // my puts' source reads are complete
+    __syncthreads();
+    // Re-zero my stripe so the verifier sees an untouched (zero) non-root recvbuff.
+    Pack z;
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) z.e[e] = (T)0;
+    for (size_t pk = pb0 + (size_t)tid; pk < pb1; pk += (size_t)nthreads) dstLocal[sliceBaseP + pk] = z;
+  }
+}
+
+// -D 3 pipelined large-tier kernel (OOP). Signature mirrors GinReduceKernel plus
+// the sub-chunk count; launched with its own grid (deviceCtaCount) in RunColl.
+template <typename T>
+__global__ void GinReducePipelinedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle, int nSub) {
+  (void)sdmaThresholdOverride; (void)scratchHandle;
+  ginReducePipelinedBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, redOp, nSub);
+}
+
 // Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
 // Reduce bodies under ONE persistent launch, bracketing only the timed region with
 // wall_clock64() per CTA. Every body re-derives its entry/exit LSA barrier, so
@@ -336,6 +466,20 @@ testResult_t ReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, si
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         if (count == 0) return testSuccess;
+        // Large OUT-OF-PLACE totals use the pipelined SM-reduce || SDMA-put tier
+        // (overlaps the read-reduce with the root delivery on distinct HW units;
+        // plan 9.5). In-place (sendwin == recvwin) and small totals keep the fused
+        // direct-to-root read-reduce (the threshold/scratch args stay inert there).
+        const bool inPlace = (sendbuff == recvbuff);
+        const ncclDevComm* dc = (const ncclDevComm*)comm;
+        const int nRanks = (dc != nullptr) ? dc->nRanks : 0;
+        const size_t totalBytes = count * (size_t)wordSize(type);
+        const size_t pipeMin = reducePipeMinBytes();
+        if (!inPlace && pipeMin > 0 && totalBytes >= pipeMin && nRanks > 1) {
+          const int nSub = reducePipeChunks();
+          TESTCHECK(testLaunchDeviceKernelReducePipelined(SPECIALIZE_REDUCE_KERNEL(GinReducePipelinedKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, TEST_SDMA_THRESHOLD_UNSET, g_reduceScratchHandle, nSub));
+          return testSuccess;
+        }
         // reduce-scatter-to-root LSA read-reduce: no size branch, so the
         // threshold/scratch launch args are inert (kept for ABI stability).
         TESTCHECK(testLaunchDeviceKernelThresholdScratch(SPECIALIZE_REDUCE_KERNEL(GinReduceKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, TEST_SDMA_THRESHOLD_UNSET, g_reduceScratchHandle));
