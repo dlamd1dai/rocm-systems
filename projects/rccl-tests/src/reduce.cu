@@ -72,6 +72,54 @@ static inline int reducePipeChunks() {
   if (e && e[0]) { int v = (int)strtol(e, nullptr, 0); if (v >= 1) return v; }
   return 4;
 }
+
+// ---- Multi-ring (edge-disjoint) large-tier Reduce (OOP) ----------------------
+// (plan 9.5.2). The diagnostic spike showed host `ncclReduce` is ~linear in
+// channel count (8ch 50, 16ch 101, 64ch 285 GB/s) and algorithm-agnostic, while
+// the flat GIN read-reduce PLATEAUS at 214 (V32==V128) because every CTA hammers
+// the same all-peer-read pattern and never spreads across the 7 xGMI links. The
+// proven cure is the SAME edge-disjoint multi-ring the broadcast campaign used to
+// go 238->350 (broadcast.cu): decompose K_N* into N-1 arc-disjoint Hamiltonian
+// cycles, run ring b%nRings on buffer stripe b, so every GPU drives all its links
+// at once. This is the reduce (all-to-one) mirror: data flows toward the root
+// along each cycle (pos N-1 -> ... -> 0), each hop adds its own contribution
+// (SM read-reduce) and forwards to its predecessor. Staging reuses the rank's own
+// recvbuff (OOP-only; in-place falls back to fused); every non-root re-zeros its
+// stripe at the end so the verifier sees an untouched recvbuff. Enabled for OOP
+// totals >= reduceRingMinBytes() (default 0 = OFF, env-gated pending the A/B).
+// CTA count self-selects (reduceRingCtas(), default 128, decoupled from -V like
+// the broadcast ring); pipeline depth via reduceRingChunks().
+static inline size_t reduceRingMinBytes() {
+  const char* e = getenv("NCCL_GIN_ANVIL_REDUCE_RING_MIN_BYTES");
+  if (e && e[0]) return (size_t)strtoull(e, nullptr, 0);
+  return (size_t)64 << 20;  // default ON for OOP totals >= 64 MiB: ring>=host there (64M 229~host,
+                            // 2G 330=116% host, 154% fused); below 64M fused wins (32M 163<189). 0 disables.
+}
+static inline int reduceRingCtas() {
+  const char* e = getenv("NCCL_GIN_ANVIL_REDUCE_RING_CTAS");
+  if (e && e[0]) { int v = (int)strtol(e, nullptr, 0); if (v >= 1) return v; }
+  return 128;  // CTA-bound: needs ~128 to saturate all xGMI links (broadcast basis)
+}
+// Ring pipeline depth (chunks per CTA stripe). The ring is an (N-1)-hop pipeline,
+// so its fill/drain efficiency is C/(C+N-1) -- too few chunks starves it (C=4 gave
+// 149 vs C=64 314 GB/s @2G). Best throughput is at ~64 KiB per chunk per CTA
+// (deeper wastes on barrier/coalescing at small sizes: 16 KiB chunks tanked 512M to
+// 218). Env forces a fixed count; 0 (default/auto) => size-adaptive in RunColl.
+static inline int reduceRingChunks() {
+  const char* e = getenv("NCCL_GIN_ANVIL_REDUCE_RING_CHUNKS");
+  if (e && e[0]) { int v = (int)strtol(e, nullptr, 0); if (v >= 1) return v; }
+  return 0;  // auto (size-adaptive; see reduceRingAutoChunks)
+}
+// Size-adaptive chunk count: target ~64 KiB per chunk per CTA, clamped to [16,256]
+// (>=16 to fill the pipeline past the N-1 fill cost; <=256 to keep chunks coalesced).
+static inline int reduceRingAutoChunks(size_t totalBytes, int ctas) {
+  if (ctas < 1) ctas = 1;
+  size_t stripeBytes = totalBytes / (size_t)ctas;
+  size_t ch = stripeBytes / (size_t)(64 * 1024);
+  if (ch < 16) ch = 16;
+  if (ch > 256) ch = 256;
+  return (int)ch;
+}
 #endif
 
 void ReduceGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
@@ -136,7 +184,11 @@ testResult_t ReduceGetDevCommRequirements(int deviceImpl, ncclDevCommRequirement
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(deviceCtaCount);
+      // Cover both the flat/pipelined kernels (deviceCtaCount) and the multi-ring
+      // kernel's own larger CTA count (reduceRingCtas(), default 128, launched
+      // decoupled from -V) -- the ring uses a per-block LSA barrier sig=blockIdx.x.
+      int reduceBarCtas = deviceCtaCount > reduceRingCtas() ? deviceCtaCount : reduceRingCtas();
+      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(reduceBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -160,7 +212,8 @@ bool ReduceGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs)
   switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: { // reduce-scatter-to-root LSA read-reduce: barriers only, no scratch
-      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(deviceCtaCount);
+      int reduceBarCtas = deviceCtaCount > reduceRingCtas() ? deviceCtaCount : reduceRingCtas();
+      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(reduceBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -454,6 +507,177 @@ __global__ void GinReduceTimedKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   __syncthreads();
   if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
 }
+
+// ===== Multi-ring (edge-disjoint) large-tier Reduce (OOP), plan 9.5.2 ========
+// Edge-disjoint decomposition of K_N* into N-1 arc-disjoint Hamiltonian cycles
+// (same construction as the broadcast ring). CTA b runs ring b%nRings on buffer
+// stripe b; data flows toward the root (pos N-1 -> ... -> 0), each hop adding its
+// local contribution (SM read-reduce) and forwarding the partial to its
+// predecessor. Every GPU thus drives all its N-1 links at once (the lever the spike
+// identified). Tables are host-built once per N and uploaded to constant memory.
+#define RED_RING_MAXR 16
+#define RED_RING_MAXN 16
+__constant__ int c_redNRings;
+__constant__ int c_redRingPred[RED_RING_MAXR * RED_RING_MAXN];  // [ring*N+rank] -> predecessor (pos-1) == forward target
+__constant__ int c_redRingPos[RED_RING_MAXR * RED_RING_MAXN];   // [ring*N+rank] -> position in cycle
+
+// Ring reduce body. Incoming partials land in MY recvbuff (written by my ring
+// successor, pos p+1); I add my local sendbuff contribution and forward to my
+// predecessor's recvbuff (pos p-1). Root (pos 0) writes the final (postOp'd)
+// result to its own recvbuff; non-roots forward the pre-postOp partial and re-zero
+// their stripe at the end (OOP verifier expects an untouched zero non-root recvbuff).
+// Per-step grid-wide LSA barrier keeps the pipeline lock-step (the table variant
+// that beat P2P for broadcast). preOp is applied once per rank's local (N total,
+// matching the fused kernel); postOp once at the root.
+template <typename T>
+__device__ __forceinline__ void ginRingReduceBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm& devComm, int redOp, size_t nChunksArg) {
+  const int N = devComm.nRanks;
+  const int rank = devComm.rank;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+
+  const int nRings = c_redNRings;
+  if (nRings < 1) return;
+  const int ring = (int)(blockIdx.x % (unsigned)nRings);
+  const int predRank = c_redRingPred[ring * N + rank];
+  const int posCur  = c_redRingPos[ring * N + rank];
+  const int posRoot = c_redRingPos[ring * N + root];
+  const int pos = (posCur - posRoot + N) % N;             // hops from root along this ring
+  const bool isRoot = (pos == 0);
+  const bool isTail = (pos == N - 1);
+  const int distTail = (N - 1) - pos;                     // pipeline offset from the tail
+
+  constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
+  struct alignas(16) Pack { T e[VEC]; };
+  const size_t nPacks = count / (size_t)VEC;
+
+  const size_t sBaseP  = (nPacks * (size_t)blockIdx.x) / (size_t)gridDim.x;
+  const size_t sEndP   = (nPacks * (size_t)(blockIdx.x + 1)) / (size_t)gridDim.x;
+  const size_t sCountP = (sEndP > sBaseP) ? (sEndP - sBaseP) : 0;
+
+  int C = (int)((size_t)nChunksArg < sCountP ? (size_t)nChunksArg : sCountP);
+  if (C < 1) C = 1;
+
+  Pack* myRecv       = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);
+  const Pack* mySend = (const Pack*)ncclGetLocalPointer(sendwin, sendoffset);
+  Pack* predRecv     = (Pack*)ncclGetLsaPointer(recvwin, recvoffset, predRank);
+
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  ncclLsaBarrierSession<ncclCoopCta> bar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);    // entry: sendbuffs filled, recvbuffs quiescent
+
+  const int totalSteps = C + (N - 1);
+  for (int step = 0; step < totalSteps; step++) {
+    const int c = step - distTail;
+    const bool active = (c >= 0) && (c < C);
+    if (active) {
+      const size_t cStart = sBaseP + (sCountP * (size_t)c) / (size_t)C;
+      const size_t cEnd   = sBaseP + (sCountP * (size_t)(c + 1)) / (size_t)C;
+      for (size_t pk = cStart + (size_t)tid; pk < cEnd; pk += (size_t)nthreads) {
+        Pack lv = mySend[pk];
+        T acc[VEC];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, lv.e[e], N);
+        if (!isTail) {
+          Pack iv = myRecv[pk];                            // incoming partial from pos p+1
+          #pragma unroll
+          for (int e = 0; e < VEC; e++)
+            acc[e] = gin_sdma_reduce::combine(redOp, iv.e[e], acc[e]);
+        }
+        Pack o;
+        if (isRoot) {
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], N);
+          myRecv[pk] = o;                                  // final result -> root's recvbuff (local, cached)
+        } else {
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = acc[e];   // forward pre-postOp partial
+          // Streaming (nontemporal system-scope b128) peer store -- the xGMI store
+          // path LL/host use to push cross-GPU writes at full rate without polluting
+          // cache (Pack is exactly 16B and 16B-aligned for every supported T).
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+          union { Pack p; v4u u; } cv; cv.p = o;
+          __builtin_amdgcn_global_store_b128((v4u_gptr)(predRecv + pk), cv.u, RCCL_SYSTEM_SYNCSCOPE);
+#else
+          predRecv[pk] = o;                                // -> predecessor's recvbuff
+#endif
+        }
+      }
+    }
+    // The release-ordered LSA barrier both syncs the CTA and publishes this step's
+    // peer stores to the predecessor GPU before it reads them next step (the same
+    // publish mechanism the broadcast table kernel uses -- an explicit
+    // __threadfence_system per step reproduced the slow P2P path, 149 vs fused 214).
+    bar.sync(ncclCoopCta(), cuda::memory_order_release);
+  }
+
+  if (!isRoot) {                                           // re-zero intermediate scratch for the verifier
+    Pack z;
+    #pragma unroll
+    for (int e = 0; e < VEC; e++) z.e[e] = (T)0;
+    for (size_t pk = sBaseP + (size_t)tid; pk < sEndP; pk += (size_t)nthreads) myRecv[pk] = z;
+  }
+}
+
+template <typename T>
+__global__ void GinRingReduceKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, size_t nChunksArg) {
+  ginRingReduceBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, root, devComm, redOp, nChunksArg);
+}
+
+// Host decomposition of K_N* into (N-1) arc-disjoint directed Hamiltonian cycles by
+// verified backtracking (exists for N != 4,6; the search fails otherwise and we fall
+// back to the flat kernel). Fills pred[ring*N+rank] (the pos-1 forward target) and
+// pos[ring*N+rank]; returns nRings (N-1) or 0.
+struct RedRingDecomp {
+  int N;
+  bool used[RED_RING_MAXN][RED_RING_MAXN];
+  int order[RED_RING_MAXR][RED_RING_MAXN];
+  long budget;
+  bool extend(int r, int* path, bool* vis, int len) {
+    if (--budget < 0) return false;
+    const int cur = path[len - 1];
+    if (len == N) {
+      if (used[cur][0]) return false;
+      for (int i = 0; i < N; i++) used[path[i]][path[(i + 1) % N]] = true;
+      for (int i = 0; i < N; i++) order[r][i] = path[i];
+      if (solve(r + 1)) return true;
+      for (int i = 0; i < N; i++) used[path[i]][path[(i + 1) % N]] = false;
+      return false;
+    }
+    for (int nx = 1; nx < N; nx++) {
+      if (!vis[nx] && !used[cur][nx]) {
+        vis[nx] = true; path[len] = nx;
+        if (extend(r, path, vis, len + 1)) return true;
+        vis[nx] = false;
+      }
+    }
+    return false;
+  }
+  bool solve(int r) {
+    if (r == N - 1) return true;
+    int path[RED_RING_MAXN]; bool vis[RED_RING_MAXN];
+    for (int i = 0; i < N; i++) vis[i] = false;
+    path[0] = 0; vis[0] = true;
+    return extend(r, path, vis, 1);
+  }
+};
+static int buildRedRingDecomp(int N, int* pred, int* pos) {
+  if (N < 2 || N > RED_RING_MAXN || (N - 1) > RED_RING_MAXR) return 0;
+  static RedRingDecomp d;
+  d.N = N;
+  for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) d.used[i][j] = false;
+  d.budget = 20000000L;
+  if (!d.solve(0)) return 0;
+  for (int r = 0; r < N - 1; r++)
+    for (int k = 0; k < N; k++) {
+      const int rk = d.order[r][k];
+      pred[r * N + rk] = d.order[r][(k - 1 + N) % N];       // predecessor (pos-1) == forward target
+      pos[r * N + rk]  = k;
+    }
+  return N - 1;
+}
+static int g_redBuiltN = -1;
+static int g_redBuiltNRings = 0;
 #endif
 
 testResult_t ReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
@@ -474,6 +698,32 @@ testResult_t ReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, si
         const ncclDevComm* dc = (const ncclDevComm*)comm;
         const int nRanks = (dc != nullptr) ? dc->nRanks : 0;
         const size_t totalBytes = count * (size_t)wordSize(type);
+        // Multi-ring (edge-disjoint) large tier (OOP): stripes CTAs across all xGMI
+        // links to break the flat kernel's 214 GB/s plateau (plan 9.5.2). Built +
+        // uploaded once per N; falls back to the flat kernel if the decomposition is
+        // unavailable. Env-gated (default OFF) pending the warm A/B.
+        const size_t ringMin = reduceRingMinBytes();
+        if (!inPlace && ringMin > 0 && totalBytes >= ringMin && nRanks > 1 && nRanks <= RED_RING_MAXN) {
+          if (g_redBuiltN != nRanks) {
+            static int h_pred[RED_RING_MAXR * RED_RING_MAXN];
+            static int h_pos[RED_RING_MAXR * RED_RING_MAXN];
+            g_redBuiltNRings = buildRedRingDecomp(nRanks, h_pred, h_pos);
+            if (g_redBuiltNRings > 0) {
+              CUDACHECK(cudaMemcpyToSymbol(c_redNRings, &g_redBuiltNRings, sizeof(int)));
+              CUDACHECK(cudaMemcpyToSymbol(c_redRingPred, h_pred, sizeof(int) * nRanks * g_redBuiltNRings));
+              CUDACHECK(cudaMemcpyToSymbol(c_redRingPos, h_pos, sizeof(int) * nRanks * g_redBuiltNRings));
+            }
+            g_redBuiltN = nRanks;
+          }
+          if (g_redBuiltNRings > 0) {
+            const int ringCtas = reduceRingCtas();
+            const int envChunks = reduceRingChunks();
+            const size_t nChunks = (envChunks > 0) ? (size_t)envChunks
+                                                   : (size_t)reduceRingAutoChunks(totalBytes, ringCtas);
+            TESTCHECK(testLaunchDeviceKernelReduceRing(SPECIALIZE_REDUCE_KERNEL(GinRingReduceKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, nChunks, ringCtas));
+            return testSuccess;
+          }
+        }
         const size_t pipeMin = reducePipeMinBytes();
         if (!inPlace && pipeMin > 0 && totalBytes >= pipeMin && nRanks > 1) {
           const int nSub = reducePipeChunks();

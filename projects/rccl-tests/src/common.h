@@ -628,6 +628,22 @@ testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, siz
   return testSuccess;
 }
 
+// Variant for the multi-ring large-tier Reduce (-D 3, OOP): EXPLICIT grid size
+// (gridCtas, the ring's own CTA count, decoupled from -V like the broadcast ring)
+// and a trailing chunk count (nChunks = ring pipeline depth). Forwards the op as an
+// int (runtime switch, template varies only on T). gridCtas must be <= the
+// lsaBarrierCount registered in ReduceGetDevCommRequirements.
+template <typename F>
+testResult_t testLaunchDeviceKernelReduceRing(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t nChunks, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, (int)op, nChunks);
+  return testSuccess;
+}
+
 // Single-launch variant with an EXPLICIT grid size (gridCtas) instead of the global
 // deviceCtaCount. Used by the GIN-SDMA AllReduce -D 5 to pick a size-adaptive CTA count
 // (few CTAs for small messages, more for large; see arTunedGridCtas). gridCtas must be
@@ -739,6 +755,10 @@ testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int nSub) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelReduceRing(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t nChunks, int gridCtas) {
   return testNotImplemented;
 }
 template <typename F, typename H>
