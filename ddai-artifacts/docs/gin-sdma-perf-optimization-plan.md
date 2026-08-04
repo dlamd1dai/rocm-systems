@@ -164,7 +164,7 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
 
 | Collective | Small (≤256 KiB) | Mid (1–33 MiB) | Large (≥64 MiB) | Worst point | Verdict |
 |---|---|---|---|---|---|
-| **broadcast** | strong (150–210 %) | fading (85→82 %) | **71–79 %** | 71 % @ 1–2 GiB | Large SAG plateau ~229 GB/s (host 320) |
+| **broadcast** | strong (150–210 %) | fading / fill-regime (68–86 %) | **104–113 %** (multi-ring) | ~68 % @ 8–16 MiB | Deep-pipelined 7-ring beats host ≥256 MiB (364 GB/s = 113 % @2 GiB); see §9.4 cap-fix |
 | **all_gather** _(post pull-fix)_ | 82–125 % (min **76 %** @64 KiB) | 85–194 % | excellent (122–194 %) | 76 % @ 64 KiB | Pull redesign closed the 68 % dip (was §9.2) |
 | **scatter** | strong (135–250 %) | **cliff 57.6 % @2 MiB** | 79–91 % | **57.6 % @ 2 MiB** | LSA↔GIN threshold cliff + ~10 % large gap |
 | **gather** | strong (150–214 %) | 108–121 % | 100–107 % | 99.6 % @ 2 GiB | Healthy — no action |
@@ -173,12 +173,15 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
 | **reduce** | excellent (up to 278 %) | 103–262 % | **100–116 %** (multi-ring) | 75 % @ 32 MiB (fused fallback) | Multi-ring beats host ≥128 MiB (330 GB/s = 116 % @2 GiB); see §9.5.3 |
 
 **Key synthesis:**
-- **Reduce large-tier is RESOLVED (§9.5.3): the deep-pipelined edge-disjoint multi-ring now beats host
-  (up to 116 % @2 GiB), default-on ≥64 MiB.** The remaining large-size composition plateau is
-  **Broadcast (≥8 MiB, →71 %)**, still ~229 GB/s while its building blocks reach the fabric ceiling
-  (AllGather 424 GB/s, Gather 437 GB/s). The broadcast scatter/gather phase is serialized against the
-  egress root, not pipelined — the multi-ring streaming-write technique that won Reduce is the candidate
-  lever there too.
+- **Reduce AND Broadcast large tiers are RESOLVED — both deep-pipelined edge-disjoint multi-rings now
+  beat host** (Reduce §9.5.3: 116 % @2 GiB, default-on ≥64 MiB; Broadcast §9.4 cap-fix: 113 % @2 GiB,
+  default-on ≥64 MiB). Broadcast's ring already used streaming b128 stores + edge-disjoint cycles but
+  was silently **chunk-capped at 64** (`kBroadcastRingMaxChunks`), starving the (N-1)-hop pipeline; the
+  earlier "chunks 64/128/256 flat" sweep all clamped to 64 and never saw the depth. Raising the cap to
+  256 with per-CTA ~64 KiB sizing (the Reduce recipe) took 2 GiB 350→**364**. The only remaining
+  broadcast gap vs host is the **4–64 MiB fill regime** (pipeline fill over 7 hops × 128 CTAs on small
+  per-CTA slices), where SAG/hybrid is used and sits ~68–86 % of host — a small-message latency class,
+  not a large-tier bandwidth plateau.
 - **Two clean quick wins:** Scatter's **2 MiB threshold cliff** (57.6 % — a misplaced LSA↔GIN crossover)
   and AllGather's **mid LSA-band dip** (68 % @128 KiB — the entry-only/exit-barrier candidate, mirrors
   the A2A pull win).
@@ -574,6 +577,44 @@ opt-out fallback via `NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES=0`):
 Verified with **no `NCCL_GIN_ANVIL_BCAST_*` knobs set** (compiled defaults only): gate `#wrong=0` OOP +
 in-place across 2 MiB–2 GiB, default perf @2 GiB = **349 GB/s**. Below 2 MiB the flat/LSA/LL hybrid still
 handles the message. File: `gin_sdma_collective_policy.h` (`kBroadcastRingMinDefault = 2 MiB`).
+
+#### Chunk-depth cap was hiding headroom — WIN (350 → 364) + threshold fix (2026-08-04)
+
+Revisiting the ring with the Reduce multi-ring's deep-pipeline insight (§9.5.3) exposed a latent cap.
+`bcastRingChunks` derived the pipeline depth from **global** `msgBytes / 2 MiB` and clamped it to
+`kBroadcastRingMaxChunks = 64` — a **hard 64 cap**. Every prior "chunk 64/128/256 is flat" sweep set the
+env override to those values, **all of which clamp to 64**, so a deeper pipeline was *never actually
+tested*. A sweep **within** the cap (env-only, 8× MI355X, 128 CTAs, 2 GiB) shows the ring is still
+climbing at 64: **8→217, 16→280, 32→322, 64→350** — the same C/(C+N-1) fill curve that starved the
+Reduce ring at C=4.
+
+Fix (mirrors Reduce): raise `kBroadcastRingMaxChunks` 64→256 and switch `bcastRingChunks` to
+**per-CTA** sizing — target ~64 KiB per chunk of *this CTA's* stripe (`msgBytes/ctas`), clamp `[16,256]`
+— so chunk bytes stay constant across sizes (the old global formula over-chunked small messages into
+tiny barrier-bound chunks). Post-fix warm A/B (`-D 3`, `-c 0`, `-n 20 -w 5`, OOP busbw GB/s):
+
+| size | host `-D 0` | SAG | ring (adaptive, 128 CTA) | ring/host |
+|-----:|----:|----:|----:|----:|
+| 32M  | 198 | 171 | 172 (fill regime) | 0.87 |
+| 64M  | 251 | 196 | 244 | 0.97 |
+| 128M | 271 | 213 | 267 | 0.99 |
+| 256M | 300 | 222 | **313** | 1.04 |
+| 512M | 308 | 226 | **341** | 1.11 |
+| 1G   | 321 | 229 | **357** | 1.11 |
+| 2G   | 322 | 230 | **364** | **1.13** |
+
+Fixed chunk depth confirms the cap was the limit (2 GiB): **64→350, 128→364, 256→365** (default adaptive
+picks 256 @2 GiB). But fixed-deep chunks are **catastrophic on small messages** (128M×256 = 69, 128M×128
+= 133) because the per-CTA slice fragments into tiny chunks — which is exactly why the adaptive per-CTA
+formula (256 @2 GiB, 64 @512M, 16 @128M) is required, and why the ring must not run on small messages at
+all. The old `kBroadcastRingMinDefault = 2 MiB` had the ring default-on across the whole small tier where
+it **collapses** (adaptive ring 2M 12, 8M 49, 16M 97 — far below SAG 35/96/135, since SAG has since
+improved and now leads there). So the threshold was raised **2 MiB → 64 MiB**: the ring engages only
+where it beats SAG (≥64 MiB) and beats host (≥256 MiB); 4–64 MiB stays on SAG/hybrid (the fill-regime
+gap vs host is a small-message latency class, not a bandwidth plateau). Gate `#wrong=0` OOP + in-place,
+ring default-on, deep adaptive chunks. Files: `gin_sdma_collective_policy.h`
+(`kBroadcastRingMaxChunks`=256, `kBroadcastRingMinChunks`=16, `kBroadcastRingTargetChunk`=64 KiB,
+per-CTA `bcastRingChunks`, `kBroadcastRingMinDefault`=64 MiB), `broadcast.cu` (pass `bcastRingCtas()`).
 
 #### Can the SDMA ring match the SM/CTA ring? — NO (per-link SDMA copy is the wall)
 
