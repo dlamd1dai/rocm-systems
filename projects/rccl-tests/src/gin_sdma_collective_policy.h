@@ -54,19 +54,31 @@ static constexpr size_t kBroadcastScatterAgMinDefault  = 2ull * 1024 * 1024;  //
 static constexpr size_t kBroadcastLLMaxBytes           = 65536;         // 64 KiB
 static constexpr size_t kBroadcastLLDefaultMaxBytes    = 2048;          // 2 KiB
 // Broadcast pipelined-ring (large tier) minimum; 0 disables. Enabled by default at
-// the 2 MiB SAG crossover: with the ring's self-selected CTA count (~128, see
-// bcastRingCtas) a warm A/B on 8x MI355X (default CTAs, -c 0) shows the ring beats
-// SAG at every size >=2 MiB -- 2M 31 vs 17, 8M 93 vs 55, 32M 180 vs 128, 128M 238
-// vs 198, 512M 342 vs 228, 2G 350 vs 237 GB/s (=119% of host's 294). The ring gate
-// is checked before SAG, so this makes the ring the large-tier default and leaves
-// SAG as the opt-out fallback (NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES=0). Below 2 MiB
-// the flat/LSA/LL hybrid still handles the message.
-static constexpr size_t kBroadcastRingMinDefault       = 2ull * 1024 * 1024;  // 2 MiB
-// Target bytes per ring pipeline chunk; the chunk (pipeline-depth) count is
-// clamp(msgBytes / target, 2, kBroadcastRingMaxChunks). Deeper pipeline hides
-// more fill latency but adds per-chunk put/waitSignal overhead.
-static constexpr size_t kBroadcastRingTargetChunk      = 2ull * 1024 * 1024;  // 2 MiB
-static constexpr int    kBroadcastRingMaxChunks        = 64;
+// the SAG crossover. With the deep per-CTA-adaptive pipeline (see bcastRingChunks)
+// a warm A/B on 8x MI355X (128 CTAs, -c 0, float) shows the ring is the best GIN
+// option from ~64 MiB up and BEATS HOST from 256 MiB up:
+//   size   host   SAG(-V32)  ring        ring/host
+//   64M    251    196        245         0.98
+//   128M   271    213        268         0.99
+//   256M   300    222        313         1.04
+//   512M   308    226        342         1.11
+//   1G     321    229        356         1.11
+//   2G     322    230        364         1.13
+// Below ~32 MiB the (N-1)-hop pipeline over tiny per-CTA slices collapses (ring
+// 2M 12, 8M 49 << SAG 35/96), and SAG now matches/leads there anyway, so the ring
+// engages only >= 64 MiB; the flat/LSA/LL hybrid + SAG handle everything smaller.
+// The ring gate is checked before SAG; SAG stays the opt-out fallback
+// (NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES=0).
+static constexpr size_t kBroadcastRingMinDefault       = 64ull * 1024 * 1024;  // 64 MiB
+// Target bytes per ring pipeline chunk, sized PER CTA (see bcastRingChunks): the
+// ring is an (N-1)-hop pipeline whose fill/drain efficiency is C/(C+N-1), so the
+// depth must be large. A chunk-depth sweep (8x MI355X, 2G, 128 CTAs) rises
+// monotonically past the old 64 cap -- 8ch 217, 16ch 280, 32ch 322, 64ch 350 --
+// so the cap is raised to 256 and the count targets ~64 KiB per chunk per CTA
+// (the same sweet spot the Reduce multi-ring found; deeper starves small sizes).
+static constexpr size_t kBroadcastRingTargetChunk      = 64ull * 1024;  // 64 KiB per CTA
+static constexpr int    kBroadcastRingMaxChunks        = 256;           // was 64 (the ring was still climbing there)
+static constexpr int    kBroadcastRingMinChunks        = 16;            // fill the pipeline past the N-1 cost
 
 // AllGather LSA<->GIN default; compared against the per-rank chunk bytes.
 static constexpr size_t kAllGatherSdmaThresholdDefault = 262144;        // 256 KiB/rank
@@ -261,16 +273,21 @@ GIN_SDMA_HD inline bool bcastUseRing(size_t msgBytes, size_t count,
          count >= (size_t)nRanks;
 }
 
-// Ring pipeline depth (chunk count). Env override (envChunks) wins when set;
-// otherwise derive from the target chunk size, clamped to [2, max]. The kernel
-// further clamps to <= count so no chunk is empty.
-GIN_SDMA_HD inline int bcastRingChunks(size_t msgBytes, size_t envChunks) {
+// Ring pipeline depth (chunks per CTA stripe). Env override (envChunks) wins when
+// set (clamped to <= max); otherwise size-adaptive like the Reduce multi-ring:
+// target ~64 KiB per chunk of THIS CTA's stripe (msgBytes/ctas), clamped to
+// [min,max]. Per-CTA sizing (vs the old global msgBytes/target) keeps the chunk
+// bytes constant across sizes so small messages are not over-chunked into tiny
+// (barrier-bound) chunks. The kernel further clamps to <= sCount so none is empty.
+GIN_SDMA_HD inline int bcastRingChunks(size_t msgBytes, int ctas, size_t envChunks) {
   if (envChunks != kThresholdUnset && envChunks > 0) {
     return (envChunks > (size_t)kBroadcastRingMaxChunks)
                ? kBroadcastRingMaxChunks : (int)envChunks;
   }
-  size_t c = (msgBytes + kBroadcastRingTargetChunk - 1) / kBroadcastRingTargetChunk;
-  if (c < 2) c = 2;
+  if (ctas < 1) ctas = 1;
+  size_t stripeBytes = msgBytes / (size_t)ctas;
+  size_t c = stripeBytes / kBroadcastRingTargetChunk;
+  if (c < (size_t)kBroadcastRingMinChunks) c = (size_t)kBroadcastRingMinChunks;
   if (c > (size_t)kBroadcastRingMaxChunks) c = (size_t)kBroadcastRingMaxChunks;
   return (int)c;
 }

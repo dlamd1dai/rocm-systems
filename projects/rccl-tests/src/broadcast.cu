@@ -1078,7 +1078,7 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         const int sagRanks = (int)((struct ncclDevComm*)comm)->nRanks;
         const size_t msgBytes = count * wordSize(type);
         if (gin_sdma::bcastUseRing(msgBytes, count, sagRanks, bcastRingMin)) {
-          const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, bcastRingChunksEnv);
+          const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, bcastRingCtas(), bcastRingChunksEnv);
           // Full edge-disjoint decomposition (all N-1 links) built + uploaded
           // once per N; falls back to the coprime-stride kernel if unavailable.
           // File-scope so BroadcastDeviceTime can see whether the tables exist.
@@ -1170,8 +1170,8 @@ testResult_t BroadcastDeviceTime(struct threadArgs* args, ncclDataType_t type, n
   if (kernel == nullptr) return testSuccess;
 
   static const size_t chunksEnv = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_RING_CHUNKS");
-  const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, chunksEnv);
   const int gridCtas = bcastRingCtas();
+  const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, gridCtas, chunksEnv);
   double devUs = 0.0;
   TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
       [&](int i, long long* d_start, long long* d_end) {
