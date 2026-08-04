@@ -667,3 +667,76 @@ host and GIN legs both warm):**
 Net: the mid-band dip is substantially closed (2 MiB 78→94, 8 MiB 80→98) and small sizes now beat host;
 large returns to parity. The residual 16–33 MiB trough (~82–86 %) is the same root-egress class as the
 other reduction collectives, not a barrier issue. One barrier saved, race-immune, gate green.
+
+### 9.5 Reduce large-tier deep-dive (M3) — in progress (2026-08-04, `smci355`, NP=8)
+
+#### CTA-count re-baseline — the broadcast free-win does NOT transfer; the global `-V` default regressed Reduce
+
+The broadcast large-tier win was almost entirely CTA-driven (`-V 32`→`128` = 238→350 GB/s), and its
+productization raised the **global** `-V` default 16→128. Reduce launches at `deviceCtaCount`, so a
+straight `-V` sweep tested whether the same lever applies. It does **not** — more CTAs *monotonically
+hurt* Reduce (warm, `-D 3`, OOP, `-c 0`, float sum, gin/host%):
+
+| size | host GB/s | `-V 32` | `-V 64` | `-V 128` |
+|---|---|---|---|---|
+| 128 MiB | 242 | **204 (84%)** | 192 (79%) | 151 (62%) |
+| 256 MiB | 272 | **211 (77%)** | 205 | 178 (65%) |
+| 512 MiB | 276 | **213 (78%)** | 211 | 196 (71%) |
+| 1 GiB | 284 | **214 (76%)** | 214 | 206 (73%) |
+| 2 GiB | 284 | **214 (76%)** | 215 | 211 (74%) |
+
+`-V 32` is Reduce's optimum (~214 = 76% of host); the ring's 128 is its *worst* point. **Consequence:
+the broadcast commit's global `-V`=128 default silently regressed the bare (no-`-V`) Reduce launch by
+−26% @128 MiB** (204→151). Fixed (see below); the gate/board pass `-V 32` explicitly so their numbers
+were unaffected.
+
+**CTA-default hygiene fix — DONE, gate green.** Reverted the global `-V` default 128→**16** (the
+pre-broadcast value; every non-broadcast collective was tuned at `-V 32` which the gate/board pass
+explicitly) and **decoupled the broadcast ring's CTA count from `-V`** so it always self-selects 128
+(`bcastRingCtas()` no longer clamps to `deviceCtaCount`; `BroadcastGetDevCommRequirements` still
+allocates `max(deviceCtaCount, ringCtas)` barriers). Verified 8× MI355X, `-D 3`, warm:
+
+| config | broadcast @2 GiB | note |
+|---|---|---|
+| default (no `-V`) | **349** | ring self-selects 128 regardless of the 16 default |
+| `-V 32` | **349.7** | previously the ring was clamped to 32 → ~238; decoupling *fixed* a latent gate gap where the gate (`-V 32`) never exercised the promoted 350 path |
+
+Broadcast **and** Reduce functional gates both green (`#wrong=0`, OOP + in-place). Files: `common.cu`
+(`deviceCtaCount` 128→16, `-V` fallback/help text), `broadcast.cu` (`bcastRingCtas` decoupled).
+
+#### Phase-isolation diagnostic — Reduce is serialized RS+gather, NOT root-ingress bound
+
+Reduce's `-D 3` kernel is a single fused pass: each rank SM-reads its slice `[r*base]` from all N peers
+(read-reduce) and SM-stores the result into the **root's** recvbuff. To localize the wall, measured each
+phase in isolation at 2 GiB (`-V 32`, `-D 3`, warm):
+
+| phase | time | algbw |
+|---|---|---|
+| `reduce_scatter` (SM read-reduce → **local**) | 4.88 ms | 440 GB/s |
+| `gather` (SDMA GIN-put → **root**) | 4.29 ms | 500 GB/s |
+| **fused `reduce`** | **9.97 ms** | **215 GB/s** |
+
+**The fused reduce time ≈ RS-time + gather-time added serially** (4.9 + 4.3 = 9.2 ms ≈ 10 ms). Reduce is
+therefore NOT root-ingress bound (Gather alone moves to the root at 500 GB/s); it pays for the
+read-reduce and the root-write **back-to-back with no overlap**. Root cause of the no-overlap: the fused
+kernel's root-write is an **SM store over the single r→root xGMI link** (~58 GB/s/link, the same
+per-link SM-store rate the broadcast campaign measured), so the ~256 MiB/rank write costs ~4.4 ms on top
+of the 4.9 ms read-reduce.
+
+#### Design (implementing): pipelined SM-reduce ∥ SDMA-put (different HW units overlap)
+
+The two phases run on **different hardware**: read-reduce is SM/LSA, the fast root delivery is SDMA
+(GIN put, the gather path that hits 500 GB/s). Unlike the broadcast SAG chunk-pipelining dead-end (both
+phases were SDMA puts on the *one* channel, so they could not overlap — §9.3), SM and SDMA are distinct
+engines and **can** run concurrently. So a chunk-pipelined large tier — SM-reduce chunk k+1 into a
+staging buffer while SDMA-puts chunk k's reduced result to the root — should collapse the time toward
+`max(4.9, 4.3) ≈ 5 ms` → **~430 GB/s ≈ 150% of host**.
+
+Mechanism located: a per-rank **scratch window** via `ncclDevResourceRequirements{bufferSize,
+bufferAlign, outBufferHandle}` on `reqs->resourceRequirementsList` (staging can't reuse sendbuff —
+corrupts subsequent perf/gate iterations — nor non-root recvbuff — verifier requires it untouched);
+device side stages via `ncclGetResourceBufferLocalPointer` and GIN-puts from `comm.resourceWindow` at
+`ncclGetResourceBufferOffset(handle)`. Root reduces its own slice locally and waits N−1 (× per-CTA)
+puts. **OOP large only**; in-place and small/mid keep the fused direct-to-root kernel (small Reduce is
+already up to 278% of host). Fold order along the pull is unchanged (ascending source rank); the
+verifier tolerates it regardless (the host tree/ring path passes the same gate).
