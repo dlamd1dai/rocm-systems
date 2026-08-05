@@ -3,9 +3,17 @@
 **Document type:** Internal AMD design/implementation plan
 **Status:** **In progress** — extends the implemented GIN-SDMA collectives (AllToAll, AllGather,
 Broadcast) to the remaining single-node collectives. No RCCL backend / GIN-ABI changes.
-**Phase 1 (SendRecv, Scatter, Gather `-D 3`) has landed** (see §3.1–3.3, marked IMPLEMENTED); P2+
-(reduction collectives) remain proposed.
-**Date:** 2026-07-27 (updated 2026-07-29)
+**P1 (SendRecv, Scatter, Gather `-D 3`), P2 (ReduceScatter `-D 3`), P3 (AllReduce `-D 5`/`-D 6`)
+and P4 (Reduce `-D 3`) have all landed** (see §3.1–3.3, §3.5–3.7, marked IMPLEMENTED).
+**Only P5 (AllToAllv) remains** — currently WIP on `users/dondai/gin-stage2j-sdma-A1457-a2av-wip`;
+the design (§3.4, §4.5) is resolved and it is the last `-D 3` collective in the expansion.
+**As-built note:** the AllReduce and Reduce large tiers deviated from the original §3.6/§3.7
+proposals during the perf campaign (AllReduce keeps a one-shot small tier but in a hang-safe
+GIN-barrier'd form, not the originally-planned no-GIN version; Reduce's large tier became an
+edge-disjoint multi-ring, not RS+Gather). The detailed campaigns live in
+[gin-sdma-perf-optimization-plan.md](gin-sdma-perf-optimization-plan.md) (§9.x); the as-built notes
+below are the authoritative summary.
+**Date:** 2026-07-27 (updated 2026-08-04)
 **Scope:** `projects/rccl-tests/` device kernels (`-D 3`, `NCCL_GIN_TYPE=6`), the shared
 `gin_sdma_collective_policy.h`, host policy unit tests, and per-collective gate scripts.
 **Related:**
@@ -66,10 +74,10 @@ in the 2026-07-27 scoping review.)
 | **Scatter** | movement | ✅ (P1, `-D 3`) | **excellent** | root puts distinct chunk to each rank; LL→LSA(interleaved)→GIN |
 | **Gather** | movement | ✅ (P1, `-D 3`) | **excellent** | each rank puts its chunk to root's slot |
 | **SendRecv** | movement | ✅ (P1, `-D 3`) | **excellent** | single put + waitSignal |
-| **AllToAllv** | movement | ❌ | **good** | AllToAll put loop with per-peer displacements/counts |
+| **AllToAllv** | movement | ❌ (P5, WIP) | **good** | AllToAll put loop with per-peer displacements/counts |
 | **ReduceScatter** | reduction | ✅ (P2, `-D 3`) | **excellent** | single-tier direct LSA read-reduce; adaptive load schedule (peer-unroll grid-stride / pack+peer-unroll+prefetch). No scratch. See [reducescatter-gin-sdma-phase2.md](reducescatter-gin-sdma-phase2.md) |
-| **AllReduce** | reduction | ❌ | **good** (SM reduce) | ReduceScatter + AllGather (reuse AG large path) |
-| **Reduce** | reduction | ❌ | **good** (SM reduce) | ReduceScatter + Gather, or direct root-ingress reduce |
+| **AllReduce** | reduction | ✅ (P3, `-D 5`/`-D 6`) | — | RS (LSA read-reduce) + in-place AllGather; single-launch (`-D 5`, grid barrier) or two-launch (`-D 6`). Threshold selects the AG tier (LSA store-gather / SDMA put). Tiny-OOP one-shot tier kept (GIN-barrier'd, hang-safe). See §3.6 |
+| **Reduce** | reduction | ✅ (P4, `-D 3`) | — | small = reduce-scatter-to-root LSA read-reduce (no scratch); large OOP = edge-disjoint multi-ring (not RS+Gather). See §3.7 |
 | Barrier | control | (have sessions) | trivial | reuse barrier session |
 
 **Out of scope / poor fit:** multi-node scaling (backend is single-node xGMI only); custom
@@ -204,7 +212,38 @@ Rank `r` owns output slice `r` (of `M/N` elements) = sum over all ranks of their
 - **DevComm:** `barrier = lsaBarrier = ginSignal = deviceCtaCount`, `needsGin`, **plus a scratch
   window requirement** (~`M` bytes = `N * chunk`) for the large path. See §4.2.
 
-### 3.6 AllReduce (`all_reduce.cu`) — Tier B (highest ML value)
+### 3.6 AllReduce (`all_reduce.cu`) — Tier B — **IMPLEMENTED (`GinAllReduceKernel`, `-D 5`/`-D 6`, 2026-08-02)**
+
+> **As-built (authoritative).** AllReduce ships as **deviceImpl 5 (single-launch, default) / 6
+> (two-launch)**, not `-D 3` (`-D 1..4` are the upstream LSA/multimem demo kernels). **Every size**
+> runs one composition: **RS (LSA read-reduce of the owned slice) → in-place AllGather**, sharing
+> factored phase bodies (`arReduceScatterOwnedSlice` + `arAllGatherInPlace`). The two realizations
+> differ only in the RS→AG sync:
+> - **`-D 5` single-launch (default):** one kernel; a hand-rolled in-kernel device-wide barrier
+>   (`arGridBarrier`) separates RS and AG. Halves host launches but busy-spins, so it **requires all
+>   CTAs co-resident** (fine for these small grids). `cg::this_grid()` SIGSEGVs on this ROCm build
+>   (issue #2805), hence the hand-rolled barrier.
+> - **`-D 6` two-launch (fallback):** `GinAllReduceRSKernel` then `GinAllReduceAGKernel` back-to-back
+>   on the same stream — the launch boundary is the global sync, no co-residency requirement.
+>
+> **Threshold selects the AllGather TIER (total bytes), default 16 MiB (`NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE`, measured 2026-08-02):**
+> small = **LSA store-gather** (`arAllGatherInPlaceLsa`, each rank stores its reduced slice into
+> peers' recvbuf); large = **SDMA AllGather** (put + `waitSignal`). Both keep **exactly one GIN world
+> barrier per launch** so the GIN completion cadence stays uniform.
+>
+> **The small one-shot tier (Q2) ships — but in a HANG-SAFE form.** The originally-planned *no-GIN*
+> one-shot was first prototyped and dropped (interleaving no-GIN LSA-only launches between GIN
+> launches deterministically re-triggered a cumulative GPU hang — a backend GIN signal-completion
+> pipeline disturbance). It was then **re-introduced** as `arAllReduceOneShotLsa` for **tiny
+> out-of-place** messages (< `NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE`, default 256 KiB): it now
+> performs **exactly one GIN world barrier** itself, so the per-launch GIN cadence stays uniform (the
+> property the no-GIN version violated), and it collapses RS + grid barrier + AllGather into that one
+> barrier — the latency floor for tiny messages. In-place tiny messages stay on the RS+AG LSA tier (a
+> one-shot would race sendbuf reads vs recvbuf writes). Two-shot grid capped to
+> `kAllReduceTwoShotMaxCtas = 16` to avoid deadlock at high `-V`. Op/type via `SPECIALIZE_REDUCE_KERNEL`;
+> fp8 `{prod, avg, mulsum}` excluded → `testNotImplemented`.
+
+*Original proposal (superseded in part by the as-built note above), kept for rationale:*
 
 Two-tier hybrid (the standard **one-shot vs two-shot** all-reduce split): a single-phase direct
 LSA reduce for small, and the bandwidth-optimal **ReduceScatter + AllGather** composition for
@@ -237,7 +276,27 @@ the well-established one-shot(small)/two-shot(large) all-reduce split used by NC
 - **DevComm:** `barrier = lsaBarrier = deviceCtaCount`, `ginSignal = max(deviceCtaCount, 2)`
   (two-signal scheme), `needsGin`, scratch window (~`M` bytes).
 
-### 3.7 Reduce (`reduce.cu`) — Tier B
+### 3.7 Reduce (`reduce.cu`) — Tier B — **IMPLEMENTED (`GinReduceKernel`, `-D 3`, 2026-08)**
+
+> **As-built (authoritative).**
+> - **Small / default — reduce-scatter-to-root LSA read-reduce (`GinReduceKernel`, no scratch/
+>   signals/GIN puts):** folds bit-for-bit identically to `GinReduceScatterKernel`; the only
+>   difference is the write target (root's `recvbuff`, offset by the slice). Entry+exit LSA barrier
+>   only, in-place safe (root is the sole reader and writer).
+> - **Large OOP — edge-disjoint MULTI-RING (`GinReduceMultiRingKernel`), NOT the planned RS+Gather.**
+>   The perf campaign found the RS+Gather large tier plateaued at the serial gather; the fix (same as
+>   the broadcast large tier) is an edge-disjoint multi-ring: CTA `b` runs ring `b % nRings` on buffer
+>   stripe `b`, so every GPU drives all its links every cycle. Default **ON for OOP totals ≥ 64 MiB**
+>   (`reduceRingMinBytes()`, env-gated); CTA count self-selects (`reduceRingCtas()`, default 128,
+>   decoupled from `-V` like the broadcast ring); pipeline depth via `reduceRingChunks()` /
+>   `reduceRingAutoChunks`. A `GinReducePipelinedKernel` (SM-reduce ∥ SDMA-put) variant also exists.
+>   Full campaign in [gin-sdma-perf-optimization-plan.md](gin-sdma-perf-optimization-plan.md) §9.5.
+>
+> Reduce's tier/threshold logic lives in `reduce.cu` (the `reduceRing*()` helpers), **not** in the
+> shared `gin_sdma_collective_policy.h`. Op/type coverage as AllReduce (fp8 `{prod, avg, mulsum}`
+> excluded).
+
+*Original proposal (large tier superseded by the multi-ring as-built note above), kept for rationale:*
 
 Reduce is the **exact dual of Broadcast** (root-*ingress* bound instead of root-egress). The tier
 ladder mirrors the broadcast ladder.
@@ -459,12 +518,13 @@ basis table exactly like §4.3.1 of the broadcast plan.
 |---|---|---|---|
 | **P1** ✅ | SendRecv, Scatter, Gather (`-D 3`) | low | **Landed** (2026-07-29). Pure movement; each adds an LL tiny tier. Scatter also gained a peer-interleaved LSA fan-out; thresholds tuned (Scatter 128 KiB; Gather/SendRecv LSA-always). |
 | **P2** ✅ | ReduceScatter (`-D 3`) | med | **Landed** (2026-07-30). Final design is single-tier **direct LSA read-reduce** (no scratch/put-partials): each rank reads its output slice from every peer and folds locally, adaptive load schedule ported from the host symmetric LD kernel. 97–100% of host at ≥64 MiB (beats host 64–256 MiB). SDMA-scatter (>host ceiling) investigated + de-risked, not implemented — see [reducescatter-gin-sdma-phase2.md](reducescatter-gin-sdma-phase2.md). |
-| **P3** | **AllReduce** (`-D 3`) | med | RS + AG composition, two signals; **highest value** |
-| **P4** | Reduce (`-D 3`) | med | RS + Gather, or direct root-ingress |
-| **P5** | AllToAllv (`-D 3`) | med | needs device-visible displ/count arrays (Q3) |
+| **P3** ✅ | **AllReduce** (`-D 5`/`-D 6`) | med | **Landed** (2026-08-02). Shipped as deviceImpl 5 (single-launch, grid barrier) / 6 (two-launch), not `-D 3`. RS+AG all sizes; threshold picks the AG tier (LSA store-gather / SDMA put). Tiny-OOP one-shot kept in a hang-safe GIN-barrier'd form. See §3.6. **Highest ML value.** |
+| **P4** ✅ | Reduce (`-D 3`) | med | **Landed** (2026-08). Small = reduce-scatter-to-root LSA read-reduce; large OOP = **edge-disjoint multi-ring** (not RS+Gather — the planned composition plateaued). Tier logic in `reduce.cu`. See §3.7. |
+| **P5** | AllToAllv (`-D 3`) | med | **NEXT / WIP** (`…-a2av-wip`). Last remaining collective. Needs device-visible displ/count arrays (Q3, RESOLVED §4.5). `AlltoAllvRunColl` has no `case 3` yet. |
 | **Xcut** | policy header + unit tests + gates + image | continuous | one PR per phase, each gated green |
 
-Recommended order by value/effort: **P1 → P2 → P3 (AllReduce)** first; P4/P5 follow.
+Recommended order by value/effort was **P1 → P2 → P3 (AllReduce)** first; **P1–P4 are done**, P5
+(AllToAllv) is the only remaining item.
 
 ---
 
@@ -474,10 +534,13 @@ Recommended order by value/effort: **P1 → P2 → P3 (AllReduce)** first; P4/P5
    `ncclDevResourceRequirements{bufferSize, bufferAlign, outBufferHandle}` → `comm.resourceWindow`
    + `ncclGetResourceBuffer(Offset)` accessors; GIN-put-addressable, proven by RCCL's own GIN
    reduce-scatter. No new backend API.
-2. ~~**AllReduce small path**~~ — **RESOLVED (§3.6):** add a single-phase **one-shot direct LSA
-   reduce** small tier (default on) above RS+AG; RS+AG's two-phase overhead structurally doubles
-   the small-message floor, unlike the marginal AllToAll LL case. Standard one-shot/two-shot split;
-   measure the crossover. An even-tinier LL sub-tier is optional/off pending a sweep.
+2. ~~**AllReduce small path**~~ — **RESOLVED, REVISED IN IMPLEMENTATION (§3.6):** the *no-GIN*
+   one-shot was first prototyped and dropped (its LSA-only launches, interleaved among GIN launches,
+   deterministically re-triggered a cumulative GPU hang — GIN signal-completion pipeline disturbance
+   from the irregular cadence), then **re-introduced hang-safe** as `arAllReduceOneShotLsa` for tiny
+   out-of-place messages (< 256 KiB), now performing exactly one GIN world barrier so the cadence
+   stays uniform. Separately, a **size-adaptive AllGather tier** (LSA store-gather < 16 MiB, SDMA put
+   ≥) wins the small/mid RS+AG range. AllReduce ships as `-D 5`/`-D 6`, not `-D 3`.
 3. ~~**AllToAllv arrays**~~ — **RESOLVED (§3.4, §4.5):** pass three `size_t[N]` metadata arrays
    (`sendBytes`, `srcByteOff`, `dstByteOff`) + `nIncoming` as cached device buffers via a bespoke
    `testLaunchDeviceKernelA2Av` launcher. The deterministic, all-ranks-identical size matrix lets
@@ -489,10 +552,11 @@ Recommended order by value/effort: **P1 → P2 → P3 (AllReduce)** first; P4/P5
    fp8 exclusions exactly (RS excludes fp8 prod/mulsum; AR/Reduce also exclude fp8 avg). Unsupported
    `(op,type)` reuse the existing `nullptr → testNotImplemented` skip. Key risk: matching
    `ncclVerifiable`'s accumulation/promotion for fp8/half/bf16 to reach `#wrong==0`.
-5. ~~**Reduce large tier**~~ — **RESOLVED (§3.7):** use **RS + Gather** (bandwidth-optimal dual of
-   SAG broadcast; reuses RS+Gather already in the plan). Direct root-ingress push is dominated
-   (capped at `B_root_ingress/N`, needs `(N−1)·M` root scratch) and is **not** shipped. Small tier
-   = single-phase LSA pull-reduce to root (no scratch).
+5. ~~**Reduce large tier**~~ — **RESOLVED, then REVISED IN IMPLEMENTATION (§3.7):** RS+Gather was
+   planned, but the perf campaign found it plateaus at the serial gather, so the shipped large OOP
+   tier is an **edge-disjoint multi-ring** (`GinReduceMultiRingKernel`, default ON ≥ 64 MiB) — the
+   same cure the broadcast large tier used. Direct root-ingress push remains rejected. Small tier =
+   reduce-scatter-to-root LSA read-reduce (no scratch), as planned. See perf-opt-plan §9.5.
 6. ~~**Integration target**~~ — **RESOLVED (recommendation, §8):** v1 = all collectives at `-D 3`
    in rccl-tests (matches the broadcast doc §0/§8 precedent: standalone kernel + gate first,
    production wiring deferred). Promote to production later, per-collective, once the gate is green

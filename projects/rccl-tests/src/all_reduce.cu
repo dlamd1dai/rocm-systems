@@ -592,6 +592,16 @@ __global__ void allReduceMultimemVectorizedKernel(ncclWindow_t sendwin, size_t s
 // data movement changes (LSA peer-stores vs SDMA puts + waitSignal). So the per-launch GIN
 // completion cadence stays uniform across the sweep, which is what the one-shot violated.
 // The RS phase is unchanged (LSA). Soak-tested on the full omni sweep for hang regression.
+//
+// NOTE (2026-08-02, later -- supersedes the "dropped" disposition above): a one-shot LSA
+// read-reduce fast path was RE-INTRODUCED in a hang-SAFE form (arAllReduceOneShotLsa, used
+// by ginAllReduceBody for tiny OUT-OF-PLACE messages < NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_
+// ALLREDUCE, default 256 KiB). The fix over the dropped version: it performs EXACTLY ONE
+// GIN world barrier itself (ncclBarrierSession on ncclTeamTagWorld), so it keeps the same
+// uniform per-launch GIN cadence as the RS+AG and LSA-AG tiers -- the property the earlier
+// NO-GIN one-shot violated. It collapses RS + grid barrier + AllGather into that single
+// barrier, so it is the latency floor for tiny messages; it stays out-of-place-only (an
+// in-place one-shot would race sendbuf reads against recvbuf writes). Soak-tested clean.
 
 // ---------------------------------------------------------------------------
 // GIN-SDMA AllReduce: ReduceScatter + AllGather (all sizes)
