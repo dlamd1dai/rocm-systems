@@ -13,15 +13,12 @@
 #           all-GIN/SDMA (large). The max of the two per size is what an ideally
 #           tuned kAllToAllvSdmaThresholdDefault would deliver.
 #
-# Timing is launch-inclusive for BOTH paths (no HIP-graph capture), so the
-# comparison is apples-to-apples. NOTE: -G graph replay is intentionally OFF by
-# default (A2AV_CUDAGRAPH=0). rccl-tests' TimeTest wraps the per-size warm-up
-# loop inside cudaStreamBeginCapture, and the A2AV -D 3 kernel lazily hipMalloc's
-# its per-peer metadata buffer on the first RunColl of each size -- which lands
-# inside that capture and is illegal ("operation not permitted when stream is
-# capturing"). Enabling -G needs a capture-safe metadata path (pass the small
-# per-peer arrays by value, or pre-allocate outside capture); until then leave
-# A2AV_CUDAGRAPH=0.
+# The GIN path uses HIP-graph replay (-G, A2AV_CUDAGRAPH default 4) to strip
+# per-launch host overhead and report device throughput, like the A2A Test#5;
+# HOST stays launch-inclusive by design. The A2AV -D 3 kernel is HIP-graph
+# capture-safe: its per-peer metadata is passed as a by-value kernel argument
+# (A2AvDeviceMeta), so no hipMalloc/hipMemcpyAsync runs inside the captured
+# warm-up. Set A2AV_CUDAGRAPH=0 for a launch-inclusive apples-to-apples run.
 #
 # Usage: gin-sdma-a2av-test.bash <bin_dir> [np] [launcher]
 #   bin_dir : dir containing a freshly-built alltoallv_perf (with the -D 3 kernel)
@@ -42,10 +39,10 @@ CTA="${A2AV_CTA:-32}"                 # -V device CTA count for the -D 3 kernel
 # Forced-GIN cold-start floor: forcing SDMA at tiny sizes can hit the pre-existing
 # GIN cold-start hang common to all GIN collectives, so start the GIN pass here.
 GIN_MIN_BYTES="${A2AV_GIN_MIN_BYTES:-1M}"
-# -G replay count for the GIN path. Default 0 (off): the A2AV -D 3 kernel is not
-# yet HIP-graph-capture-safe (lazy hipMalloc of per-peer metadata during the
-# captured warm-up). See header note before setting >0.
-CUDAGRAPH="${A2AV_CUDAGRAPH:-0}"
+# -G replay count for the GIN path (0 = off). The A2AV -D 3 kernel is HIP-graph
+# capture-safe (by-value A2AvDeviceMeta), so graph replay is used by default to
+# report device throughput; set A2AV_CUDAGRAPH=0 for launch-inclusive timing.
+CUDAGRAPH="${A2AV_CUDAGRAPH:-4}"
 HOST_NCHANNELS="${A2AV_HOST_NCHANNELS:-32}"
 ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD:-$((128 * 1024 * 1024))}"
 OUTDIR="${A2AV_OUTDIR:-/tmp/a2av-perf}"
