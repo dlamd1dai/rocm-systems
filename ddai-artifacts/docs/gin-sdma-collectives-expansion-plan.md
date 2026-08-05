@@ -13,7 +13,7 @@ GIN-barrier'd form, not the originally-planned no-GIN version; Reduce's large ti
 edge-disjoint multi-ring, not RS+Gather). The detailed campaigns live in
 [gin-sdma-perf-optimization-plan.md](gin-sdma-perf-optimization-plan.md) (§9.x); the as-built notes
 below are the authoritative summary.
-**Date:** 2026-07-27 (updated 2026-08-04)
+**Date:** 2026-07-27 (updated 2026-08-05)
 **Scope:** `projects/rccl-tests/` device kernels (`-D 3`, `NCCL_GIN_TYPE=6`), the shared
 `gin_sdma_collective_policy.h`, host policy unit tests, and per-collective gate scripts.
 **Related:**
@@ -193,6 +193,53 @@ are passed directly (no `sizeof(T)` multiply in-kernel), matching how the other 
 - **DevComm:** as AllToAll case 3 (`barrier = lsaBarrier = ginSignal = deviceCtaCount`, `needsGin`).
 - **In-place:** unsupported by the A2Av test (`reportErrors = 0` in-place), same as AllToAll.
 
+#### 3.4.1 As-built & measured (2026-08-05, 8× MI355X, gfx950, float, `-V 32`)
+
+Two post-bring-up refinements landed after the P5 kernel passed its functional gate (commits
+`e9eb2929b3` src, `87ca8f1006` test on `…-a2av-wip`):
+
+1. **Grid-wide LSA scatter (was one-CTA-per-peer).** The first cut mapped one CTA to each peer
+   (`for (p = blockIdx.x; p < N; p += gridDim.x)`), which left `gridDim − N` CTAs idle and pinned
+   each peer chunk to a single 512-thread block. That capped the mid-band (128 K–512 K/peer nominal)
+   at ~4 GB/s regardless of `-G` (a *parallelism* limit, not launch overhead). The LSA tier was
+   rewritten to a **grid-wide cooperative copy** — the full grid drives every peer chunk via a
+   grid-global `(tid, nthreads)`, visiting peers in a `(rank + blockIdx.x)`-rotated order (F2+F3) so
+   distinct CTAs hit distinct peers and spread xGMI egress. This mirrors the host RING's
+   multi-channel parallelism and the sibling A2A `AlltoAllVectorizedImpl`. Result: the 128 K–512 K
+   band jumped ~2.7–4.8× and GIN-LSA now **beats** host RING through 256 KiB/peer.
+
+2. **Measured LSA↔GIN threshold = 256 KiB/peer** (`kAllToAllvSdmaThresholdDefault = 262144`, now
+   *measured*, previously an unmeasured placeholder — which happened to be correct). Nominal
+   per-peer crossover sweep (all `#wrong==0`): LSA wins at 256 KiB/peer (39.6 vs 36.3 GB/s), GIN/SDMA
+   takes over from 384 KiB/peer (47.5 vs 41.4; 512 KiB 50.7 vs 43.4; 768 KiB 61.2 vs 56.9). Convention
+   is "largest per-peer chunk LSA still wins" (`bytes <= threshold → LSA`), i.e. 256 KiB.
+
+**Host-vs-GIN envelope (out-of-place busbw, GB/s; GIN on `-G 4` graph-replay = device throughput,
+HOST launch-inclusive; `best_host` was host-RING at every size, host-CE never won):**
+
+| total size | best host | best GIN (tier) | gin/host | regime |
+|---:|---:|---:|---:|:--|
+| ≤ 256 K | 0.01–10.6 | 1.0–1.84× higher (LSA) | **1.4–1.84×** | GIN-LSA wins (grid-wide scatter + graph replay) |
+| 512 K | 25.1 | 28.2 (LSA) | 1.12× | GIN edge |
+| 1 M–2 M | 41.4–55.6 | 34.5–39.5 (LSA) | 0.71–0.83× | host RING ramps faster; GIN mid-band soft spot |
+| 4 M–64 M | 67.8–87.5 | 52.8–84.2 (GIN) | 0.78→0.96× | GIN/SDMA closing |
+| 128 M–1 G | ~87 | ~86–87.5 (GIN) | 0.99–1.01× | **parity at xGMI ceiling** |
+| 2 G | 87.1 | 65.6 (GIN) | 0.76× | copy-engine dip (see below) |
+
+**2 GB copy-engine dip (investigated, not a regression).** GIN busbw drops to 65.6 at 2 GB while
+host-RING holds ~87. Reproducible across 3 runs (65.5/65.5/65.6), `#wrong==0`, no truncation/overflow
+warnings. The put chunk is already the compile-time 1 GiB (`kGinPutMaxBytes`; `ginPutChunked`), so the
+1 GiB SDMA descriptor boundary is *not* newly triggered. Key corroboration: the **host copy-engine
+path (host-CE) also collapses at 2 GB (60.3 vs RING 87.1)**, and GIN-SDMA (65.6) actually *beats*
+host-CE there — so both DMA/copy-engine paths sag at 2 GB while the SM-copy ring stays flat. This is a
+**copy-engine throughput characteristic of this system at 2 GB transfers**, not a GIN-kernel or
+chunk-size issue; the only levers are the SM-copy (LSA) tier or more SDMA channels
+(`NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS`), not the put chunk size.
+
+**Remaining opportunity:** the 512 K–2 M/rank mid-band (0.71–0.83× host) — GIN-LSA plateaus (~40 GB/s)
+while the GIN/SDMA tier hasn't fully ramped. Candidate follow-ups: multi-channel SDMA in that band, or
+a size-adaptive LSA CTA ladder like A2A's `a2aLsaCtaCount`.
+
 ### 3.5 ReduceScatter (`reduce_scatter.cu`) — Tier B (introduces SM reduce)
 
 Rank `r` owns output slice `r` (of `M/N` elements) = sum over all ranks of their slice `r`.
@@ -331,7 +378,7 @@ ladder mirrors the broadcast ladder.
 ### 4.1 Shared policy header (`gin_sdma_collective_policy.h`)
 
 Add, mirroring the existing structure:
-- Thresholds: `kScatter/kGather/kSendRecv/kAllToAllv/kReduceScatter/kAllReduce/kReduceSdmaThresholdDefault` (start at 256 KiB; retune per §5).
+- Thresholds: `kScatter/kGather/kSendRecv/kAllToAllv/kReduceScatter/kAllReduce/kReduceSdmaThresholdDefault` (start at 256 KiB; retune per §5). `kAllToAllv` is now **measured** at 256 KiB/peer (§3.4.1).
 - Tier predicates + enums: `scatterKernelTier`, `gatherKernelTier`, `reduceScatterKernelTier`,
   `allReduceKernelTier` (two-phase gate like `bcastUseScatterAllgather`), `reduceKernelTier`.
 - `DevReqs`-style helpers per collective (extend the `a2aDevReqs` pattern), including the
