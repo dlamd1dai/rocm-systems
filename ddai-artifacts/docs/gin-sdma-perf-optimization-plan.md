@@ -164,7 +164,7 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
 
 | Collective | Small (≤256 KiB) | Mid (1–33 MiB) | Large (≥64 MiB) | Worst point | Verdict |
 |---|---|---|---|---|---|
-| **broadcast** | strong (150–210 %) | fading / fill-regime (68–86 %) | **104–113 %** (multi-ring) | ~68 % @ 8–16 MiB | Deep-pipelined 7-ring beats host ≥256 MiB (364 GB/s = 113 % @2 GiB); see §9.4 cap-fix |
+| **broadcast** | strong (150–210 %) | fill-regime ~87–93 % (8–33 MiB) | **104–113 %** (multi-ring) | ~87 % @ 8–16 MiB | Ring crossover realigned 64→32 MiB (§9.7: 33 MiB +3 %); CTA lever exhausted; 8–16 MiB residual structural (§9.3). Deep-pipelined 7-ring beats host ≥256 MiB (§9.4) |
 | **all_gather** _(post pull-fix)_ | 82–125 % (min **76 %** @64 KiB) | 85–194 % | excellent (122–194 %) | 76 % @ 64 KiB | Pull redesign closed the 68 % dip (was §9.2) |
 | **scatter** | strong (135–250 %) | **cliff 57.6 % @2 MiB** | 79–91 % | **57.6 % @ 2 MiB** | LSA↔GIN threshold cliff + ~10 % large gap |
 | **gather** | strong (150–214 %) | 108–121 % | 100–107 % | 99.6 % @ 2 GiB | Healthy — no action |
@@ -178,10 +178,11 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
   default-on ≥64 MiB). Broadcast's ring already used streaming b128 stores + edge-disjoint cycles but
   was silently **chunk-capped at 64** (`kBroadcastRingMaxChunks`), starving the (N-1)-hop pipeline; the
   earlier "chunks 64/128/256 flat" sweep all clamped to 64 and never saw the depth. Raising the cap to
-  256 with per-CTA ~64 KiB sizing (the Reduce recipe) took 2 GiB 350→**364**. The only remaining
-  broadcast gap vs host is the **4–64 MiB fill regime** (pipeline fill over 7 hops × 128 CTAs on small
-  per-CTA slices), where SAG/hybrid is used and sits ~68–86 % of host — a small-message latency class,
-  not a large-tier bandwidth plateau.
+  256 with per-CTA ~64 KiB sizing (the Reduce recipe) took 2 GiB 350→**364**. The **4–64 MiB fill
+  regime** is now investigated + closed (§9.7): the ring↔SAG crossover was realigned 64→**32 MiB**
+  (+3 % @33 MiB, zero regression), the CTA lever is proven *exhausted* (SAG is best at bare `-V`=16 —
+  the opposite of ReduceScatter), and the residual 8–16 MiB dip (~87–90 %) is the same structural
+  single-channel root-egress / small-message-fill class as §9.3 (no software lever).
 - **Two clean quick wins:** Scatter's **2 MiB threshold cliff** (57.6 % — a misplaced LSA↔GIN crossover)
   and AllGather's **mid LSA-band dip** (68 % @128 KiB — the entry-only/exit-barrier candidate, mirrors
   the A2A pull win).
@@ -196,8 +197,10 @@ Full boards captured via `gin-sdma-hostvsgin-board.bash`.
 
 **Data-driven attack order (supersedes §5 priority):**
 1. **Quick wins:** Scatter 2 MiB threshold cliff; AllGather mid-band exit-barrier audit.
-2. **Biggest headroom:** shared large-tier composition plateau — Broadcast (SAG) + Reduce (RS+Gather)
-   phase pipelining; confirm the scatter-phase egress bound vs AllGather's achieved 424 GB/s.
+2. ~~**Biggest headroom:** shared large-tier composition plateau — Broadcast (SAG) + Reduce (RS+Gather)
+   phase pipelining.~~ **DONE:** Reduce (§9.5.3) and Broadcast large (§9.4) both beat host via multi-ring;
+   Broadcast **mid-band closed (§9.7)** — ring crossover realigned 64→32 MiB, CTA lever exhausted, 8–16 MiB
+   residual structural (§9.3). Scatter root-egress remains structural (§9.2/§9.3, needs multi-channel).
 3. ~~**ReduceScatter** mid-band (1–33 MiB) + above-ceiling put-partials tier.~~ **DONE (§9.6):**
    size-adaptive CTA count closed the 33 MiB trough (88→99 %) and RS now beats host at large; put-partials
    tier moot.
@@ -1026,3 +1029,63 @@ untouched. Net mid-band busbw ~+5 %.
 plateau. Two levers, both host-inspired: a **size-adaptive CTA count** (the big one — a CTA-default
 hygiene fix, same class as §9.5.3) plus **4-way peer-ILP** in the mid path. A ring was correctly ruled
 out; an LL small-tier was deferred (high complexity, plan lever #5 deprioritizes it).
+
+### 9.7 Broadcast 4–64 MiB fill regime — ring crossover realigned to 32 MiB; CTA lever exhausted; residual is structural (2026-08-04, `smci355`, NP=8)
+
+Attacked the last non-structural broadcast gap: the 4–64 MiB **fill regime** (board §9.1 flagged
+~68–86 % of host), which runs the **SAG** (scatter+allgather) tier — the multi-ring engages only at the
+`kBroadcastRingMinDefault` cutover (was 64 MiB), and the flat/LSA/LL hybrid handles < 2 MiB.
+
+**Hypothesis A (CTA-starvation, the ReduceScatter story) — DISPROVEN.** SAG launches on
+`-V`/`deviceCtaCount` (bare default 16) via the plain `testLaunchDeviceKernel` (broadcast.cu ~L1124), so
+it looked like the same latent under-launch that crippled the RS mid-band. A warm CTA ladder (ring forced
+OFF so every size is pure SAG; `gin-bcast-mid-ctas.bash`) shows the **opposite** of RS — more CTAs
+*monotonically hurt* SAG:
+
+| size | SAG V16 | V32 | V48 | V64 |
+|---:|---:|---:|---:|---:|
+| 8 MiB  | **104** | 97  | 88  | 83 |
+| 16 MiB | **145** | 136 | 128 | 123 |
+| 33 MiB | **177** | 173 | 167 | 162 |
+| 64 MiB | **199** | 200 | 197 | 194 |
+
+So the bare `-V`=16 default is already SAG-optimal (the scatter phase saturates root egress at low CTA
+count; extra CTAs only add barrier/incast overhead — the same single-GPU-egress wall as §9.3). **No CTA
+lever exists for broadcast SAG** — an important asymmetry vs ReduceScatter (occupancy-bound, wanted *more*
+CTAs). This also means the board's "68 %" was a higher-`-V`/degraded-baseline artifact, not a default bug.
+
+**Hypothesis B (ring engages too high) — CONFIRMED, small win.** The doc claimed the (N−1)-hop ring
+collapses < 64 MiB, but that predated the adaptive per-CTA chunk cap fix (§9.4). Re-probing the current
+adaptive-chunk ring forced ON below 64 MiB (intra-GIN, format-identical, reproduced 3×):
+
+| size | SAG (V16) | ring (128 CTA, adaptive) | winner |
+|---:|---:|---:|---|
+| 8 MiB  | **104** | 49  | SAG (ring fill-stalls) |
+| 16 MiB | **145** | 98  | SAG (ring fill-stalls) |
+| 33 MiB | 177 | **182** | ring (+3 %) |
+| 64 MiB | 199 | **245** | ring (already default) |
+
+The true ring↔SAG crossover is **~32 MiB, not 64** — at 33 MiB the ring already edges SAG, while 16 MiB
+still collapses. **Change shipped:** `kBroadcastRingMinDefault` **64 → 32 MiB**, capturing 33 MiB
+(177→182, a clean **+3 %**) with **zero regression** (16 MiB stays SAG; 64 MiB+ unchanged;
+shipped-default A/B confirmed OOP 33 MiB 176→182, in-place 186→189, all other sizes ≈). One constant;
+the ring kernel/decomp already validated ≥ 64 MiB now just engages one f2 step lower. **Gate PASS**
+(`BCAST_GATE_PASS`, `#wrong==0`, OOP + in-place, the newly-covered 32 MiB point included).
+
+**Residual 8–16 MiB dip has no software lever.** SAG is CTA-saturated at V16 (Hyp. A) and the ring
+fill-stalls below 32 MiB (Hyp. B), so the 8–16 MiB band (~87–90 % of the canonical warm host) is the same
+**structural single-channel root-egress / small-message-fill class** already closed in §9.3
+(multi-channel probe: no gain; ch≥4 collapses, ch8 deadlocks). No further broadcast lever remains.
+
+> ⚠️ **Host-baseline caveat.** Ad-hoc `-D 0` broadcast runs in this session were **unstable** (host OOP
+> read 34–43 GB/s in some runs vs ~115–249 in others for the *identical* command), correlated with
+> lingering `RAS ... bind: Address already in use` state degrading host RCCL's intra-node transport while
+> GIN's SDMA path is unaffected. The SAG-vs-ring **and** CTA-ladder results above are all **intra-GIN,
+> format-identical, reproducible**, so the shipped change stands independent of the flaky host number;
+> host-% should be read from the canonical warm board (§9.1), not these ad-hoc anchors.
+
+**Disposition.** Broadcast mid-band is **closed**: the one available lever (ring-threshold realignment to
+the measured 32 MiB crossover) is shipped (+3 % @33 MiB, zero-regression, gate-green); the CTA lever is
+proven exhausted; and the 8–16 MiB residual is structural (§9.3), not a tunable. Files:
+`gin_sdma_collective_policy.h` (`kBroadcastRingMinDefault` 64→32 MiB + rationale). Script:
+`gin-bcast-mid-ctas.bash` (CTA ladder / ring-below-threshold probe).
