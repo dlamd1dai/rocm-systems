@@ -452,16 +452,23 @@ static constexpr size_t kScatterSdmaThresholdDefault  = 131072;      // 128 KiB/
 static constexpr size_t kGatherSdmaThresholdDefault   = 1073741824;  // 1 GiB: LSA-always
 static constexpr size_t kSendRecvSdmaThresholdDefault = 1073741824;  // 1 GiB: LSA-always
 
-// AllToAllv LSA<->GIN default. AllToAllv is AllToAll with per-peer variable
-// counts (a sparse, per-(sender,receiver) size matrix), so there is no single
-// per-peer chunk to key the tier on; the kernel picks ONE tier for the whole
-// collective from the NOMINAL per-peer chunk (count*eltSize, the AllToAll-style
-// average slice), mirroring how AllToAll keys on its per-peer chunk. Unlike the
-// AllToAll default this is an UNMEASURED starting value (256 KiB, per the
-// expansion-plan "start at 256 KiB, retune per the measurement methodology");
-// tune with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
-// NCCL_GIN_ANVIL_SDMA_THRESHOLD once the crossover is swept on 8x MI355X.
-static constexpr size_t kAllToAllvSdmaThresholdDefault = 262144;     // 256 KiB nominal/peer (unmeasured)
+// AllToAllv LSA<->GIN default; compared against the NOMINAL per-peer chunk
+// (count*eltSize, the AllToAll-style average slice). AllToAllv is AllToAll with
+// per-peer variable counts (a sparse, per-(sender,receiver) size matrix), so
+// there is no single per-peer chunk to key the tier on; the kernel picks ONE
+// tier for the whole collective from that nominal slice, mirroring how AllToAll
+// keys on its per-peer chunk. Like the AllToAll default this is the *largest
+// per-peer chunk the LSA tier still wins* (not the crossover). Measured on 8x
+// MI355X (2026-08-05, float, -V 32, -G 4 graph replay for GIN vs launch-inclusive
+// LSA; grid-wide LSA scatter) via all-LSA vs all-GIN/SDMA sweeps: LSA leads at
+// 256 KiB/peer (2 MiB total, 39.6 vs 36.3 GB/s) and SDMA takes over from
+// 384 KiB/peer (3 MiB total, 47.5 vs 41.4; 512 KiB 50.7 vs 43.4; 768 KiB 61.2 vs
+// 56.9). So <=256 KiB/peer -> LSA, >256 KiB/peer -> GIN-SDMA. The grid-wide LSA
+// rewrite lifted the 128-512 KiB/peer band ~2.7-4.8x (it beats host RING through
+// 256 KiB/peer), which is what pulled the crossover down to this clean 256 KiB
+// step. Tune with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
+// NCCL_GIN_ANVIL_SDMA_THRESHOLD.
+static constexpr size_t kAllToAllvSdmaThresholdDefault = 262144;     // 256 KiB nominal/peer (measured)
 
 enum class MoveTier { LSA, Gin };
 

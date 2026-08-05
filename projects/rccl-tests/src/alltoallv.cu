@@ -280,11 +280,11 @@ __device__ __forceinline__ void A2AvCopy(T* dst, const T* src, size_t nElts, int
 // Metadata (meta.sendBytes/srcByteOff/dstByteOff, all BYTE units) is a by-value
 // kernel argument computed host-side from the deterministic, all-ranks-identical
 // size matrix (no cross-rank exchange needed). Passing it by value (rather than a
-// device buffer) keeps the launch HIP-graph-capture-safe. The LSA tier maps each
-// peer to a CTA (peer = blockIdx.x, blockIdx.x+gridDim.x, ...) so distinct peers'
-// xGMI egress links run concurrently; the GIN tier issues one put per peer from a
-// distinct thread (tid == p), which the backend routes to independent per-peer
-// SDMA queues.
+// device buffer) keeps the launch HIP-graph-capture-safe. The LSA tier is a
+// grid-wide cooperative copy: the full grid drives every peer chunk (grid-global
+// tid), visiting peers in a (rank+blockIdx.x)-rotated order so xGMI egress links
+// stay spread; the GIN tier issues one put per peer from a distinct thread
+// (tid == p), which the backend routes to independent per-peer SDMA queues.
 template <typename T>
 __device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, size_t sdmaThresholdOverride, A2AvDeviceMeta meta) {
   const int rank = devComm.rank, nRanks = devComm.nRanks;
@@ -303,14 +303,23 @@ __device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, 
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 
     const char* srcBase = (const char*)ncclGetLocalPointer(sendwin, sendoffset);
-    // Peer-interleaved fan-out: CTA b serves peers b, b+gridDim, ... so distinct
-    // xGMI egress links fire concurrently (one CTA's 512 threads per peer chunk).
-    for (int p = blockIdx.x; p < nRanks; p += gridDim.x) {
+    // Grid-wide cooperative fan-out (mirrors the host multi-channel A2AV and the
+    // sibling A2A AlltoAllVectorizedImpl): the FULL grid copies every peer chunk,
+    // not one CTA per peer. A single-CTA-per-peer split left gridDim-nRanks CTAs
+    // idle and pinned each peer to 512 threads, capping the mid-band (128K-512K)
+    // at ~4 GB/s. Each thread uses a grid-global (tid, nthreads) so all
+    // deviceCtaCount*blockDim threads drive each transfer. Peers are visited in a
+    // (rank + blockIdx.x)-rotated order (F2+F3) so distinct CTAs hit distinct
+    // peers at any instant, spreading xGMI egress instead of incasting one link.
+    const int gtid      = threadIdx.x + blockIdx.x * blockDim.x;
+    const int gnthreads = blockDim.x * gridDim.x;
+    for (int pp = 0; pp < nRanks; pp++) {
+      const int p = (rank + blockIdx.x + pp) % nRanks;
       const size_t bytes = meta.sendBytes[p];
       if (bytes == 0) continue;
       T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset + meta.dstByteOff[p], p);
       const T* s = (const T*)(srcBase + meta.srcByteOff[p]);
-      A2AvCopy<T>(dst, s, bytes / sizeof(T), (int)threadIdx.x, (int)blockDim.x);
+      A2AvCopy<T>(dst, s, bytes / sizeof(T), gtid, gnthreads);
     }
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
     return;
@@ -437,8 +446,9 @@ testResult_t AlltoAllvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         }
 
         // AllToAllv LSA<->GIN threshold (compared against the nominal per-peer
-        // chunk count*eltSize). Unmeasured 256 KiB starting default; override
-        // with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
+        // chunk count*eltSize). Measured 256 KiB default (LSA wins <=256 KiB/peer,
+        // GIN/SDMA from 384 KiB/peer up on 8x MI355X); override with
+        // NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t a2avThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV", gin_sdma::kAllToAllvSdmaThresholdDefault);
         TESTCHECK(testLaunchDeviceKernelA2Av(SPECIALIZE_KERNEL(GinHybridAlltoAllvKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2avThr, meta));
