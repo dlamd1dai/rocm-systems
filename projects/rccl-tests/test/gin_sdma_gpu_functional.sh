@@ -37,6 +37,7 @@ case "$COLL" in
   broadcast)  BIN="broadcast_perf" ;;
   all_gather) BIN="all_gather_perf" ;;
   alltoall)   BIN="alltoall_perf" ;;
+  alltoallv)  BIN="alltoallv_perf" ;;
   scatter)    BIN="scatter_perf" ;;
   gather)     BIN="gather_perf" ;;
   sendrecv)   BIN="sendrecv_perf" ;;
@@ -130,6 +131,24 @@ case "$COLL" in
     "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
       "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=4096 \
       "$EXE" -b "$MIN_BYTES" -e 8K -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
+      -D 3 -c 1 -n "$ITERS" -w "$WARMUP"
+    set +x
+    ;;
+  alltoallv)
+    # Variable-count AllToAll (deviceImpl 3): PUSH LSA (small) / GIN-SDMA (large)
+    # tiers, no in-place, no LL. Per-peer sizes come from the deterministic shared
+    # size matrix; the default sweep crosses the nominal-per-peer LSA<->GIN cutover
+    # (256 KiB). Start above nranks*nranks/2 elements so the counts are nonzero.
+    run "sweep (LSA<->GIN by size)"
+    # Force the GIN put tier. Like ReduceScatter, forcing GIN at very small sizes
+    # can hit the pre-existing GIN/SDMA cold-start hang common to all GIN
+    # collectives, so start the forced-GIN pass at a safe size.
+    A2AV_GIN_MIN="${GIN_SDMA_A2AV_GIN_MIN:-1048576}"
+    echo "=== [$COLL] GIN-tier forced (NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV=0, -b ${A2AV_GIN_MIN}) ==="
+    set -x
+    "$LAUNCHER" -n "$NP" "${MPI_OPT[@]}" "${EXTRA_LAUNCH_ARGS[@]}" \
+      "${MPI_ENV[@]}" "${EXTRA_ENV[@]}" -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV=0 \
+      "$EXE" -b "$A2AV_GIN_MIN" -e "$MAX_BYTES" -f "$FACTOR" -g 1 -R 2 -V "$CTA" \
       -D 3 -c 1 -n "$ITERS" -w "$WARMUP"
     set +x
     ;;

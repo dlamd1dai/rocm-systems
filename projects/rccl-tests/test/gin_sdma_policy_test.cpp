@@ -338,6 +338,22 @@ TEST(MoveThresholdDefaults, TunedPerCollective) {
   EXPECT_EQ(kSendRecvSdmaThresholdDefault, 1073741824u);   // 1 GiB (LSA-always)
 }
 
+TEST(A2avKernelTier, ThresholdSplit) {
+  // AllToAllv keys the (single) tier on the nominal per-peer chunk; same
+  // LSA(<=thr)/GIN(>thr) split as moveKernelTier, just named for A2Av.
+  const size_t thr = kAllToAllvSdmaThresholdDefault;
+  EXPECT_EQ(a2avKernelTier(thr, thr), MoveTier::LSA);       // at threshold -> LSA
+  EXPECT_EQ(a2avKernelTier(thr - 1, thr), MoveTier::LSA);
+  EXPECT_EQ(a2avKernelTier(thr + 1, thr), MoveTier::Gin);   // above -> GIN
+  EXPECT_EQ(a2avKernelTier(0, thr), MoveTier::LSA);
+  EXPECT_EQ(a2avKernelTier(1, 0), MoveTier::Gin);           // threshold 0 -> always GIN
+}
+
+TEST(A2avThresholdDefault, UnmeasuredStart256KiB) {
+  // Unmeasured 256 KiB starting default (retune per the measurement methodology).
+  EXPECT_EQ(kAllToAllvSdmaThresholdDefault, 262144u);       // 256 KiB nominal/peer
+}
+
 TEST(SendRecvLLEligible, AllGates) {
   const size_t cap = kSendRecvLLMaxBytes;
   EXPECT_FALSE(sendRecvLLEligible(64, 0, cap));           // no slots
