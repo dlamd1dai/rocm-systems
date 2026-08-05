@@ -613,6 +613,25 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
   return testSuccess;
 }
 
+// Same as testLaunchDeviceKernelThresholdScratch but with an EXPLICIT grid size
+// (gridCtas) instead of the global deviceCtaCount. Used by the GIN-SDMA
+// ReduceScatter (-D 3) to self-select a size-adaptive CTA count (see
+// gin_sdma::reduceScatterCtas) decoupled from -V, like the broadcast/reduce
+// rings. gridCtas must be <= the barrier/lsaBarrier count registered in
+// ReduceScatterGetDevCommRequirements (sized to max(deviceCtaCount, tuned)); the
+// kernel indexes devComm.lsaBarrier by blockIdx.x, so over-launching would
+// corrupt/hang.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdScratchGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
 // Variant for the pipelined large-tier Reduce (-D 3, OOP): same reduction-collective
 // signature as ...ThresholdScratch plus a trailing sub-chunk count (nSub) that sets
 // the double-buffer depth of the SM-reduce || SDMA-put overlap. Launched with the
@@ -751,6 +770,10 @@ testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, si
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas, size_t oneShotThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdScratchGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
   return testNotImplemented;
 }
 template <typename F, typename H>

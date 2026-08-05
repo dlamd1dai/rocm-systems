@@ -98,7 +98,12 @@ testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequ
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(deviceCtaCount);
+      // Cover both the -V/deviceCtaCount launch and the size-adaptive CTA count the
+      // kernel self-selects (reduceScatterCtas, up to reduceScatterMaxCtas()),
+      // decoupled from -V -- the read-reduce indexes devComm.lsaBarrier by blockIdx.x.
+      const int rsBarCtas = (deviceCtaCount > gin_sdma::reduceScatterMaxCtas())
+                              ? deviceCtaCount : gin_sdma::reduceScatterMaxCtas();
+      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(rsBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -122,7 +127,9 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
   switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: { // single-tier LSA read-reduce: barriers only, no scratch
-      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(deviceCtaCount);
+      const int rsBarCtas = (deviceCtaCount > gin_sdma::reduceScatterMaxCtas())
+                              ? deviceCtaCount : gin_sdma::reduceScatterMaxCtas();
+      gin_sdma::DevReqs dr = gin_sdma::reduceScatterDevReqs(rsBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
       reqs->ginSignalCount = dr.ginSignalCount;
@@ -148,11 +155,12 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // Reads are 128-bit packed (Pack = 16 bytes = VEC elements). The load SCHEDULE is
 // chosen by total message size (both schedules fold identically, bit-for-bit):
 //   * < ~48 MiB: a register-light grid-stride loop (one pack/thread for maximum
-//     wave occupancy) that consumes peers TWO at a time -- both loads issued
-//     before either reduce, so consecutive source ranks overlap their xGMI read
-//     latency (mirrors UnrollPeers=2). This is the mid-size lever: it breaks past
-//     the ~175 GB/s serial-per-peer plateau (e.g. 16 MiB 175->225, 32 MiB
-//     194->261) without the register cost of pack-unrolling;
+//     wave occupancy) that consumes peers FOUR at a time -- four independent peer
+//     loads issued before any reduce, so four source ranks overlap their xGMI read
+//     latency (deeper peer-ILP than the old 2-way; the read-latency-bound mid-band
+//     has its CTA count already maxed, so per-thread load ILP is the lever). This
+//     breaks past the serial-per-peer plateau without the register/occupancy cost
+//     of the large tier's warp-strided pack-unroll;
 //   * >= ~48 MiB: a WARP-STRIDED loop that unrolls over BOTH packs and peers -- a
 //     warp owns a tile of U*WARP packs and issues U independent 128-bit loads per
 //     source rank at stride WARP (lane varies fastest, so every load stays fully
@@ -212,19 +220,43 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
   const size_t totalBytes = count * (size_t)nRanks * sizeof(T);
 
   if (totalBytes < RS_UNROLL_MIN) {
-    // ---- small/mid: high-occupancy grid-stride with 2-way PEER ILP ----
-    // One pack per thread (register-light -> max occupancy), but the peers are
-    // consumed two at a time: both loads are issued before either is reduced, so
-    // consecutive source ranks overlap their xGMI read latency (mirrors the
-    // UnrollPeers=2 of RCCL's symmetric LD kernel) without the register cost of
-    // pack-unrolling. Ascending source-rank fold order is preserved (s then s+1).
+    // ---- small/mid: high-occupancy grid-stride with 4-way PEER ILP ----
+    // One pack per thread (register-light -> max wave occupancy), but peers are
+    // consumed FOUR at a time: up to four independent 128-bit peer loads are
+    // issued before any is folded, so four source ranks' xGMI read latencies
+    // overlap. RS is read-latency-bound in this occupancy-limited mid-band (16-33
+    // MiB grid-stride tier), and the CTA count is already maxed (48 CTAs; more
+    // crater it), so the remaining lever is per-thread load ILP -- the host
+    // symmetric kernel's latency hiding, adapted to grid-stride granularity (vs
+    // its warp-strided UnrollPacks x UnrollPeers, which collapses occupancy here).
+    // Four Pack temps (64 B) is far lighter than the large tier's U=4 accumulator
+    // set, so occupancy holds. Ascending source-rank fold (s, s+1, s+2, s+3) is
+    // preserved, so the reduction stays bit-for-bit identical to the verifier.
     for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
       Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
       T acc[VEC];
       #pragma unroll
       for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
       int s = 1;
-      for (; s + 1 < nRanks; s += 2) {
+      for (; s + 3 < nRanks; s += 4) {  // four peer loads in flight before folding
+        Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
+        Pack c = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 2))[myBaseP + pk];
+        Pack d = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 3))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, a.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, b.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, c.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, d.e[e], nRanks));
+      }
+      for (; s + 1 < nRanks; s += 2) {  // two-peer remainder
         Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
         Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
         #pragma unroll
@@ -410,9 +442,21 @@ testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvb
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         if (count == 0) return testSuccess;
-        // Single-tier LSA read-reduce: the kernel no longer branches on size, so
-        // the threshold/scratch launch args are inert (kept for ABI stability).
-        TESTCHECK(testLaunchDeviceKernelThresholdScratch(SPECIALIZE_REDUCE_KERNEL(GinReduceScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, TEST_SDMA_THRESHOLD_UNSET, g_rsScratchHandle));
+        // Single-tier LSA read-reduce, launched at a SIZE-ADAPTIVE CTA count
+        // decoupled from -V (mirrors the broadcast/reduce rings). The read-reduce is
+        // occupancy-bound in the grid-stride mid-band (~8-48 MiB) and peaks at ~48
+        // CTAs (33 MiB 88->~100% of host, 16 MiB ->86%), while the warp-unrolled
+        // large tier (>=48 MiB) and the small tier peak at 32 (more CTAs crater the
+        // unroll path, e.g. 67 MiB 249->153). The bare -V default (16) badly
+        // under-launches the mid-band (16 MiB ~46%, 33 MiB ~43% of host); self-
+        // selecting repairs that for callers that don't pass -V. sdmaThreshold/
+        // scratch args stay inert (ABI stability).
+        const ncclDevComm* rsDc = (const ncclDevComm*)comm;
+        const int rsNRanks = (rsDc != nullptr) ? rsDc->nRanks : 1;
+        const size_t rsTotalBytes = count * (size_t)wordSize(type) * (size_t)rsNRanks;
+        static const size_t rsCtasEnv = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_RS_CTAS");
+        const int rsGridCtas = gin_sdma::reduceScatterCtas(rsTotalBytes, rsCtasEnv);
+        TESTCHECK(testLaunchDeviceKernelThresholdScratchGrid(SPECIALIZE_REDUCE_KERNEL(GinReduceScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, TEST_SDMA_THRESHOLD_UNSET, g_rsScratchHandle, rsGridCtas));
         return testSuccess;
       }
 #endif
@@ -440,7 +484,12 @@ testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t typ
   auto kernel = SPECIALIZE_REDUCE_KERNEL(GinReduceScatterTimedKernel, type, op);
   if (kernel == nullptr) return testSuccess;
 
-  const int gridCtas = (deviceCtaCount > 0) ? deviceCtaCount : 16;
+  // Match the perf path: self-select the size-adaptive CTA count (decoupled from
+  // -V) so the device-timed number reflects the launched configuration.
+  const int nRanksGlobalCta = args->nProcs * args->nThreads * args->nGpus;
+  const size_t totalBytesCta = count * wordSize(type) * (size_t)nRanksGlobalCta;
+  static const size_t rsCtasEnv = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_RS_CTAS");
+  const int gridCtas = gin_sdma::reduceScatterCtas(totalBytesCta, rsCtasEnv);
   double devUs = 0.0;
   TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
       [&](int i, long long* d_start, long long* d_end) {

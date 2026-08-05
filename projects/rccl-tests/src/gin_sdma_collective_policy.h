@@ -581,6 +581,31 @@ GIN_SDMA_HD inline DevReqs reduceScatterDevReqs(int deviceCtaCount) {
   return r;
 }
 
+// ReduceScatter -D 3 size-adaptive CTA count (decoupled from -V, mirrors the
+// broadcast/reduce rings). The LSA read-reduce is occupancy-bound in the
+// grid-stride mid-band [kReduceScatterCtaMidLo, RS_UNROLL_MIN): ~48 CTAs peaks
+// there (33 MiB 88->~100% of host, 16 MiB ->86%), while the small tier and the
+// warp-unrolled large tier (>= RS_UNROLL_MIN) peak at 32 -- more CTAs crater the
+// unroll path (67 MiB 249->153 busbw at 64 CTAs). The bare -V default (16) badly
+// under-launches the mid-band (16 MiB ~46%, 33 MiB ~43% of host); self-selecting
+// repairs that for callers that don't pass -V. NCCL_GIN_ANVIL_RS_CTAS pins a
+// fixed count for all sizes (diagnostic).
+static constexpr int    kReduceScatterCtasMid   = 48;                    // grid-stride mid-band
+static constexpr int    kReduceScatterCtasOther = 32;                    // small + warp-unroll large
+static constexpr size_t kReduceScatterCtaMidLo  = 8ull  * 1024 * 1024;   // >= -> mid band
+static constexpr size_t kReduceScatterCtaMidHi  = 48ull * 1024 * 1024;   // <  -> mid band (== RS_UNROLL_MIN)
+GIN_SDMA_HD inline int reduceScatterCtas(size_t totalBytes, size_t envCtas) {
+  if (envCtas != kThresholdUnset && envCtas > 0)
+    return (envCtas > 128) ? 128 : (int)envCtas;
+  if (totalBytes >= kReduceScatterCtaMidLo && totalBytes < kReduceScatterCtaMidHi)
+    return kReduceScatterCtasMid;
+  return kReduceScatterCtasOther;
+}
+GIN_SDMA_HD inline int reduceScatterMaxCtas() {
+  return (kReduceScatterCtasMid > kReduceScatterCtasOther) ? kReduceScatterCtasMid
+                                                           : kReduceScatterCtasOther;
+}
+
 // Bytes of scratch-window the large tier needs per rank: it stages N incoming
 // per-source partials, each up to the largest per-rank slice, so it needs the
 // full per-rank send-buffer worth (N * maxChunkBytes == maxSendBytesPerRank).
