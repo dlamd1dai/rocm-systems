@@ -349,8 +349,10 @@ TEST(A2avKernelTier, ThresholdSplit) {
   EXPECT_EQ(a2avKernelTier(1, 0), MoveTier::Gin);           // threshold 0 -> always GIN
 }
 
-TEST(A2avThresholdDefault, UnmeasuredStart256KiB) {
-  // Unmeasured 256 KiB starting default (retune per the measurement methodology).
+TEST(A2avThresholdDefault, Measured256KiB) {
+  // Measured 8x MI355X (2026-08-05, grid-wide LSA scatter): LSA wins at
+  // 256 KiB/peer, GIN/SDMA from 384 KiB/peer up, so the largest-LSA-wins
+  // threshold is 256 KiB. See kAllToAllvSdmaThresholdDefault for the sweep.
   EXPECT_EQ(kAllToAllvSdmaThresholdDefault, 262144u);       // 256 KiB nominal/peer
 }
 
