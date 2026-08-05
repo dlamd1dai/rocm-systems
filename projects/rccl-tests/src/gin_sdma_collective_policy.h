@@ -64,12 +64,19 @@ static constexpr size_t kBroadcastLLDefaultMaxBytes    = 2048;          // 2 KiB
 //   512M   308    226        342         1.11
 //   1G     321    229        356         1.11
 //   2G     322    230        364         1.13
-// Below ~32 MiB the (N-1)-hop pipeline over tiny per-CTA slices collapses (ring
-// 2M 12, 8M 49 << SAG 35/96), and SAG now matches/leads there anyway, so the ring
-// engages only >= 64 MiB; the flat/LSA/LL hybrid + SAG handle everything smaller.
+// Below the crossover the (N-1)-hop pipeline over tiny per-CTA slices collapses
+// (ring 8M 49, 16M 98 << SAG 104/145), so SAG owns the small/mid fill regime. A
+// warm mid-band A/B (8x MI355X, 2026-08-04, float, no -V; §9.7) pinned the actual
+// ring<->SAG crossover at ~32 MiB, LOWER than the previous 64 MiB gate: at 33 MiB
+// the ring (182) already edges SAG (177), and at 16 MiB it still collapses (98).
+// So the gate is lowered 64->32 MiB to capture 33 MiB (+3%, 90->93% of host) with
+// no regression (16 MiB stays SAG; 64 MiB+ unchanged). The 8-16 MiB residual dip
+// (~87-90% of host) has no lever -- SAG is CTA-saturated at the bare -V=16 default
+// (more CTAs monotonically HURT, the opposite of ReduceScatter) and the ring
+// fill-stalls there -- so it stays a structural small-message latency class (§9.3).
 // The ring gate is checked before SAG; SAG stays the opt-out fallback
 // (NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES=0).
-static constexpr size_t kBroadcastRingMinDefault       = 64ull * 1024 * 1024;  // 64 MiB
+static constexpr size_t kBroadcastRingMinDefault       = 32ull * 1024 * 1024;  // 32 MiB
 // Target bytes per ring pipeline chunk, sized PER CTA (see bcastRingChunks): the
 // ring is an (N-1)-hop pipeline whose fill/drain efficiency is C/(C+N-1), so the
 // depth must be large. A chunk-depth sweep (8x MI355X, 2G, 128 CTAs) rises
