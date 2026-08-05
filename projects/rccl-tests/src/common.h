@@ -458,6 +458,23 @@ static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDe
                                     collDefault);
 }
 
+// Fixed-capacity, pass-by-value per-peer metadata for the GIN-SDMA AllToAllv
+// (-D 3) kernel. Passing the small per-peer arrays as a by-value kernel argument
+// (instead of a device buffer filled per call) keeps the launch HIP-graph
+// capture-safe: no hipMalloc / hipMemcpyAsync runs inside the collective, so the
+// captured warm-up (rccl-tests' TimeTest wraps the per-size warm-up loop in
+// cudaStreamBeginCapture) never hits an illegal allocation / sync. Single-node
+// A2AV rank counts are small, so kA2AvMaxRanks caps the arg size at
+// 3*64*8 = 1536 B (well under the kernel-arg limit); AlltoAllvRunColl returns
+// testNotImplemented if nRanks exceeds it.
+static constexpr int kA2AvMaxRanks = 64;
+struct A2AvDeviceMeta {
+  size_t sendBytes[kA2AvMaxRanks];   // bytes rank sends to peer p (0 = skip)
+  size_t srcByteOff[kA2AvMaxRanks];  // sender-side displacement (bytes)
+  size_t dstByteOff[kA2AvMaxRanks];  // receiver-side column-p prefix (bytes)
+  int    nIncoming;                  // # non-empty puts this rank receives
+};
+
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 // Overflow-safe gin.put for the Anvil-SDMA backend. The SDMA linear-copy count
 // field is 30 bits and 1-based (count = bytes-1), so the largest single packet
@@ -691,25 +708,27 @@ testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* se
   return testSuccess;
 }
 
-// Bespoke launcher for AllToAllv (-D 3). Beyond the usual args it forwards the
-// three per-rank metadata arrays (device pointers, BYTE units) and the
-// incoming-put count the variable-size kernel needs:
-//   dSendBytes[p] : bytes this rank sends to peer p (0 => skip the pair).
-//   dSrcOff[p]    : source byte offset of that chunk in this rank's sendbuf.
-//   dDstOff[p]    : destination byte offset in peer p's recvbuf (the receiver-
-//                   side column-p prefix -- where this rank's chunk lands).
-//   nIncoming     : number of non-empty puts this rank receives (waitSignal
-//                   target for the GIN tier).
-// AlltoAllvRunColl computes and uploads the arrays with cudaMemcpyAsync on the
-// SAME stream, so they are valid before this kernel runs. Fixed grid
+// Bespoke launcher for AllToAllv (-D 3). Beyond the usual args it forwards a
+// by-value A2AvDeviceMeta (BYTE units) holding the per-peer arrays the
+// variable-size kernel needs:
+//   meta.sendBytes[p]  : bytes this rank sends to peer p (0 => skip the pair).
+//   meta.srcByteOff[p] : source byte offset of that chunk in this rank's sendbuf.
+//   meta.dstByteOff[p] : destination byte offset in peer p's recvbuf (the
+//                        receiver-side column-p prefix -- where the chunk lands).
+//   meta.nIncoming     : number of non-empty puts this rank receives (waitSignal
+//                        target for the GIN tier).
+// Passing meta by value (no device buffer, no hipMalloc/hipMemcpyAsync in the
+// collective) makes the launch HIP-graph-capture-safe. Fixed grid
 // (deviceCtaCount) matches the barrier/signal pool sized by moveDevReqs.
 template <typename F>
-testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const size_t* dSendBytes, const size_t* dSrcOff, const size_t* dDstOff, int nIncoming) {
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const A2AvDeviceMeta& meta) {
   if (kernel == nullptr) return testNotImplemented;
   ncclDevComm* devComm = (ncclDevComm*)comm;
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
-  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, dSendBytes, dSrcOff, dDstOff, nIncoming);
+  // meta is passed BY VALUE into the kernel arg buffer -> no device alloc/copy in
+  // the collective, so the launch is HIP-graph-capture-safe (works under -G).
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, meta);
   return testSuccess;
 }
 
@@ -811,7 +830,7 @@ testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* se
   return testNotImplemented;
 }
 template <typename F>
-testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const size_t* dSendBytes, const size_t* dSrcOff, const size_t* dDstOff, int nIncoming) {
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const A2AvDeviceMeta& meta) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr

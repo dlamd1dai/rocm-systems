@@ -17,8 +17,6 @@
 #include <random>
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
-#include <map>
 
 #define USE_RCCL_GATHER_SCATTER
 
@@ -279,15 +277,16 @@ __device__ __forceinline__ void A2AvCopy(T* dst, const T* src, size_t nElts, int
 // (count*sizeof(T)), since the actual per-peer sizes vary. nIncoming is the
 // number of non-empty puts this rank receives (its GIN waitSignal target).
 //
-// Metadata arrays (sendBytes/srcByteOff/dstByteOff) are per-rank device pointers
-// in BYTE units, computed host-side from the deterministic, all-ranks-identical
-// size matrix (no cross-rank exchange needed). The LSA tier maps each peer to a
-// CTA (peer = blockIdx.x, blockIdx.x+gridDim.x, ...) so distinct peers' xGMI
-// egress links run concurrently; the GIN tier issues one put per peer from a
+// Metadata (meta.sendBytes/srcByteOff/dstByteOff, all BYTE units) is a by-value
+// kernel argument computed host-side from the deterministic, all-ranks-identical
+// size matrix (no cross-rank exchange needed). Passing it by value (rather than a
+// device buffer) keeps the launch HIP-graph-capture-safe. The LSA tier maps each
+// peer to a CTA (peer = blockIdx.x, blockIdx.x+gridDim.x, ...) so distinct peers'
+// xGMI egress links run concurrently; the GIN tier issues one put per peer from a
 // distinct thread (tid == p), which the backend routes to independent per-peer
 // SDMA queues.
 template <typename T>
-__device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, size_t sdmaThresholdOverride, const size_t* sendBytes, const size_t* srcByteOff, const size_t* dstByteOff, int nIncoming) {
+__device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, size_t sdmaThresholdOverride, A2AvDeviceMeta meta) {
   const int rank = devComm.rank, nRanks = devComm.nRanks;
   const size_t nominalPeerBytes = count * sizeof(T);  // tier selector (avg per-peer slice)
   const size_t sdmaThreshold = (sdmaThresholdOverride != TEST_SDMA_THRESHOLD_UNSET)
@@ -307,10 +306,10 @@ __device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, 
     // Peer-interleaved fan-out: CTA b serves peers b, b+gridDim, ... so distinct
     // xGMI egress links fire concurrently (one CTA's 512 threads per peer chunk).
     for (int p = blockIdx.x; p < nRanks; p += gridDim.x) {
-      const size_t bytes = sendBytes[p];
+      const size_t bytes = meta.sendBytes[p];
       if (bytes == 0) continue;
-      T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset + dstByteOff[p], p);
-      const T* s = (const T*)(srcBase + srcByteOff[p]);
+      T* dst = (T*)ncclGetLsaPointer(recvwin, recvoffset + meta.dstByteOff[p], p);
+      const T* s = (const T*)(srcBase + meta.srcByteOff[p]);
       A2AvCopy<T>(dst, s, bytes / sizeof(T), (int)threadIdx.x, (int)blockDim.x);
     }
     lsaBar.sync(ncclCoopCta(), cuda::memory_order_release);
@@ -332,22 +331,22 @@ __device__ void ginHybridAlltoAllvBody(ncclWindow_t sendwin, size_t sendoffset, 
   // each (rank->p) pair carries exactly one receiver-side SignalInc. Chunked to
   // <=1 GiB segments (signal on the final segment) for the 30-bit SDMA limit.
   for (int p = tid; p < nRanks; p += nthreads) {
-    const size_t bytes = sendBytes[p];
+    const size_t bytes = meta.sendBytes[p];
     if (bytes == 0) continue;
     ginPutChunked(gin, ncclTeamWorld(devComm), p,
-        recvwin, recvoffset + dstByteOff[p],
-        sendwin, sendoffset + srcByteOff[p],
+        recvwin, recvoffset + meta.dstByteOff[p],
+        sendwin, sendoffset + meta.srcByteOff[p],
         bytes, ncclGin_SignalInc{signalIndex});
   }
 
   // This rank receives exactly nIncoming puts (non-empty senders to its column).
-  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)nIncoming);
+  gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)meta.nIncoming);
   gin.flush(ncclCoopCta());
 }
 
 template <typename T>
-__global__ void GinHybridAlltoAllvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, const size_t* sendBytes, const size_t* srcByteOff, const size_t* dstByteOff, int nIncoming) {
-  ginHybridAlltoAllvBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, sdmaThresholdOverride, sendBytes, srcByteOff, dstByteOff, nIncoming);
+__global__ void GinHybridAlltoAllvKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, A2AvDeviceMeta meta) {
+  ginHybridAlltoAllvBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, sdmaThresholdOverride, meta);
 }
 #endif
 
@@ -409,54 +408,40 @@ testResult_t AlltoAllvRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
     switch (deviceImpl) {
       case 3: {
         const size_t eltSize = wordSize(type);
-        // Per-rank device metadata (BYTE units), derived from the shared size
-        // matrix M with no cross-rank exchange (every rank knows all of M):
+        // The by-value metadata caps at kA2AvMaxRanks; single-node A2AV never
+        // exceeds it, but guard so we degrade to "not implemented" rather than
+        // silently truncate on an over-large communicator.
+        if (nranks > kA2AvMaxRanks) {
+          fprintf(stderr, "AllToAllv -D 3 supports up to %d ranks (got %d)\n", kA2AvMaxRanks, nranks);
+          return testNotImplemented;
+        }
+        // Per-rank metadata (BYTE units), derived from the shared size matrix M
+        // with no cross-rank exchange (every rank knows all of M):
         //   sendBytes[p] = M[rank][p]*eltSize           (bytes rank sends to p)
         //   srcByteOff[p] = (row-r prefix)*eltSize       (== sdispls; sender-side)
         //   dstByteOff[p] = (Sum_{s<rank} M[s][p])*eltSize (receiver-side column
         //                   prefix: where this rank's chunk lands in p's recvbuf)
-        // nIncoming = #{ s : M[s][rank] != 0 }           (non-empty puts received)
-        std::vector<size_t> hMeta((size_t)3 * nranks, 0);
-        int nIncoming = 0;
+        //   nIncoming = #{ s : M[s][rank] != 0 }         (non-empty puts received)
+        // Filled into a by-value A2AvDeviceMeta and passed straight to the kernel
+        // (no device buffer / no hipMalloc / no hipMemcpyAsync), which keeps the
+        // launch HIP-graph-capture-safe -- rccl-tests' TimeTest wraps the per-size
+        // warm-up loop in a stream capture, and an alloc/sync there is illegal.
+        A2AvDeviceMeta meta{};
         for (int p = 0; p < nranks; p++) {
-          hMeta[p]                       = M[(size_t)rank * nranks + p] * eltSize;
-          hMeta[(size_t)nranks + p]      = sdispls[p + rank * nranks] * eltSize;
+          meta.sendBytes[p]  = M[(size_t)rank * nranks + p] * eltSize;
+          meta.srcByteOff[p] = sdispls[p + rank * nranks] * eltSize;
           size_t col = 0;
           for (int s = 0; s < rank; s++) col += M[(size_t)s * nranks + p];
-          hMeta[(size_t)2 * nranks + p]  = col * eltSize;
-          if (M[(size_t)p * nranks + rank] != 0) nIncoming++;
+          meta.dstByteOff[p] = col * eltSize;
+          if (M[(size_t)p * nranks + rank] != 0) meta.nIncoming++;
         }
-
-        // Per-device cached staging: a persistent host+device [3*N] buffer keyed
-        // by device ordinal (so an nGpus>1 process keeps a distinct buffer per
-        // GPU). The values depend only on (nranks, count, type), which are
-        // constant across a TimeTest's iterations, and BenchTime stream-syncs
-        // between sizes -- so reusing one persistent host buffer per device is
-        // race-free even with an in-flight async upload.
-        struct A2AvMeta { size_t* d; size_t* h; int capN; };
-        static std::map<int, A2AvMeta> g_meta;
-        int dev = 0;
-        CUDACHECK(cudaGetDevice(&dev));
-        A2AvMeta& m = g_meta[dev];
-        if (m.capN < nranks) {
-          if (m.d) CUDACHECK(cudaFree(m.d));
-          free(m.h);
-          CUDACHECK(cudaMalloc(&m.d, sizeof(size_t) * 3 * nranks));
-          m.h = (size_t*)malloc(sizeof(size_t) * 3 * nranks);
-          m.capN = nranks;
-        }
-        memcpy(m.h, hMeta.data(), sizeof(size_t) * 3 * nranks);
-        CUDACHECK(cudaMemcpyAsync(m.d, m.h, sizeof(size_t) * 3 * nranks, cudaMemcpyHostToDevice, stream));
-        const size_t* dSendBytes = m.d;
-        const size_t* dSrcOff    = m.d + nranks;
-        const size_t* dDstOff    = m.d + 2 * nranks;
 
         // AllToAllv LSA<->GIN threshold (compared against the nominal per-peer
         // chunk count*eltSize). Unmeasured 256 KiB starting default; override
         // with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
         static const size_t a2avThr = testResolveSdmaThreshold("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV", gin_sdma::kAllToAllvSdmaThresholdDefault);
-        TESTCHECK(testLaunchDeviceKernelA2Av(SPECIALIZE_KERNEL(GinHybridAlltoAllvKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2avThr, dSendBytes, dSrcOff, dDstOff, nIncoming));
+        TESTCHECK(testLaunchDeviceKernelA2Av(SPECIALIZE_KERNEL(GinHybridAlltoAllvKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, a2avThr, meta));
         return testSuccess;
       }
       default:
