@@ -452,12 +452,32 @@ static constexpr size_t kScatterSdmaThresholdDefault  = 131072;      // 128 KiB/
 static constexpr size_t kGatherSdmaThresholdDefault   = 1073741824;  // 1 GiB: LSA-always
 static constexpr size_t kSendRecvSdmaThresholdDefault = 1073741824;  // 1 GiB: LSA-always
 
+// AllToAllv LSA<->GIN default. AllToAllv is AllToAll with per-peer variable
+// counts (a sparse, per-(sender,receiver) size matrix), so there is no single
+// per-peer chunk to key the tier on; the kernel picks ONE tier for the whole
+// collective from the NOMINAL per-peer chunk (count*eltSize, the AllToAll-style
+// average slice), mirroring how AllToAll keys on its per-peer chunk. Unlike the
+// AllToAll default this is an UNMEASURED starting value (256 KiB, per the
+// expansion-plan "start at 256 KiB, retune per the measurement methodology");
+// tune with NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALLV or the shared
+// NCCL_GIN_ANVIL_SDMA_THRESHOLD once the crossover is swept on 8x MI355X.
+static constexpr size_t kAllToAllvSdmaThresholdDefault = 262144;     // 256 KiB nominal/peer (unmeasured)
+
 enum class MoveTier { LSA, Gin };
 
 // Tier chosen by the single-phase movement kernels: LSA below/at the threshold,
 // GIN/SDMA above it.
 GIN_SDMA_HD inline MoveTier moveKernelTier(size_t bytes, size_t sdmaThreshold) {
   return (bytes <= sdmaThreshold) ? MoveTier::LSA : MoveTier::Gin;
+}
+
+// AllToAllv tier selector. Same LSA(small)/GIN(large) split as moveKernelTier,
+// but named for AllToAllv and keyed on the nominal per-peer chunk (count*eltSize)
+// since the actual per-peer sizes vary. Both tiers are PUSH (each rank writes its
+// per-peer chunk into that peer's recvbuf), so the shape matches AllToAll case 3
+// (barrier = lsaBarrier = ginSignal = deviceCtaCount, needsGin: see moveDevReqs).
+GIN_SDMA_HD inline MoveTier a2avKernelTier(size_t nominalPeerBytes, size_t sdmaThreshold) {
+  return moveKernelTier(nominalPeerBytes, sdmaThreshold);
 }
 
 // devComm requirements for the -D 3 movement kernels (scatter/gather/sendrecv):

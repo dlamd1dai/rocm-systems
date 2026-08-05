@@ -691,6 +691,28 @@ testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* se
   return testSuccess;
 }
 
+// Bespoke launcher for AllToAllv (-D 3). Beyond the usual args it forwards the
+// three per-rank metadata arrays (device pointers, BYTE units) and the
+// incoming-put count the variable-size kernel needs:
+//   dSendBytes[p] : bytes this rank sends to peer p (0 => skip the pair).
+//   dSrcOff[p]    : source byte offset of that chunk in this rank's sendbuf.
+//   dDstOff[p]    : destination byte offset in peer p's recvbuf (the receiver-
+//                   side column-p prefix -- where this rank's chunk lands).
+//   nIncoming     : number of non-empty puts this rank receives (waitSignal
+//                   target for the GIN tier).
+// AlltoAllvRunColl computes and uploads the arrays with cudaMemcpyAsync on the
+// SAME stream, so they are valid before this kernel runs. Fixed grid
+// (deviceCtaCount) matches the barrier/signal pool sized by moveDevReqs.
+template <typename F>
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const size_t* dSendBytes, const size_t* dSrcOff, const size_t* dDstOff, int nIncoming) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, dSendBytes, dSrcOff, dDstOff, nIncoming);
+  return testSuccess;
+}
+
 #define SPECIALIZE_KERNEL(kernel, type, op) \
   ( op != ncclSum ? nullptr : \
    type == ncclInt8 ? kernel<int8_t> : \
@@ -786,6 +808,10 @@ testResult_t testLaunchDeviceKernelReduceRing(F kernel, void* sendbuff, size_t s
 }
 template <typename F, typename H>
 testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const size_t* dSendBytes, const size_t* dSrcOff, const size_t* dDstOff, int nIncoming) {
   return testNotImplemented;
 }
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
