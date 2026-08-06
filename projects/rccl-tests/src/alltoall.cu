@@ -12,6 +12,9 @@
 #include "rccl_vector_types.h"
 #endif
 
+// Defined in common.cu: number of cuda/hip graph launches requested via -G (0 = eager).
+extern int cudaGraphLaunches;
+
 void AlltoAllGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *paramcount = (count/nranks) & -(16/eltSize);
   *sendcount = nranks*(*paramcount);
@@ -67,6 +70,9 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       }
       reqs->barrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
+      // Superset of HybridAlltoAllKernel's LSA-barrier need so that the capture-aware
+      // fallback in AlltoAllRunColl can launch the graph-safe LSA kernel on this comm.
+      reqs->lsaBarrierCount = deviceCtaCount - 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -106,6 +112,9 @@ bool AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* req
     case 3: // GinAlltoAllKernel: all CTAs, one barrier per CTA
       reqs->barrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
+      // Superset of HybridAlltoAllKernel's LSA-barrier need so that the capture-aware
+      // fallback in AlltoAllRunColl can launch the graph-safe LSA kernel on this comm.
+      reqs->lsaBarrierCount = deviceCtaCount - 1;
       return true;
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
       reqs->barrierCount = 1;
@@ -382,9 +391,33 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         return testSuccess;
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
-      case 3:
+      case 3: {
+        // Anvil SDMA (case 3, large transfers) submits work to a persistent KFD SDMA
+        // hardware queue by ringing an MMIO doorbell from inside the kernel and then
+        // spin-waiting on the queue read-pointer / peer signals. HIP graph capture is
+        // unaware of that out-of-band queue: a captured/replayed kernel does not reliably
+        // drive the SDMA engine, so the completion signal and read-pointer never advance
+        // and the waitSignal/flush spin loops hang forever.
+        //
+        // Deciding this per-launch from cudaStreamIsCapturing() would mix the SDMA kernel
+        // (eager warmup/correctness passes) and the LSA kernel (captured passes) on the
+        // same communicator and SDMA queue, which is racy. Instead, key off whole-run graph
+        // mode (-G >= 1): when graph launches are requested, use the graph-safe LSA-only
+        // Hybrid kernel (pure coherent-fabric memcpy) for ALL launches on this comm.
+        // Correct; loses SDMA throughput for >SDMA-threshold sizes while under graphs.
+        if (cudaGraphLaunches >= 1) {
+          static bool warnedGinGraphFallback = false;
+          if (!warnedGinGraphFallback) {
+            warnedGinGraphFallback = true;
+            fprintf(stderr, "rccl-tests: graph mode (-G) enabled; GIN Anvil-SDMA alltoall (-D 3) is not "
+                            "graph-capture-safe. Using the LSA path for all launches.\n");
+          }
+          TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+          return testSuccess;
+        }
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
+      }
       case 4:
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
