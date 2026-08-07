@@ -54,7 +54,15 @@ if [[ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" == 1 ]]; then
   echo "docker build: RCCL_GIN_ALLTOALL_DEVICE_TRACE=1 (GPU kernel phase markers)"
 fi
 
+# Optional network mode for RUN steps. On hosts whose docker daemon disables the
+# default bridge (daemon.json "bridge":"none", e.g. some shared/slurm nodes), the
+# default RUN sandbox fails with "network bridge not found"; set
+# DOCKER_BUILD_NETWORK=host to route RUN steps over host networking instead.
+DOCKER_NET_OPT=()
+[[ -n "${DOCKER_BUILD_NETWORK:-}" ]] && DOCKER_NET_OPT=(--network="${DOCKER_BUILD_NETWORK}")
+
 ${DOCKER_CMD} build -f ${DOCKERFILE_PATH} -t ${DOCKER_IMAGE} \
+    "${DOCKER_NET_OPT[@]}" \
     ${DOCKER_CACHE_OPT} \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg USE_LOCAL_SRC=${USE_LOCAL_SRC} \

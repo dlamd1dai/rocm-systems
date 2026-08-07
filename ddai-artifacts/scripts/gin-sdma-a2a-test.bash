@@ -105,6 +105,12 @@ MPI_BASE=(
 [[ -n "${NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK:-}" ]] && \
   MPI_BASE+=(-x "NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK=${NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK}")
 
+# [CUMEM-SKIP-FREE][WORKAROUND] gfx950 hipMemUnmap teardown deadlock: forward
+# NCCL_CUMEM_SKIP_FREE=1 to ranks so ncclCuMemFree skips the hanging cuMem unmap
+# at ncclCommDestroy (leaks the aperture; OS reclaims at process exit).
+[[ -n "${NCCL_CUMEM_SKIP_FREE:-}" ]] && \
+  MPI_BASE+=(-x "NCCL_CUMEM_SKIP_FREE=${NCCL_CUMEM_SKIP_FREE}")
+
 DOCKER_TEST2_VOLUMES=""
 DOCKER_TEST5_MLX5_VOLUMES=""
 _rccl_bind_seen=""
