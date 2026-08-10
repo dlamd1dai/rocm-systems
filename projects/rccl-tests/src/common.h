@@ -476,23 +476,32 @@ struct A2AvDeviceMeta {
 };
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-// Overflow-safe gin.put for the Anvil-SDMA backend. The SDMA linear-copy count
-// field is 30 bits and 1-based (count = bytes-1), so the largest single packet
-// is exactly 2^30 = 1 GiB; a put of >1 GiB silently truncates and corrupts data
-// (a 2 GiB transfer copies only 1 GiB). Split the transfer into
-// <=gin_sdma::kGinPutMaxBytes (1 GiB, the HW max) segments and carry the caller's
-// remote action (e.g. SignalInc) ONLY on the final segment: the SDMA queue is
-// in-order, so a single signal still correctly means "the whole message has
-// landed" and per-message signal accounting (waitSignal counts) is unchanged. A
-// <=1 GiB message is a single put with no extra overhead. Threads still each own
-// a disjoint (peer, offset) tuple, so the inner segmentation is race-free.
+// Overflow-safe AND hang-safe gin.put for the Anvil-SDMA backend. Two distinct
+// single-descriptor limits apply, and we clamp to the smaller of the two:
+//   1) Correctness: the SDMA linear-copy count field is 30 bits and 1-based
+//      (count = bytes-1), so a put of >1 GiB (kGinPutMaxBytes) silently
+//      truncates and corrupts data (a 2 GiB transfer copies only 1 GiB).
+//   2) Reliability: on MI355X + ROCm 7.13 a single copy descriptor at/above
+//      256 MiB stalls the SDMA engine on the fused copy+signal packet, so the
+//      copy never lands and the SignalInc never fires -> waitSignal hangs. A
+//      128 MiB cap (gin_sdma::kGinSdmaSafeCopyBytes) is measured hang-free with
+//      no bandwidth loss; see that constant for the evidence.
+// Split the transfer into <=kGinSdmaSafeCopyBytes segments and carry the
+// caller's remote action (e.g. SignalInc) ONLY on the final segment: the SDMA
+// queue is in-order, so a single signal still correctly means "the whole
+// message has landed" and per-message signal accounting (waitSignal counts) is
+// unchanged. A <=128 MiB message is a single put with no extra overhead.
+// Threads still each own a disjoint (peer, offset) tuple, so the inner
+// segmentation is race-free.
 template <typename RemoteAction>
 __device__ __forceinline__ void ginPutChunked(
     ncclGin& gin, ncclTeam team, int peer,
     ncclWindow_t dstWin, size_t dstOff,
     ncclWindow_t srcWin, size_t srcOff,
     size_t bytes, RemoteAction finalAction) {
-  const size_t kMax = gin_sdma::kGinPutMaxBytes;
+  const size_t kMax = gin_sdma::kGinSdmaSafeCopyBytes < gin_sdma::kGinPutMaxBytes
+                          ? gin_sdma::kGinSdmaSafeCopyBytes
+                          : gin_sdma::kGinPutMaxBytes;
   size_t off = 0;
   do {
     const size_t rem = bytes - off;

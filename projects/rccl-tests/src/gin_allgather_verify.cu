@@ -64,6 +64,9 @@ __global__ void GinAllGatherVerifyKernel(ncclWindow_t sendwin, size_t sendoffset
   int nthreads = blockDim.x * gridDim.x;
   const size_t size = count * sizeof(T);
 
+  // NOTE: standalone verify binary (does not include common.h/ginPutChunked).
+  // Keep raw puts; this runs one small AllGather iteration for correctness only.
+  // For >128 MiB/rank chunks, mirror common.h::ginPutChunked (128 MiB segments).
   for (int r = tid; r < devComm.nRanks; r += nthreads) {
     gin.put(ncclTeamWorld(devComm), r,
         recvwin, recvoffset + devComm.rank * size,

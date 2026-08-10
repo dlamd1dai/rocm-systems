@@ -203,6 +203,21 @@ static constexpr size_t kGatherLLDefaultMaxBytes       = 2048;          // 2 KiB
 // descriptor's 32 B length alignment.
 static constexpr size_t kGinPutMaxBytes                = 1024ull * 1024 * 1024;  // 1 GiB (2^30, HW max)
 
+// Max bytes per single gin.put() that the Anvil-SDMA backend copies *reliably*
+// on MI355X + ROCm 7.13 (NCCL_GIN_TYPE=5). This is SMALLER than kGinPutMaxBytes:
+// the 30-bit count field bounds correctness at 1 GiB, but a single copy
+// descriptor at/above 256 MiB (2^28) on the fused COPY_LINEAR_WAIT_SIGNAL_MI4
+// path stalls the SDMA engine, so the fused copy never lands AND its SignalInc
+// never fires -> every rank spins forever in waitSignal (a HANG, not a data
+// miscompare). Measured on 8x MI355X (2026-08-07, alltoall_perf -D 3): a single
+// 256 MiB/peer put (AllToAll @ 2 GiB total) HANGS; capping each put to 128 MiB
+// (2 puts/peer) completes with identical bandwidth (busbw ~423 GB/s, unchanged
+// vs the 1 GiB total case). 128 MiB is proven safe with zero measured perf loss;
+// do not raise without re-measuring. ginPutChunked segments every GIN-tier put
+// to this size, so it protects ALL GIN-SDMA collectives (A2A, A2Av, AllGather,
+// Broadcast, ReduceScatter, AllReduce) that route through it.
+static constexpr size_t kGinSdmaSafeCopyBytes          = 128ull * 1024 * 1024;   // 128 MiB (MI355X reliable single-copy max)
+
 // ---------------------------- env / threshold ----------------------------
 
 // Parse a size string ("123", "4K", "2M", "1G"; decimal only, optional single
