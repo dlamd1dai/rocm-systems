@@ -456,6 +456,19 @@ TEST(GinPutMaxBytes, AtSdma30BitLimit) {
   EXPECT_EQ(kGinPutMaxBytes % 32u, 0u);            // 32 B copy-length aligned
 }
 
+// Reliability cap (MI355X + ROCm 7.13): a single copy descriptor at/above
+// 256 MiB stalls the SDMA engine on the fused copy+signal packet -> the copy
+// never lands and SignalInc never fires -> waitSignal hangs. ginPutChunked
+// therefore clamps to kGinSdmaSafeCopyBytes (128 MiB), which must be (a) the
+// actual chunk ceiling (<= kGinPutMaxBytes so correctness still holds), (b)
+// below the measured 256 MiB hang cliff, and (c) 32 B copy-length aligned.
+TEST(GinSdmaSafeCopyBytes, HangSafeChunkCeiling) {
+  EXPECT_EQ(kGinSdmaSafeCopyBytes, 134217728u);         // 128 MiB (proven hang-free)
+  EXPECT_LE(kGinSdmaSafeCopyBytes, kGinPutMaxBytes);    // never exceeds 30-bit bound
+  EXPECT_LT(kGinSdmaSafeCopyBytes, 268435456ull);       // strictly below 256 MiB cliff
+  EXPECT_EQ(kGinSdmaSafeCopyBytes % 32u, 0u);           // 32 B copy-length aligned
+}
+
 // ---------------------------- ReduceScatter (P2) ----------------------------
 
 TEST(ReduceScatterKernelTier, LadderSelection) {
