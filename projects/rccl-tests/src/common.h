@@ -429,10 +429,16 @@ extern thread_local int is_main_thread;
 //      128 MiB cap (gin_sdma::kGinSdmaSafeCopyBytes) is measured hang-free with
 //      no bandwidth loss; see that constant for the evidence.
 // Split the transfer into <=kGinSdmaSafeCopyBytes segments and carry the
-// caller's remote action (e.g. SignalInc) ONLY on the final segment: the SDMA
-// queue is in-order, so a single signal still correctly means "the whole
-// message has landed" and per-message signal accounting (waitSignal counts) is
-// unchanged. A <=128 MiB message is a single put with no extra overhead.
+// caller's remote action (e.g. SignalInc) ONLY on the final segment. A
+// <=128 MiB message is a single put with no extra overhead.
+//
+// ORDERING (why the trailing signal is safe): the Anvil-SDMA backend runs with a
+// single SDMA channel per peer (gin_plugin_anvil_sdma.cc forces one channel). A
+// hardware SDMA queue is a strict in-order FIFO, so every segment of this message
+// -- the data segments AND the final signal-carrying put -- is consumed in
+// submission order on that one queue. The final SignalInc therefore completes
+// only after all prior segments have landed: "signal fired" still means "the
+// whole message landed", and per-message waitSignal accounting is unchanged.
 // Threads still each own a disjoint (peer, offset) tuple, so the inner
 // segmentation is race-free.
 template <typename RemoteAction>
@@ -441,21 +447,19 @@ __device__ __forceinline__ void ginPutChunked(
     ncclWindow_t dstWin, size_t dstOff,
     ncclWindow_t srcWin, size_t srcOff,
     size_t bytes, RemoteAction finalAction) {
-  const size_t kMax = gin_sdma::kGinSdmaSafeCopyBytes < gin_sdma::kGinPutMaxBytes
-                          ? gin_sdma::kGinSdmaSafeCopyBytes
-                          : gin_sdma::kGinPutMaxBytes;
-  size_t off = 0;
-  do {
-    const size_t rem = bytes - off;
-    const size_t seg = rem > kMax ? kMax : rem;
-    if (off + seg >= bytes) {
+  // Segmentation math lives in gin_sdma_collective_policy.h so the exact loop
+  // driven here is what the host unit test validates (test/gin_sdma_policy_test.cpp).
+  constexpr size_t kMax = gin_sdma::kGinPutSegBytes;
+  const size_t nSeg = gin_sdma::ginPutSegmentCount(bytes, kMax);
+  for (size_t i = 0; i < nSeg; ++i) {
+    const gin_sdma::PutSegment s = gin_sdma::ginPutSegmentAt(bytes, kMax, i);
+    if (s.isFinal) {
       // Final (or only) segment carries the signal / remote action.
-      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg, finalAction);
+      gin.put(team, peer, dstWin, dstOff + s.offset, srcWin, srcOff + s.offset, s.bytes, finalAction);
     } else {
-      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg);
+      gin.put(team, peer, dstWin, dstOff + s.offset, srcWin, srcOff + s.offset, s.bytes);
     }
-    off += seg;
-  } while (off < bytes);
+  }
 }
 
 template <typename F>
