@@ -576,6 +576,11 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
   epoch ^= 1;
 }
 
+// Explicit instantiations so other TUs (e.g. gin_sdma_devtime.h via alltoall.cu)
+// can call Allreduce through the common.h declaration.
+template void Allreduce<double>(struct threadArgs* args, double* value, int average);
+template void Allreduce<long long>(struct threadArgs* args, long long* value, int average);
+
 testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int64_t *wrongElts) {
   int nranks = args->nProcs*args->nGpus*args->nThreads;
   size_t count = args->expectedBytes/wordSize(type);
@@ -913,10 +918,59 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   if (deviceOnly) {
     // The reported metric is the in-kernel wall_clock64 device latency
     // (per iteration, max across ranks), measured by the collective's hook.
-    double deviceDeltaSec = 0.0;
+    // Note: the datacheck loop below re-inits buffers and re-runs the PRODUCTION
+    // kernel via startColl before CheckData, so it validates the production path,
+    // not the timed kernel (whose output is overwritten first). By default the
+    // *TimedKernel bodies call the same __device__ collective functions as the
+    // production kernels, so collective correctness is covered; only the timing-only
+    // loop/skip/stamp wrapper around them is not exercised by that datacheck.
+    // deviceTime() leaves this negative when the timing hook produced no
+    // measurement -- the timed kernel never ran (non-GIN impl, unsupported op/type,
+    // count == 0, or loop < 1). Reporting that as the metric would divide by zero in
+    // getBw (0.00 us / inf GB/s), and the DEVTIME_CHECK below would validate a stale
+    // buffer -- the warmup/production result (false pass), or raw init scratch under
+    // -w 0 (false fail) -- for a kernel that never executed. So WARN once and skip
+    // this row rather than emit a bogus metric or a misleading check verdict.
+    double deviceDeltaSec = -1.0;
     TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, &deviceDeltaSec));
+    if (deviceDeltaSec <= 0.0) {
+      if (args->proc == 0 && args->thread == 0) {
+        fprintf(stderr, "# WARN NCCL_GIN_ANVIL_DEVICE_TIMING=2: no in-kernel device-time "
+                        "measurement for this size (timed kernel did not run: non-GIN impl, "
+                        "unsupported op/type, count==0, or loop<1); skipping row "
+                        "(size %ld bytes)\n", args->expectedBytes);
+      }
+      return testSuccess;
+    }
     deltaSec = deviceDeltaSec;
     cputimeSec = deviceDeltaSec;
+
+    // Opt-in validation of the TIMED path itself (NCCL_GIN_ANVIL_DEVTIME_CHECK=1).
+    // Reached only when the timed kernel actually ran (deviceDeltaSec > 0 above), so
+    // recvbuff holds the timed kernel's output -- not a stale warmup/production
+    // buffer. The hook just ran skip+loop back-to-back collectives into recvbuff;
+    // each iteration is a full deterministic collective over the unchanged sendbuff,
+    // so the final recvbuff equals `expected` from initData. Validate it HERE -- the
+    // only point the timed kernel's output is live, before the datacheck loop below
+    // re-inits buffers and overwrites it with the production path. Needs datacheck on
+    // (that is what populates `expected`). Combines wrong-element counts across
+    // threads/ranks so any rank's mismatch fails the run.
+    static const int devTimeCheck = []() {
+      const char* e = getenv("NCCL_GIN_ANVIL_DEVTIME_CHECK");
+      return (e && *e) ? atoi(e) : 0;
+    }();
+    if (devTimeCheck && datacheck) {
+      int64_t timedWrong = 0;
+      TESTCHECK(CheckData(args, type, op, root, in_place, &timedWrong));
+      long long timedWrong1 = timedWrong;
+      Allreduce(args, &timedWrong1, /*sum*/4);
+      if (timedWrong1) {
+        fprintf(stderr, "\nERROR: NCCL_GIN_ANVIL_DEVTIME_CHECK: timed-kernel output datacheck "
+                        "failed with %lld wrong elements (size %ld bytes)\n",
+                        timedWrong1, args->expectedBytes);
+        return testInternalError;
+      }
+    }
   }
 
 #if HIP_VERSION >= 50221310

@@ -11,8 +11,8 @@
 // CTA stamps start_time[blockIdx.x] at i==skip and end_time[blockIdx.x] after the
 // final iteration -- and (2) a thin "*DeviceTime" hook that calls gin_devtime::measure
 // with a lambda that launches that kernel. measure() owns everything mechanical and
-// identical across collectives: query the wall-clock rate once, allocate the per-CTA
-// start/end stamp buffers, run the launch, reduce the grid busy window
+// identical across collectives: sample each GPU's wall-clock rate, allocate the
+// per-CTA start/end stamp buffers, run the launch, reduce the grid busy window
 // (min(start)..max(end) over CTAs) and the slowest rank (MPI MAX), and return the
 // per-iteration device latency in microseconds. This is the pure device-function
 // execution time -- it excludes host launch, stream/graph, and teardown overhead.
@@ -36,15 +36,14 @@ static inline int envInt(const char* name, int def) {
   return (e && *e) ? atoi(e) : def;
 }
 
-// GPU fixed-frequency wall-clock rate (kHz), queried once for the current device.
-static inline int wallClockRateKhz() {
-  static int khz = 0;
-  if (khz == 0) {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return 1;
-    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || khz <= 0)
-      khz = 1;
-  }
+// GPU fixed-frequency wall-clock rate (kHz) for a specific device ordinal. Sampled
+// per-GPU (rather than once from the current device) so each GPU's cycle delta is
+// converted with its own rate on mixed-clock nodes. Falls back to 1 kHz if the query
+// fails, which yields a harmless raw-cycle magnitude instead of a divide-by-zero.
+static inline int wallClockRateKhz(int dev) {
+  int khz = 0;
+  if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || khz <= 0)
+    khz = 1;
   return khz;
 }
 
@@ -63,26 +62,40 @@ template <typename LaunchFn>
 static inline testResult_t measure(struct threadArgs* args, int gridCtas, int loop,
                                    LaunchFn&& launch, double* outUs) {
   if (gridCtas < 1) gridCtas = 1;
-  const int rate = wallClockRateKhz();
   double localMaxUs = 0.0;
 
+  std::vector<long long*> d_start(args->nGpus, nullptr);
+  std::vector<long long*> d_end(args->nGpus, nullptr);
+
   Barrier(args);
+
+  // Pass 1: allocate stamps and launch the timed kernel on EVERY local GPU before
+  // synchronizing any of them. The collective bodies do an all-ranks device barrier
+  // and each local GPU is its own rank under -g N, so all local GPUs must be
+  // in-flight concurrently -- synchronizing GPU i before launching GPU i+1 would
+  // block GPU 0 at the barrier waiting for GPUs that were never launched (deadlock).
+  // This mirrors the launch-then-complete split in startColl()/completeColl().
   for (int i = 0; i < args->nGpus; i++) {
     CUDACHECK(cudaSetDevice(args->gpus[i]));
+    CUDACHECK(cudaMalloc(&d_start[i], (size_t)gridCtas * sizeof(long long)));
+    CUDACHECK(cudaMalloc(&d_end[i], (size_t)gridCtas * sizeof(long long)));
+    launch(i, d_start[i], d_end[i]);
+  }
 
-    long long* d_start = nullptr;
-    long long* d_end = nullptr;
-    CUDACHECK(cudaMalloc(&d_start, (size_t)gridCtas * sizeof(long long)));
-    CUDACHECK(cudaMalloc(&d_end, (size_t)gridCtas * sizeof(long long)));
-
-    launch(i, d_start, d_end);
+  // Pass 2: synchronize each GPU, copy stamps back, reduce the grid busy window.
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
     CUDACHECK(cudaStreamSynchronize(args->streams[i]));
 
+    // Sample THIS GPU's wall-clock rate to convert its own cycle delta; on a
+    // mixed-clock node a single reference rate would skew the non-reference GPUs.
+    const int rate = wallClockRateKhz(args->gpus[i]);
+
     std::vector<long long> h_start(gridCtas), h_end(gridCtas);
-    CUDACHECK(cudaMemcpy(h_start.data(), d_start, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaMemcpy(h_end.data(), d_end, (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaFree(d_start));
-    CUDACHECK(cudaFree(d_end));
+    CUDACHECK(cudaMemcpy(h_start.data(), d_start[i], (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaMemcpy(h_end.data(), d_end[i], (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
+    CUDACHECK(cudaFree(d_start[i]));
+    CUDACHECK(cudaFree(d_end[i]));
 
     long long mn = h_start[0], mx = h_end[0];
     for (int c = 1; c < gridCtas; c++) {
@@ -95,10 +108,15 @@ static inline testResult_t measure(struct threadArgs* args, int gridCtas, int lo
   }
   Barrier(args);
 
+  // Combine across threads AND ranks through the harness helper. A direct
+  // MPI_Allreduce on MPI_COMM_WORLD here would be wrong under -t N>1: MPI is
+  // initialized MPI_THREAD_SINGLE, and all N BenchTime threads would issue
+  // concurrent collectives on the same communicator (can hang). Allreduce()
+  // accumulates across the process's threads, has only the last thread touch MPI,
+  // and broadcasts the reduced value back -- which also fixes localMaxUs (per-GPU
+  // max on this thread) not being combined across threads.
   double devUs = localMaxUs;
-#ifdef MPI_SUPPORT
-  MPI_Allreduce(MPI_IN_PLACE, &devUs, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-#endif
+  Allreduce(args, &devUs, /*max*/3);
   *outUs = devUs;
   return testSuccess;
 }
