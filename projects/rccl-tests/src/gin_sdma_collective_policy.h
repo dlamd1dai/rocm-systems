@@ -29,6 +29,19 @@
 #include <cstdlib>
 #include <cstring>
 
+// kGinPutMaxBytes / kGinSdmaSafeCopyBytes were upstreamed into RCCL's device
+// header gin_anvil_sdma_put_policy.h, which defines them (plus kGinPutSegBytes
+// and the segment math) in namespace gin_sdma. When that header is on the include
+// path (the GIN device-API build), use it as the single source of truth and skip
+// our local copies below to avoid a redefinition clash; keep the local fallbacks
+// only for builds where it is absent (older RCCL / no device API).
+#if defined(__has_include)
+#  if __has_include("nccl_device/gin/anvil_sdma/gin_anvil_sdma_put_policy.h")
+#    include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_put_policy.h"
+#    define GIN_SDMA_HAVE_RCCL_PUT_POLICY 1
+#  endif
+#endif
+
 // The device kernels get __host__ __device__; plain host builds (and the host
 // unit test, which defines GIN_SDMA_HOST_ONLY) get no attribute so the header
 // compiles as ordinary C++ with no device codegen.
@@ -201,7 +214,9 @@ static constexpr size_t kGatherLLDefaultMaxBytes       = 2048;          // 2 KiB
 // fills the 30-bit field exactly with no truncation. Zero margin by design; do
 // NOT raise above 2^30. 1 GiB is a multiple of 32 B, satisfying the copy
 // descriptor's 32 B length alignment.
+#ifndef GIN_SDMA_HAVE_RCCL_PUT_POLICY
 static constexpr size_t kGinPutMaxBytes                = 1024ull * 1024 * 1024;  // 1 GiB (2^30, HW max)
+#endif
 
 // Max bytes per single gin.put() that the Anvil-SDMA backend copies *reliably*
 // on MI355X + ROCm 7.13 (NCCL_GIN_TYPE=5). This is SMALLER than kGinPutMaxBytes:
@@ -216,7 +231,9 @@ static constexpr size_t kGinPutMaxBytes                = 1024ull * 1024 * 1024; 
 // do not raise without re-measuring. ginPutChunked segments every GIN-tier put
 // to this size, so it protects ALL GIN-SDMA collectives (A2A, A2Av, AllGather,
 // Broadcast, ReduceScatter, AllReduce) that route through it.
+#ifndef GIN_SDMA_HAVE_RCCL_PUT_POLICY
 static constexpr size_t kGinSdmaSafeCopyBytes          = 128ull * 1024 * 1024;   // 128 MiB (MI355X reliable single-copy max)
+#endif
 
 // ---------------------------- env / threshold ----------------------------
 
