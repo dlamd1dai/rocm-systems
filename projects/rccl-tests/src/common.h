@@ -10,6 +10,10 @@
 
 #define NCCL_TESTS_VERSION "2.18.3"
 
+// Pure (no-GPU) policy logic shared by the GIN-SDMA collective designs and their
+// host unit tests. Included first so the threshold/tier helpers below can
+// delegate to it.
+#include "gin_sdma_collective_policy.h"
 #include "rccl/rccl.h"
 // nccl_device.h provides the device-API public types referenced below
 // (ncclCommProperties_t, full ncclDevCommRequirements, NCCL_GIN_TYPE_NONE, ...).
@@ -22,6 +26,7 @@
 #endif
 #include <stdio.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #ifdef MPI_SUPPORT
@@ -116,16 +121,16 @@ struct testColl {
   testResult_t (*getAlgoProtoChannels)(ncclComm_t comm, size_t count, ncclDataType_t type, int* algo, int* proto, int* nchannels);
   testResult_t (*getSymkInfo)(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op, int* algo, int* proto, int* nchannels);
   // Optional device-side (in-kernel wall_clock64) timing hook. Non-null only for
-  // collectives that implement it (currently AllToAll). Driven by BenchTime via
-  // NCCL_GIN_ANVIL_DEVICE_TIMING (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING)
+  // collectives that implement it (currently AllToAll and AllReduce). Driven by BenchTime via
+  // NCCL_GIN_ANVIL_DEVICE_TIMING (or legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING)
   // (0=off, 1=augment, 2=device-time-only):
   //   - outDeltaSec == nullptr (mode 1): prints an extra device-only
   //     latency/busbw line alongside the normal graph/hipEvent numbers (report,
   //     not replace).
   //   - outDeltaSec != nullptr (mode 2): stores the measured per-iteration
-  //     device latency (seconds, max across ranks) in *outDeltaSec; BenchTime
-  //     then reports that as THE metric, having skipped the graph/hipEvent
-  //     timed loop.
+  //     device latency (seconds, max across ranks) in *outDeltaSec and prints a
+  //     short context annotation; BenchTime then reports that as THE metric,
+  //     having skipped the graph/hipEvent timed loop.
   // Other collectives leave it nullptr via aggregate initialization, so no other
   // struct needs to change.
   testResult_t (*deviceTime)(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec);
@@ -376,7 +381,10 @@ typedef enum { ncclCoarse        = 0,
 extern const char *test_memorytypes[nccl_NUM_MTYPES];
 extern int deviceCtaCount; // number of CTAs for device implementation
 extern int deviceImpl;     // selected -D device implementation (0 = host); lets per-collective
-                           // device-timing hooks pick the matching timed kernel.
+                           // device-timing hooks pick the matching timed kernel, and per-coll
+                           // RunTest skip op/type combos unimplemented on the device path.
+extern size_t maxBytes;    // largest message the run will exercise (from -e); used
+                           // by device-kernel scratch-window sizing (ReduceScatter)
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
@@ -431,7 +439,88 @@ static int ncclstringtomtype (char *str) {
 extern int is_main_proc;
 extern thread_local int is_main_thread;
 
+// Sentinel meaning "no per-collective override; use the device/backend value
+// (i.e. rsCtx->sdmaThreshold, populated from NCCL_GIN_ANVIL_SDMA_THRESHOLD)".
+#define TEST_SDMA_THRESHOLD_UNSET (gin_sdma::kThresholdUnset)
+
+// Parse a per-collective LSA<->GIN threshold env var (bytes; optional K/M/G
+// suffix). Returns TEST_SDMA_THRESHOLD_UNSET when unset/empty/unparseable so
+// the kernel falls back to the shared NCCL_GIN_ANVIL_SDMA_THRESHOLD value.
+// Thin getenv() wrapper over the pure, unit-tested gin_sdma::parseSize().
+static inline size_t testParseSdmaThresholdEnv(const char* name) {
+  return gin_sdma::parseSize(getenv(name));
+}
+
+// Resolve a collective's LSA<->GIN threshold with the fallback chain:
+//   1. the collective-specific env var (collVar), if set;
+//   2. the shared NCCL_GIN_ANVIL_SDMA_THRESHOLD, if explicitly set (keeps the
+//      global force knob, e.g. BC-D4's THRESHOLD=0, working);
+//   3. the collective's data-driven default (collDefault).
+// Always returns a concrete value, so callers pass it straight to the kernel.
+static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDefault) {
+  return gin_sdma::resolveThreshold(gin_sdma::parseSize(getenv(collVar)),
+                                    gin_sdma::parseSize(getenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD")),
+                                    collDefault);
+}
+
+// Fixed-capacity, pass-by-value per-peer metadata for the GIN-SDMA AllToAllv
+// (-D 3) kernel. Passing the small per-peer arrays as a by-value kernel argument
+// (instead of a device buffer filled per call) keeps the launch HIP-graph
+// capture-safe: no hipMalloc / hipMemcpyAsync runs inside the collective, so the
+// captured warm-up (rccl-tests' TimeTest wraps the per-size warm-up loop in
+// cudaStreamBeginCapture) never hits an illegal allocation / sync. Single-node
+// A2AV rank counts are small, so kA2AvMaxRanks caps the arg size at
+// 3*64*8 = 1536 B (well under the kernel-arg limit); AlltoAllvRunColl returns
+// testNotImplemented if nRanks exceeds it.
+static constexpr int kA2AvMaxRanks = 64;
+struct A2AvDeviceMeta {
+  size_t sendBytes[kA2AvMaxRanks];   // bytes rank sends to peer p (0 = skip)
+  size_t srcByteOff[kA2AvMaxRanks];  // sender-side displacement (bytes)
+  size_t dstByteOff[kA2AvMaxRanks];  // receiver-side column-p prefix (bytes)
+  int    nIncoming;                  // # non-empty puts this rank receives
+};
+
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+// Overflow-safe AND hang-safe gin.put for the Anvil-SDMA backend. Two distinct
+// single-descriptor limits apply, and we clamp to the smaller of the two:
+//   1) Correctness: the SDMA linear-copy count field is 30 bits and 1-based
+//      (count = bytes-1), so a put of >1 GiB (kGinPutMaxBytes) silently
+//      truncates and corrupts data (a 2 GiB transfer copies only 1 GiB).
+//   2) Reliability: on MI355X + ROCm 7.13 a single copy descriptor at/above
+//      256 MiB stalls the SDMA engine on the fused copy+signal packet, so the
+//      copy never lands and the SignalInc never fires -> waitSignal hangs. A
+//      128 MiB cap (gin_sdma::kGinSdmaSafeCopyBytes) is measured hang-free with
+//      no bandwidth loss; see that constant for the evidence.
+// Split the transfer into <=kGinSdmaSafeCopyBytes segments and carry the
+// caller's remote action (e.g. SignalInc) ONLY on the final segment: the SDMA
+// queue is in-order, so a single signal still correctly means "the whole
+// message has landed" and per-message signal accounting (waitSignal counts) is
+// unchanged. A <=128 MiB message is a single put with no extra overhead.
+// Threads still each own a disjoint (peer, offset) tuple, so the inner
+// segmentation is race-free.
+template <typename RemoteAction>
+__device__ __forceinline__ void ginPutChunked(
+    ncclGin& gin, ncclTeam team, int peer,
+    ncclWindow_t dstWin, size_t dstOff,
+    ncclWindow_t srcWin, size_t srcOff,
+    size_t bytes, RemoteAction finalAction) {
+  const size_t kMax = gin_sdma::kGinSdmaSafeCopyBytes < gin_sdma::kGinPutMaxBytes
+                          ? gin_sdma::kGinSdmaSafeCopyBytes
+                          : gin_sdma::kGinPutMaxBytes;
+  size_t off = 0;
+  do {
+    const size_t rem = bytes - off;
+    const size_t seg = rem > kMax ? kMax : rem;
+    if (off + seg >= bytes) {
+      // Final (or only) segment carries the signal / remote action.
+      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg, finalAction);
+    } else {
+      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg);
+    }
+    off += seg;
+  } while (off < bytes);
+}
+
 template <typename F>
 testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   if (kernel == nullptr) return testNotImplemented;
@@ -440,6 +529,220 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
   kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
+  return testSuccess;
+}
+
+// Variant that passes a per-collective LSA<->GIN threshold override as the last
+// kernel argument. Used by AllGather/Broadcast GIN kernels; AlltoAll keeps the
+// base launcher (its LSA-vs-GIN split is topology-based, not size-based).
+template <typename F>
+testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride);
+  return testSuccess;
+}
+
+// Like ...Threshold, but the caller picks the grid (CTA count) instead of the
+// global deviceCtaCount (-V). Used by the Broadcast GIN ring, whose pipelined
+// throughput is CTA-bound: it launches its own power-of-2 CTA count (~128 to
+// saturate all xGMI links) decoupled from -V. The requested grid must be <= the
+// lsaBarrier count registered in BroadcastGetDevCommRequirements (which is sized
+// to max(deviceCtaCount, ring CTAs)); the kernel indexes devComm.lsaBarrier by
+// blockIdx.x, so launching more CTAs than allocated barriers would corrupt/hang.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride);
+  return testSuccess;
+}
+
+// Variant that also forwards an LL (low-latency, packed data+flag) handle as the
+// last kernel argument. Used by the AllGather GIN kernel for its tiny-message
+// LL fast path; the handle is a small POD ({bufHandle, nSlots}) assigned during
+// ncclDevCommCreate.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  return testSuccess;
+}
+
+// Like ...ThresholdLL, but the caller picks the grid (CTA count) per call instead
+// of using the global deviceCtaCount. Used by AllToAll's size-adaptive LSA tier
+// (F1): the CTA count grows with the per-peer chunk to scale xGMI egress like the
+// host RING's channel parallelism, while the SDMA tier launches a small grid. The
+// requested grid must be <= the allocated lsaBarrier count (see a2aDevReqs), which
+// is sized for kA2aLsaMaxCtas; launching fewer CTAs than allocated is always safe.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  return testSuccess;
+}
+
+// Like ...ThresholdLLCtas, but also forwards a trailing int (caller-picked grid +
+// an int flag). Used by AllToAll's LSA tier to select its cross-rank sync mode at
+// runtime (0 = LSA barriers, 1 = none [diagnostic ceiling], 2 = point-to-point
+// ready/done flags).
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLCtasFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int gridCtas, int flag, ncclDevResourceHandle_t flagBuf) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle, flag, flagBuf);
+  return testSuccess;
+}
+
+// Variant that forwards both an LL handle and a trailing int flag as the last
+// two kernel arguments. Used by the Scatter GIN kernel to toggle its LSA-tier
+// root fan-out layout (peer-interleaved vs sequential) at runtime from an env.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int flag) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle, flag);
+  return testSuccess;
+}
+
+// Variant for the reduction collectives (ReduceScatter): forwards the LSA<->GIN
+// threshold, the reduction op (as an int -- the kernel switches on it via
+// gin_sdma_reduce), and a resource-buffer scratch-window handle for the large
+// put-partials tier. The handle is a small POD (uint32_t) assigned during
+// ncclDevCommCreate; 0 means no scratch was configured.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
+// Same as testLaunchDeviceKernelThresholdScratch but with an EXPLICIT grid size
+// (gridCtas) instead of the global deviceCtaCount. Used by the GIN-SDMA
+// ReduceScatter (-D 3) to self-select a size-adaptive CTA count (see
+// gin_sdma::reduceScatterCtas) decoupled from -V, like the broadcast/reduce
+// rings. gridCtas must be <= the barrier/lsaBarrier count registered in
+// ReduceScatterGetDevCommRequirements (sized to max(deviceCtaCount, tuned)); the
+// kernel indexes devComm.lsaBarrier by blockIdx.x, so over-launching would
+// corrupt/hang.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdScratchGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
+// Variant for the pipelined large-tier Reduce (-D 3, OOP): same reduction-collective
+// signature as ...ThresholdScratch plus a trailing sub-chunk count (nSub) that sets
+// the double-buffer depth of the SM-reduce || SDMA-put overlap. Launched with the
+// global deviceCtaCount grid; the per-CTA GIN signal index is blockIdx.x, so the grid
+// must be <= the ginSignalCount registered in ReduceGetDevCommRequirements.
+template <typename F>
+testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int nSub) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle, nSub);
+  return testSuccess;
+}
+
+// Variant for the multi-ring large-tier Reduce (-D 3, OOP): EXPLICIT grid size
+// (gridCtas, the ring's own CTA count, decoupled from -V like the broadcast ring)
+// and a trailing chunk count (nChunks = ring pipeline depth). Forwards the op as an
+// int (runtime switch, template varies only on T). gridCtas must be <= the
+// lsaBarrierCount registered in ReduceGetDevCommRequirements.
+template <typename F>
+testResult_t testLaunchDeviceKernelReduceRing(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t nChunks, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, (int)op, nChunks);
+  return testSuccess;
+}
+
+// Single-launch variant with an EXPLICIT grid size (gridCtas) instead of the global
+// deviceCtaCount. Used by the GIN-SDMA AllReduce -D 5 to pick a size-adaptive CTA count
+// (few CTAs for small messages, more for large; see arTunedGridCtas). gridCtas must be
+// <= the barrier/signal slot count registered in AllReduceGetDevCommRequirements.
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas, size_t oneShotThresholdOverride) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle, oneShotThresholdOverride);
+  return testSuccess;
+}
+
+// Two-launch variant (AllReduce -D 6) with an EXPLICIT grid size: launches a ReduceScatter
+// kernel then an AllGather kernel back-to-back on the SAME stream, so the RS->AG boundary
+// is the kernel-launch boundary. Both kernels share the reduction-collective signature.
+template <typename F>
+testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+  if (rsKernel == nullptr || agKernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  rsKernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  agKernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+
+// Bespoke launcher for AllToAllv (-D 3). Beyond the usual args it forwards a
+// by-value A2AvDeviceMeta (BYTE units) holding the per-peer arrays the
+// variable-size kernel needs:
+//   meta.sendBytes[p]  : bytes this rank sends to peer p (0 => skip the pair).
+//   meta.srcByteOff[p] : source byte offset of that chunk in this rank's sendbuf.
+//   meta.dstByteOff[p] : destination byte offset in peer p's recvbuf (the
+//                        receiver-side column-p prefix -- where the chunk lands).
+//   meta.nIncoming     : number of non-empty puts this rank receives (waitSignal
+//                        target for the GIN tier).
+// Passing meta by value (no device buffer, no hipMalloc/hipMemcpyAsync in the
+// collective) makes the launch HIP-graph-capture-safe. Fixed grid
+// (deviceCtaCount) matches the barrier/signal pool sized by moveDevReqs.
+template <typename F>
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const A2AvDeviceMeta& meta) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  // meta is passed BY VALUE into the kernel arg buffer -> no device alloc/copy in
+  // the collective, so the launch is HIP-graph-capture-safe (works under -G).
+  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, meta);
   return testSuccess;
 }
 
@@ -456,12 +759,96 @@ testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset,
    type == ncclFloat64 ? kernel<double> : \
    nullptr \
   )
+
+// Op-aware dispatch for the reduction collectives (ReduceScatter). Unlike
+// SPECIALIZE_KERNEL (which forces op==ncclSum), this selects kernel<T> across the
+// full element-type set for any of the supported built-in reduction ops
+// (sum/prod/max/min/avg). PreMulSum ("mulsum", a created op handle >= ncclNumOps)
+// is NOT supported (deferred) -> nullptr -> testNotImplemented; fp8 prod is
+// excluded too (matches the ReduceScatterRunTest skip). The reduction op itself
+// is passed to the kernel at launch (runtime switch), so the template varies
+// only on T.
+#if HAVE_BF16
+#define RS_BF16_CASE(kernel, type) (type) == ncclBfloat16 ? kernel<hip_bfloat16> :
+#else
+#define RS_BF16_CASE(kernel, type)
+#endif
+#if HAVE_FP8
+#define RS_FP8_CASE(kernel, type) (type) == ncclFloat8e4m3 ? kernel<rccl_float8> : (type) == ncclFloat8e5m2 ? kernel<rccl_bfloat8> :
+#else
+#define RS_FP8_CASE(kernel, type)
+#endif
+#define SPECIALIZE_REDUCE_KERNEL(kernel, type, op) \
+  ( (int)(op) >= (int)ncclNumOps ? nullptr : \
+    (((op) == ncclProd && ((type) == ncclFloat8e4m3 || (type) == ncclFloat8e5m2)) ? nullptr : \
+     (type) == ncclInt8 ? kernel<int8_t> : \
+     (type) == ncclUint8 ? kernel<uint8_t> : \
+     (type) == ncclInt32 ? kernel<int32_t> : \
+     (type) == ncclUint32 ? kernel<uint32_t> : \
+     (type) == ncclInt64 ? kernel<int64_t> : \
+     (type) == ncclUint64 ? kernel<uint64_t> : \
+     (type) == ncclFloat16 ? kernel<half> : \
+     (type) == ncclFloat32 ? kernel<float> : \
+     (type) == ncclFloat64 ? kernel<double> : \
+     RS_BF16_CASE(kernel, type) \
+     RS_FP8_CASE(kernel, type) \
+     nullptr) \
+  )
 #else
 template <typename F>
 testResult_t testLaunchDeviceKernel(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   return testNotImplemented;
 }
+template <typename F>
+testResult_t testLaunchDeviceKernelThreshold(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelThresholdCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdLLFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int flag) {
+  return testNotImplemented;
+}
+template <typename F, typename H, typename R>
+testResult_t testLaunchDeviceKernelThresholdLLCtasFlag(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H llHandle, int gridCtas, int flag, R flagBuf) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdScratch(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdScratchCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas, size_t oneShotThresholdOverride) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelThresholdScratchGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelReducePipelined(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int nSub) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelReduceRing(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t nChunks, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F, typename H>
+testResult_t testLaunchDeviceKernelAR2SplitCtas(F rsKernel, F agKernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, H scratchHandle, int gridCtas) {
+  return testNotImplemented;
+}
+template <typename F>
+testResult_t testLaunchDeviceKernelA2Av(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, const A2AvDeviceMeta& meta) {
+  return testNotImplemented;
+}
 #define SPECIALIZE_KERNEL(kernel, type, op) nullptr
+#define SPECIALIZE_REDUCE_KERNEL(kernel, type, op) nullptr
 #endif
 
 typedef enum {
