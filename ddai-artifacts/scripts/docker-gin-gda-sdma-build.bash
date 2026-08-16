@@ -28,12 +28,12 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
 # range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
 # pattern.
-# NOTE: ReduceScatter is intentionally excluded. The GIN ReduceScatter gate (RS-C2) exercises
-# the rccl-tests device-API GinReduceScatterKernel (-D 3, NCCL_GIN_TYPE=6), which does NOT need
-# RCCL's symmetric ReduceScatter. Compiling RCCL's symmetric RS GIN path (RailA2A_LsaLD) pulls in
-# an unresolved rocSHMEM symbol (rocshmem::envvar::log_flags) that this librccl link config does
-# not satisfy, aborting every reduce_scatter_perf invocation at startup. Keep the RS gate GIN-only.
-ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
+# "ReduceScatter" is included so the ReduceScatter host baseline (reduce_scatter_perf -D 0) and
+# the GIN -D 3 devcomm/symk query for ncclFuncReduceScatter resolve via generated kernels. Note
+# RCCL's symmetric RS GIN kernel (RailA2A_LsaLD) references rocshmem::envvar::log_flags, which
+# librccl.so leaves unresolved by design; reduce_scatter_perf links roc::rocshmem with -rdynamic
+# (see rccl-tests/src/CMakeLists.txt) to export it, matching alltoall_perf/all_gather_perf.
+ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce|ReduceScatter}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
 DEV_ARTI_DIR="${GIT_CLONE_ROOT}/ddai-artifacts"
