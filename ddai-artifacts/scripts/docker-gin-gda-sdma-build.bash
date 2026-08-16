@@ -28,7 +28,7 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
 # range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
 # pattern.
-ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
+ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce|ReduceScatter}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
 DEV_ARTI_DIR="${GIT_CLONE_ROOT}/ddai-artifacts"
@@ -154,4 +154,44 @@ if [ "${RCCL_IMAGE_AG_SMOKE}" = "1" ]; then
   fi
 else
   echo "NOTE: GIN AllGather smoke assert disabled (RCCL_IMAGE_AG_SMOKE=0)."
+fi
+
+# ---------------------------------------------------------------------------
+# Build hardening: GIN Anvil-SDMA ReduceScatter (-D 3) smoke assert.
+# Runs the ReduceScatter harness RS-C2 (GIN only, NCCL_GIN_TYPE=6) so a broken
+# GinReduceScatterKernel or GIN bring-up is caught at image build time, alongside
+# the A2A / AllGather gates above. The single-tier LSA read-reduce is exercised
+# across the sweep; the SM reduction is validated against rccl-tests' verifiable
+# oracle (datacheck). Shares the same skip conditions as the AG gate.
+#   RCCL_IMAGE_RS_SMOKE=0   disable this assert
+#   RS_SMOKE_NP=<n>         GPU/rank count (default = GIN_SMOKE_NP)
+#   RS_SMOKE_SIZE=<bytes>   max message size (default = GIN_SMOKE_SIZE)
+# ---------------------------------------------------------------------------
+RCCL_IMAGE_RS_SMOKE="${RCCL_IMAGE_RS_SMOKE:-1}"
+RS_SMOKE_NP="${RS_SMOKE_NP:-${GIN_SMOKE_NP:-8}}"
+RS_SMOKE_SIZE="${RS_SMOKE_SIZE:-${GIN_SMOKE_SIZE:-1M}}"
+if [ "${RCCL_IMAGE_RS_SMOKE}" = "1" ]; then
+  if [ ! -e /dev/kfd ]; then
+    echo "WARN: ReduceScatter GIN smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_RS_SMOKE=0 to silence." >&2
+  else
+    echo "=== Build hardening: GIN Anvil-SDMA ReduceScatter smoke assert (NP=${RS_SMOKE_NP}, -D 3, NCCL_GIN_TYPE=6, -e ${RS_SMOKE_SIZE}) ==="
+    RS_SMOKE_LOG="$(mktemp)"
+    RUN_HOST_BASELINE=0 RUN_GIN_SDMA=1 \
+      bash "${DEV_ARTI_DIR}/scripts/gin-sdma-reducescatter-test.bash" "${RS_SMOKE_NP}" "${RS_SMOKE_SIZE}" \
+      > "${RS_SMOKE_LOG}" 2>&1
+    if grep -qE "GIN support is not enabled for this communicator|Failed to initialize any GIN plugin|Test failure" "${RS_SMOKE_LOG}" \
+       || ! grep -q "Out of bounds values : 0 OK" "${RS_SMOKE_LOG}"; then
+      echo "ERROR: GIN Anvil-SDMA ReduceScatter (-D 3) bring-up FAILED for image '${DOCKER_IMAGE}'." >&2
+      echo "       The GinReduceScatterKernel did not initialize GIN or failed datacheck." >&2
+      echo "------------------------------ RS smoke log tail ------------------------------" >&2
+      tail -n 40 "${RS_SMOKE_LOG}" >&2
+      echo "-------------------------------------------------------------------------------" >&2
+      rm -f "${RS_SMOKE_LOG}"
+      exit 1
+    fi
+    echo "ReduceScatter GIN smoke OK: $(grep 'Avg bus bandwidth' "${RS_SMOKE_LOG}" | tail -n1 | sed 's/^# *//')"
+    rm -f "${RS_SMOKE_LOG}"
+  fi
+else
+  echo "NOTE: GIN ReduceScatter smoke assert disabled (RCCL_IMAGE_RS_SMOKE=0)."
 fi
