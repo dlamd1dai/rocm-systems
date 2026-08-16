@@ -366,6 +366,45 @@ if(BUILD_TESTS)
   add_test(NAME rccl-UnitTestsGinSdmaPolicy COMMAND rccl-UnitTestsGinSdmaPolicy)
   set_tests_properties(rccl-UnitTestsGinSdmaPolicy PROPERTIES LABELS "unit")
 
+  # GIN Anvil-SDMA AllReduce policy host unit test (no GPU). Exercises the pure
+  # host decision logic the rccl-tests AllReduce launcher (-D 5 single-launch /
+  # -D 6 two-launch) drives: threshold parsing/resolution (arThr / arOneShot),
+  # AllGather tier selection, devComm resource requirements, and two-shot
+  # slice-stride / scratch sizing -- compiled with GIN_SDMA_HOST_ONLY so it needs
+  # neither a built librccl nor device codegen. The policy header lives in the
+  # sibling rccl-tests project; skip the target if that checkout is absent so a
+  # standalone rccl build still configures. Runs under `ctest -L unit`.
+  set(_gin_sdma_ar_policy_hdr_dir "${PROJECT_SOURCE_DIR}/../rccl-tests/src")
+  if (EXISTS "${_gin_sdma_ar_policy_hdr_dir}/gin_sdma_collective_policy.h")
+    add_executable(rccl-UnitTestsGinSdmaAllReducePolicy gin/gin_sdma_allreduce_policy_test.cpp)
+    set_source_files_properties(gin/gin_sdma_allreduce_policy_test.cpp PROPERTIES LANGUAGE CXX)
+    target_include_directories(rccl-UnitTestsGinSdmaAllReducePolicy PRIVATE
+      "${_gin_sdma_ar_policy_hdr_dir}")
+    target_compile_definitions(rccl-UnitTestsGinSdmaAllReducePolicy PRIVATE GIN_SDMA_HOST_ONLY)
+    target_link_libraries(rccl-UnitTestsGinSdmaAllReducePolicy PRIVATE ${GTEST_BOTH_LIBRARIES} Threads::Threads)
+    set_target_properties(rccl-UnitTestsGinSdmaAllReducePolicy PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test")
+    add_test(NAME rccl-UnitTestsGinSdmaAllReducePolicy COMMAND rccl-UnitTestsGinSdmaAllReducePolicy)
+    set_tests_properties(rccl-UnitTestsGinSdmaAllReducePolicy PROPERTIES LABELS "unit")
+
+    # GIN-SDMA AllReduce reduction-ops host unit test (no GPU). The device-only
+    # gin_sdma_reduce.h (preOp/combine/postOp) is compiled as plain host C++
+    # behind a light shim inside the test (attributes drop to no-ops, __half is a
+    # float carrier), so the generic reduction templates and every op-dispatch /
+    # avg pre-post / integral-vs-floating branch are exercised without a GPU.
+    add_executable(rccl-UnitTestsGinSdmaReduceOps gin/gin_sdma_reduce_ops_test.cpp)
+    set_source_files_properties(gin/gin_sdma_reduce_ops_test.cpp PROPERTIES LANGUAGE CXX)
+    target_include_directories(rccl-UnitTestsGinSdmaReduceOps PRIVATE
+      "${_gin_sdma_ar_policy_hdr_dir}")
+    target_link_libraries(rccl-UnitTestsGinSdmaReduceOps PRIVATE ${GTEST_BOTH_LIBRARIES} Threads::Threads)
+    set_target_properties(rccl-UnitTestsGinSdmaReduceOps PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test")
+    add_test(NAME rccl-UnitTestsGinSdmaReduceOps COMMAND rccl-UnitTestsGinSdmaReduceOps)
+    set_tests_properties(rccl-UnitTestsGinSdmaReduceOps PROPERTIES LABELS "unit")
+  else()
+    message(STATUS "Skipping GIN-SDMA AllReduce host unit tests (sibling rccl-tests checkout not found at ${_gin_sdma_ar_policy_hdr_dir})")
+  endif()
+
   # rccl-UnitTestsFixturesDebug: Tests that access internal symbols compiled into
   # librccl.so which are only visible in Debug builds (hidden visibility in Release).
   if (ROCM_VERSION VERSION_GREATER_EQUAL "60400" AND CMAKE_BUILD_TYPE MATCHES "Debug")
