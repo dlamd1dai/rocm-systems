@@ -121,10 +121,17 @@ _check_datacheck() {  # $1=logfile $2=label
   return 1
 }
 
-# True if the log shows the intermittent gfx950 cuMem-VMM peer-map fault that the
-# GIN plugin's connectivity gate aborts on (safe/expected to re-launch).
+# True if the log shows the intermittent gfx950 cuMem-VMM peer-map fault (safe /
+# expected to re-launch). At NCCL_DEBUG=INFO the GIN plugin prints an explicit
+# "LSA signal connectivity gate failed" WARN; at the harness default
+# (NCCL_DEBUG=VERSION) those WARNs are suppressed and the *same* fault surfaces
+# only as a generic "unhandled system error" raised at init (before any size row
+# is produced). We treat an init-time "unhandled system error" as retryable too:
+# the caller only invokes this when datacheck is absent, and a genuine numeric
+# mismatch reports "Out of bounds values : N" (N>0) rather than a system error,
+# so this never masks a real correctness failure.
 _is_conn_gate_fault() {  # $1=logfile
-  grep -qE "LSA signal connectivity gate failed|cuMem-VMM peer-map fault|cuMem VMM peer mapping broken" "$1"
+  grep -qE "LSA signal connectivity gate failed|cuMem-VMM peer-map fault|cuMem VMM peer mapping broken|unhandled system error" "$1"
 }
 
 _common_perf_args() {  # $1=deviceImpl

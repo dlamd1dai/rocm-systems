@@ -114,3 +114,48 @@ if [ "${RCCL_IMAGE_GIN_SMOKE}" = "1" ]; then
 else
   echo "NOTE: GIN smoke assert disabled (RCCL_IMAGE_GIN_SMOKE=0)."
 fi
+
+# ---------------------------------------------------------------------------
+# Build hardening (runtime): assert GIN Anvil-SDMA AllReduce (-D 5) bring-up.
+# Companion to the A2A gate above -- all_reduce_perf links GIN separately, so a
+# broken/mis-linked AllReduce device kernel would slip past the A2A smoke test.
+# Runs a minimal Test#5 AllReduce (NCCL_GIN_TYPE=5, -D 5) via the AR harness and
+# fails if GIN does not init or datacheck is not clean. The harness itself
+# retries the intermittent gfx950 cuMem-VMM connectivity-gate abort, so we key
+# success off its retry-aware exit code + success sentinel (NOT a raw "Test
+# failure" grep, which a retried-then-passed run legitimately prints).
+# Skips cleanly on GPU-less builders or when RCCL_IMAGE_AR_SMOKE=0.
+#   RCCL_IMAGE_AR_SMOKE=0  disable this assert
+#   AR_SMOKE_NP=<n>        GPU/rank count (default = GIN_SMOKE_NP)
+#   AR_SMOKE_SIZE=<bytes>  max message size, e.g. 8M (default = GIN_SMOKE_SIZE)
+# ---------------------------------------------------------------------------
+RCCL_IMAGE_AR_SMOKE="${RCCL_IMAGE_AR_SMOKE:-1}"
+AR_SMOKE_NP="${AR_SMOKE_NP:-${GIN_SMOKE_NP}}"
+AR_SMOKE_SIZE="${AR_SMOKE_SIZE:-${GIN_SMOKE_SIZE}}"
+if [ "${RCCL_IMAGE_AR_SMOKE}" = "1" ]; then
+  if [ ! -e /dev/kfd ]; then
+    echo "WARN: AR smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_AR_SMOKE=0 to silence." >&2
+  else
+    echo "=== Build hardening: GIN Anvil-SDMA AllReduce smoke assert (NP=${AR_SMOKE_NP}, NCCL_GIN_TYPE=5, -D 5, -e ${AR_SMOKE_SIZE}) ==="
+    AR_SMOKE_LOG="$(mktemp)"
+    if DOCKER_IMAGE="${DOCKER_IMAGE}" RCCL_GIN_RUN_TESTS=5 RCCL_GIN_ECHO=0 \
+         bash "${DEV_ARTI_DIR}/scripts/gin-sdma-ar-test.bash" "${AR_SMOKE_NP}" "${AR_SMOKE_SIZE}" \
+         > "${AR_SMOKE_LOG}" 2>&1 \
+       && grep -q "gin-sdma-ar-test: all selected tests passed datacheck" "${AR_SMOKE_LOG}" \
+       && ! grep -qE "GIN support is not enabled for this communicator|Failed to initialize any GIN plugin" "${AR_SMOKE_LOG}"; then
+      echo "AR smoke OK: $(grep 'Avg bus bandwidth' "${AR_SMOKE_LOG}" | tail -n1 | sed 's/^# *//')"
+      rm -f "${AR_SMOKE_LOG}"
+    else
+      echo "ERROR: GIN Anvil-SDMA AllReduce bring-up FAILED for image '${DOCKER_IMAGE}'." >&2
+      echo "       -D 5 AllReduce did not enable GIN (ginType=NONE) or datacheck failed." >&2
+      echo "       This image is NOT safe for GIN AllReduce tests. Smoke log tail:" >&2
+      echo "------------------------------ AR smoke log tail ------------------------------" >&2
+      tail -n 40 "${AR_SMOKE_LOG}" >&2
+      echo "-------------------------------------------------------------------------------" >&2
+      rm -f "${AR_SMOKE_LOG}"
+      exit 1
+    fi
+  fi
+else
+  echo "NOTE: AR smoke assert disabled (RCCL_IMAGE_AR_SMOKE=0)."
+fi
