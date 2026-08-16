@@ -17,7 +17,9 @@
 DOCKER_NO_CACHE=${1:-0}
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 DOCKERFILE="Dockerfile-rccl-gin-gda-sdma"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
+# Exported so the post-build smoke gates (gin-sdma-a2a-test.bash / gin-sdma-ag-test.bash)
+# run against THIS just-built image rather than the harness's own default name.
+export DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 TARGET_GPU_ARCH="${GPU_TARGETS:-gfx950}"
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
@@ -113,4 +115,43 @@ if [ "${RCCL_IMAGE_GIN_SMOKE}" = "1" ]; then
   fi
 else
   echo "NOTE: GIN smoke assert disabled (RCCL_IMAGE_GIN_SMOKE=0)."
+fi
+
+# ---------------------------------------------------------------------------
+# Build hardening: GIN Anvil-SDMA hybrid AllGather (-D 3) smoke assert.
+# Runs the AllGather harness Test#3 (NCCL_GIN_TYPE=5) so a broken GinHybrid-
+# AllGatherKernel or GIN bring-up is caught at image build time, alongside the
+# A2A gate above. Exercises both tiers (AG_THRESHOLD default keeps LSA<->SDMA
+# crossover at 2 MiB/rank). Shares the same skip conditions as the A2A gate.
+#   RCCL_IMAGE_AG_SMOKE=0   disable this assert
+#   AG_SMOKE_NP=<n>         GPU/rank count (default = GIN_SMOKE_NP)
+#   AG_SMOKE_SIZE=<bytes>   max message size (default = GIN_SMOKE_SIZE)
+# ---------------------------------------------------------------------------
+RCCL_IMAGE_AG_SMOKE="${RCCL_IMAGE_AG_SMOKE:-1}"
+AG_SMOKE_NP="${AG_SMOKE_NP:-${GIN_SMOKE_NP:-8}}"
+AG_SMOKE_SIZE="${AG_SMOKE_SIZE:-${GIN_SMOKE_SIZE:-1M}}"
+if [ "${RCCL_IMAGE_AG_SMOKE}" = "1" ]; then
+  if [ ! -e /dev/kfd ]; then
+    echo "WARN: AllGather GIN smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_AG_SMOKE=0 to silence." >&2
+  else
+    echo "=== Build hardening: GIN Anvil-SDMA AllGather smoke assert (NP=${AG_SMOKE_NP}, -D 3, NCCL_GIN_TYPE=5, -e ${AG_SMOKE_SIZE}) ==="
+    AG_SMOKE_LOG="$(mktemp)"
+    RCCL_GIN_RUN_TESTS=3 \
+      bash "${DEV_ARTI_DIR}/scripts/gin-sdma-ag-test.bash" "${AG_SMOKE_NP}" "${AG_SMOKE_SIZE}" \
+      > "${AG_SMOKE_LOG}" 2>&1
+    if grep -qE "GIN support is not enabled for this communicator|Failed to initialize any GIN plugin|Test failure" "${AG_SMOKE_LOG}" \
+       || ! grep -q "Out of bounds values : 0 OK" "${AG_SMOKE_LOG}"; then
+      echo "ERROR: GIN Anvil-SDMA AllGather (-D 3) bring-up FAILED for image '${DOCKER_IMAGE}'." >&2
+      echo "       The GinHybridAllGatherKernel did not initialize GIN or failed datacheck." >&2
+      echo "------------------------------ AG smoke log tail ------------------------------" >&2
+      tail -n 40 "${AG_SMOKE_LOG}" >&2
+      echo "-------------------------------------------------------------------------------" >&2
+      rm -f "${AG_SMOKE_LOG}"
+      exit 1
+    fi
+    echo "AllGather GIN smoke OK: $(grep 'Avg bus bandwidth' "${AG_SMOKE_LOG}" | tail -n1 | sed 's/^# *//')"
+    rm -f "${AG_SMOKE_LOG}"
+  fi
+else
+  echo "NOTE: GIN AllGather smoke assert disabled (RCCL_IMAGE_AG_SMOKE=0)."
 fi
