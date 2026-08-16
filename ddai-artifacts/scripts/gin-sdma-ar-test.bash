@@ -180,15 +180,24 @@ if _run_test 5; then
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}"
   )
-  # AllGather-tier LSA<->SDMA crossover (per-message bytes). Unset => kernel
-  # built-in default (gin_sdma::kAllReduceSdmaThresholdDefault, 16 MiB). Set to 0
-  # to force all-SDMA, or a huge value to force all-LSA.
-  [[ -n "${AR_SDMA_THRESHOLD:-}" ]] && \
-    AR_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE=${AR_SDMA_THRESHOLD}")
-  # Tiny one-shot LSA read-reduce cutoff (-D 5 only). Unset => built-in default
-  # (gin_sdma::kAllReduceOneShotThresholdDefault, 256 KiB). Set 0 to disable.
-  [[ -n "${AR_ONESHOT_THRESHOLD:-}" ]] && \
-    AR_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE=${AR_ONESHOT_THRESHOLD}")
+  # AllReduce AllGather-tier cutoffs. IMPORTANT: NCCL_GIN_ANVIL_SDMA_THRESHOLD
+  # above is dual-purpose -- the backend reads it as the gin.put copy-engine
+  # control (kept at 0 so the SDMA tier's puts use the copy engine), but
+  # rccl-tests' resolveThreshold ALSO consumes it as the shared fallback for
+  # BOTH arThr and arOneShot. Leaving it at 0 therefore collapses arThr and
+  # arOneShot to 0 and forces the SDMA AllGather tier at every size, disabling
+  # the xGMI-LSA one-shot / peer-store tiers. resolveThreshold checks the
+  # collective-specific var FIRST, so we set the AR-specific cutoffs explicitly
+  # to the measured production defaults; this restores the LSA tiers for small
+  # messages while leaving the backend put behavior (shared knob) untouched.
+  #   arThr:     LSA peer-store below, SDMA put at/above (16 MiB, measured).
+  #   arOneShot: tiny out-of-place one-shot LSA read-reduce below (256 KiB, -D 5).
+  # Override AR_SDMA_THRESHOLD / AR_ONESHOT_THRESHOLD to retune (0 forces all-SDMA
+  # / disables one-shot; a huge arThr forces all-LSA).
+  AR_SDMA_THRESHOLD="${AR_SDMA_THRESHOLD:-16777216}"     # 16 MiB
+  AR_ONESHOT_THRESHOLD="${AR_ONESHOT_THRESHOLD:-262144}"  # 256 KiB
+  AR_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLREDUCE=${AR_SDMA_THRESHOLD}")
+  AR_MPI_EXTRA+=(-x "NCCL_GIN_ANVIL_ONESHOT_THRESHOLD_ALLREDUCE=${AR_ONESHOT_THRESHOLD}")
 
   # Device-side (in-kernel wall_clock64) timing. 0=off (default), 1=augment (extra
   # "#[ar-devtime]" line), 2=device-time-only (report device latency AS the metric;
