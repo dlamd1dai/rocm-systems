@@ -416,6 +416,27 @@ if(BUILD_TESTS)
     set_tests_properties(rccl-UnitTestsGinSdmaAllGatherGpu PROPERTIES LABELS "unit;gpu")
   endif()
 
+  # GIN Anvil-SDMA ReduceScatter (-D 3) policy host unit test (no GPU). Compiles
+  # gin_sdma_reducescatter_policy.h from the sibling rccl-tests project with
+  # GIN_SDMA_HOST_ONLY (no librccl / device codegen needed), validating the per-rank
+  # slice sizing, size-adaptive CTA schedule, devComm requirement shape, threshold
+  # precedence and bandwidth math the GinReduceScatterKernel relies on. Skip the
+  # target if the rccl-tests checkout is absent so a standalone rccl build still
+  # configures. Runs under `ctest -L unit`.
+  set(_gin_sdma_rs_hdr_dir "${PROJECT_SOURCE_DIR}/../rccl-tests/src")
+  if (EXISTS "${_gin_sdma_rs_hdr_dir}/gin_sdma_reducescatter_policy.h")
+    add_executable(rccl-UnitTestsGinSdmaReduceScatterPolicy gin/gin_sdma_reducescatter_policy_test.cpp)
+    set_source_files_properties(gin/gin_sdma_reducescatter_policy_test.cpp PROPERTIES LANGUAGE CXX)
+    target_include_directories(rccl-UnitTestsGinSdmaReduceScatterPolicy PRIVATE
+      "${_gin_sdma_rs_hdr_dir}")
+    target_compile_definitions(rccl-UnitTestsGinSdmaReduceScatterPolicy PRIVATE GIN_SDMA_HOST_ONLY)
+    target_link_libraries(rccl-UnitTestsGinSdmaReduceScatterPolicy PRIVATE ${GTEST_BOTH_LIBRARIES} Threads::Threads)
+    set_target_properties(rccl-UnitTestsGinSdmaReduceScatterPolicy PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test")
+    add_test(NAME rccl-UnitTestsGinSdmaReduceScatterPolicy COMMAND rccl-UnitTestsGinSdmaReduceScatterPolicy)
+    set_tests_properties(rccl-UnitTestsGinSdmaReduceScatterPolicy PROPERTIES LABELS "unit")
+  endif()
+
   # rccl-UnitTestsFixturesDebug: Tests that access internal symbols compiled into
   # librccl.so which are only visible in Debug builds (hidden visibility in Release).
   if (ROCM_VERSION VERSION_GREATER_EQUAL "60400" AND CMAKE_BUILD_TYPE MATCHES "Debug")

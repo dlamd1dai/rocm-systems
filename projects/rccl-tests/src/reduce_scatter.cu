@@ -5,11 +5,97 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include <cstdlib>
 #include "cuda_runtime.h"
 #include "common.h"
+#include "gin_sdma_reducescatter_policy.h"
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+#include "nccl_device.h"
+#include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
+#include "rccl_vector_types.h"
+#if HAVE_FP8
+#include "rccl_float8.h"
+#endif
+#include "gin_sdma_reduce.h"  // device Apply<op,T>, mirrors verifiable.cu exactly
+#include "gin_sdma_devtime.h" // shared device-side (wall_clock64) timing scaffold
+
+// ReduceScatter (-D 3): the first reduction collective. Single tier -- balanced
+// LSA read-reduce for all sizes. Every rank reads its owned output slice
+// [rank*count] directly from EVERY peer's sendbuff via ncclGetLsaPointer, folds
+// the N contributions with gin_sdma_reduce (ascending source-rank order, matching
+// the verifier bit-for-bit) and writes its local recvbuff. This is the same
+// direct-parallel-pull algorithm RCCL's symmetric ReduceScatter LD kernel uses.
+// Balanced egress, no scratch/signals -- entry LSA barrier only. Reads are
+// 128-bit packed and pack-unrolled (see GinReduceScatterKernel) to keep the xGMI
+// read pipe full.
+//
+// An earlier size-hybrid design added a large-tier "put-partials + SM reduce"
+// path that staged into the GIN resource window and SM-reduced it. That was slow
+// for two reasons: (1) the extra staging round-trip, and (2) the reduce read all
+// N partials from a SINGLE local buffer, whereas the direct LSA pull spreads the
+// reduce reads across N peers' memories / xGMI links in parallel. (Note: under a
+// HIP_VMM_UNCACHED_MEMORY build -- active here -- both the resource window and
+// ncclMemAlloc'd send/recv buffers are UNCACHED, so caching is not the
+// differentiator; read parallelism + load scheduling are.) The launch still
+// carries the (unused) sdmaThreshold/scratch args for ABI stability; scratch is
+// no longer registered. PreMulSum/mulsum is deferred (SPECIALIZE_REDUCE_KERNEL
+// returns nullptr -> testNotImplemented); fp8 prod is excluded there and by the
+// ReduceScatterRunTest skip.
+static ncclDevResourceHandle g_rsScratchHandle = 0;  // unused (no scratch); passed to kernel as 0
+
+// Thin getenv() wrapper: parse a decimal CTA-count env var (NCCL_GIN_ANVIL_RS_CTAS)
+// into a size_t, returning the policy "unset" sentinel when absent/empty/unparseable
+// so gin_sdma_reducescatter::reduceScatterCtas() falls back to its size-adaptive
+// ladder. Self-contained here (the target common.h has no testParseSdmaThresholdEnv).
+static inline size_t ReduceScatterParseCtasEnv(const char* name) {
+  const char* e = getenv(name);
+  if (e == nullptr || e[0] == '\0') return gin_sdma_reducescatter::kThresholdUnset;
+  char* end = nullptr;
+  unsigned long long v = strtoull(e, &end, 10);
+  if (end == e) return gin_sdma_reducescatter::kThresholdUnset;
+  return (size_t)v;
+}
+
+// Op-aware dispatch for the reduction collective (ReduceScatter). Unlike the
+// shared SPECIALIZE_KERNEL (which forces op==ncclSum), this selects kernel<T>
+// across the full element-type set for any built-in reduction op
+// (sum/prod/max/min/avg); the op itself is passed to the kernel at launch (runtime
+// switch), so the template varies only on T. PreMulSum ("mulsum", a created op
+// handle >= ncclNumOps) is deferred -> nullptr -> testNotImplemented; fp8 prod is
+// excluded too (matches the ReduceScatterRunTest skip). Self-contained here since
+// the target common.h defines only SPECIALIZE_KERNEL.
+#ifndef SPECIALIZE_REDUCE_KERNEL
+#if HAVE_BF16
+#define RS_BF16_CASE(kernel, type) (type) == ncclBfloat16 ? kernel<hip_bfloat16> :
+#else
+#define RS_BF16_CASE(kernel, type)
+#endif
+#if HAVE_FP8
+#define RS_FP8_CASE(kernel, type) (type) == ncclFloat8e4m3 ? kernel<rccl_float8> : (type) == ncclFloat8e5m2 ? kernel<rccl_bfloat8> :
+#else
+#define RS_FP8_CASE(kernel, type)
+#endif
+#define SPECIALIZE_REDUCE_KERNEL(kernel, type, op) \
+  ( (int)(op) >= (int)ncclNumOps ? nullptr : \
+    (((op) == ncclProd && ((type) == ncclFloat8e4m3 || (type) == ncclFloat8e5m2)) ? nullptr : \
+     (type) == ncclInt8 ? kernel<int8_t> : \
+     (type) == ncclUint8 ? kernel<uint8_t> : \
+     (type) == ncclInt32 ? kernel<int32_t> : \
+     (type) == ncclUint32 ? kernel<uint32_t> : \
+     (type) == ncclInt64 ? kernel<int64_t> : \
+     (type) == ncclUint64 ? kernel<uint64_t> : \
+     (type) == ncclFloat16 ? kernel<half> : \
+     (type) == ncclFloat32 ? kernel<float> : \
+     (type) == ncclFloat64 ? kernel<double> : \
+     RS_BF16_CASE(kernel, type) \
+     RS_FP8_CASE(kernel, type) \
+     nullptr) \
+  )
+#endif
+#endif
 
 void ReduceScatterGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
-  size_t base = (count/nranks) & -(16/eltSize);
+  size_t base = gin_sdma_reducescatter::sliceBaseCount(count, eltSize, nranks);
   *sendcount = base*nranks;
   *recvcount = base;
   *sendInplaceOffset = 0;
@@ -48,12 +134,371 @@ testResult_t  ReduceScatterGetSymkInfo(ncclComm_t comm, size_t count, ncclDataTy
 }
 
 void ReduceScatterGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  double baseBw = (double)(count * typesize * nranks) / 1.0E9 / sec;
-
-  *algBw = baseBw;
-  double factor = ((double)(nranks - 1))/((double)nranks);
-  *busBw = baseBw * factor;
+  gin_sdma_reducescatter::bandwidthGBps(count, typesize, sec, nranks, algBw, busBw);
 }
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
+  if (!reqs || !commProperties) return testInternalError;
+  switch(deviceImpl) {
+    case 3: { // GinReduceScatterKernel: single-tier LSA read-reduce (no scratch)
+      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+        fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
+        return testInternalError;
+      }
+      // Cover both the -V/deviceCtaCount launch and the size-adaptive CTA count the
+      // kernel self-selects (reduceScatterCtas, up to reduceScatterMaxCtas()),
+      // decoupled from -V -- the read-reduce indexes devComm.lsaBarrier by blockIdx.x.
+      const int rsBarCtas = (deviceCtaCount > gin_sdma_reducescatter::reduceScatterMaxCtas())
+                              ? deviceCtaCount : gin_sdma_reducescatter::reduceScatterMaxCtas();
+      gin_sdma_reducescatter::DevReqs dr = gin_sdma_reducescatter::reduceScatterDevReqs(rsBarCtas);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+      // No resource/scratch window: the LSA read-reduce reads peers' sendbuffs
+      // directly, so nothing needs to be staged.
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,7)
+      reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+#else
+      reqs->ginForceEnable = true;
+#endif
+      return testSuccess;
+    }
+    default:
+      return testNotImplemented;
+  }
+}
+#elif defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs) {
+  if (!reqs) return false;
+  memset(reqs, 0, sizeof(*reqs));
+  switch(deviceImpl) {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+    case 3: { // single-tier LSA read-reduce: barriers only, no scratch
+      const int rsBarCtas = (deviceCtaCount > gin_sdma_reducescatter::reduceScatterMaxCtas())
+                              ? deviceCtaCount : gin_sdma_reducescatter::reduceScatterMaxCtas();
+      gin_sdma_reducescatter::DevReqs dr = gin_sdma_reducescatter::reduceScatterDevReqs(rsBarCtas);
+      reqs->barrierCount = dr.barrierCount;
+      reqs->lsaBarrierCount = dr.lsaBarrierCount;
+      reqs->ginSignalCount = dr.ginSignalCount;
+      return true;
+    }
+#endif
+    default:
+      return false;
+  }
+}
+#endif
+
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+// Single-node ReduceScatter (-D 3). count is the per-rank output-slice element
+// count; the send buffer holds nRanks such slices ([p*count]).
+// Single tier: balanced LSA read-reduce. Each rank reads its owned output slice
+// [rank*count] directly from EVERY peer's sendbuff via ncclGetLsaPointer, folds
+// the N contributions in ascending source-rank order (matching verifiable.cu
+// bit-for-bit via gin_sdma_reduce), and writes its local recvbuff. Entry LSA
+// barrier only (own-writes-local pull, no exit barrier) -- no scratch, signals,
+// or GIN puts.
+//
+// Reads are 128-bit packed (Pack = 16 bytes = VEC elements). The load SCHEDULE is
+// chosen by total message size (both schedules fold identically, bit-for-bit):
+//   * < ~48 MiB: a register-light grid-stride loop (one pack/thread for maximum
+//     wave occupancy) that consumes peers FOUR at a time -- four independent peer
+//     loads issued before any reduce, so four source ranks overlap their xGMI read
+//     latency (deeper peer-ILP than the old 2-way; the read-latency-bound mid-band
+//     has its CTA count already maxed, so per-thread load ILP is the lever). This
+//     breaks past the serial-per-peer plateau without the register/occupancy cost
+//     of the large tier's warp-strided pack-unroll;
+//   * >= ~48 MiB: a WARP-STRIDED loop that unrolls over BOTH packs and peers -- a
+//     warp owns a tile of U*WARP packs and issues U independent 128-bit loads per
+//     source rank at stride WARP (lane varies fastest, so every load stays fully
+//     coalesced), AND consumes source ranks two at a time, so 2*U loads are in
+//     flight before any reduce. This mirrors RCCL's symmetric ReduceScatter LD
+//     kernel (UnrollPacks=4 x UnrollPeers=2 = 8 outstanding loads): pack-ILP fills
+//     the pipe within a source, peer-ILP overlaps consecutive sources' xGMI read
+//     latency. ~parity with the host symmetric path at >=64 MiB.
+// count is always a multiple of 16/sizeof(T) (see ReduceScatterGetCollByteCount) so
+// packs tile exactly with no scalar element tail; a short per-lane tail loop covers
+// a partial final warp-tile in the unrolled path.
+//
+// NOTE on the accumulator: low-precision types (half/bf16/fp8) MUST narrow back
+// to T on every pairwise step (gin_sdma_reduce::combine) to bit-match the
+// verifier, so acc[] stays in T rather than a wider float -- the reduction ALU is
+// not the bottleneck; the load schedule is.
+//
+// This replaces an earlier size-hybrid design whose large tier staged partials
+// via GIN put into the resource window and SM-reduced them; the direct LSA pull
+// avoids the staging round-trip and spreads reduce reads across N peers' links
+// (see the file-top note). The sdmaThreshold/scratch launch args are retained for
+// ABI compatibility but unused.
+template <typename T>
+__device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, int redOp) {
+  const int nRanks = devComm.nRanks;
+  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  const int nthreads = blockDim.x * gridDim.x;
+
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
+  lsaBar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+
+  // 128-bit packed read-reduce over the owned slice. In-place safe: each thread
+  // reads its own input pack (source s == rank) into registers before writing the
+  // same recv pack, and each thread owns a disjoint set of pack indices.
+  constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
+  struct alignas(16) Pack { T e[VEC]; };
+  Pack* dstP = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);
+  const size_t nPacks = count / (size_t)VEC;
+  const size_t myBaseP = ((size_t)devComm.rank * count) / (size_t)VEC;  // pack idx of my slice
+
+  // Adaptive load schedule. Both branches are the identical direct LSA read-reduce
+  // (same ascending source-rank fold, bit-for-bit); they differ ONLY in how loads
+  // are scheduled:
+  //   * small/mid (< RS_UNROLL_MIN total bytes): a register-light grid-stride loop
+  //     (one 128-bit load per iter) that maximizes wave occupancy -- best latency
+  //     hiding when there isn't enough data to saturate xGMI via ILP alone.
+  //   * large: a warp-strided loop unrolled over packs AND peers -- U independent
+  //     128-bit loads per source rank (each fully coalesced across the warp) times
+  //     two source ranks in flight = 2*U outstanding loads, mirroring RCCL's
+  //     symmetric LD UnrollPacks=4 x UnrollPeers=2. Pack-ILP fills the per-source
+  //     pipe; peer-ILP overlaps consecutive sources' latency -- saturates xGMI at
+  //     large sizes (~parity with host).
+  // The crossover (~48 MiB total) is where the unrolled path measurably overtakes
+  // the occupancy-bound loop on 8x MI355X; below it the grid-stride loop is faster.
+  constexpr size_t RS_UNROLL_MIN = (size_t)48 << 20;  // 48 MiB total message
+  const size_t totalBytes = count * (size_t)nRanks * sizeof(T);
+
+  if (totalBytes < RS_UNROLL_MIN) {
+    // ---- small/mid: high-occupancy grid-stride with 4-way PEER ILP ----
+    // One pack per thread (register-light -> max wave occupancy), but peers are
+    // consumed FOUR at a time: up to four independent 128-bit peer loads are
+    // issued before any is folded, so four source ranks' xGMI read latencies
+    // overlap. RS is read-latency-bound in this occupancy-limited mid-band (16-33
+    // MiB grid-stride tier), and the CTA count is already maxed (48 CTAs; more
+    // crater it), so the remaining lever is per-thread load ILP -- the host
+    // symmetric kernel's latency hiding, adapted to grid-stride granularity (vs
+    // its warp-strided UnrollPacks x UnrollPeers, which collapses occupancy here).
+    // Four Pack temps (64 B) is far lighter than the large tier's U=4 accumulator
+    // set, so occupancy holds. Ascending source-rank fold (s, s+1, s+2, s+3) is
+    // preserved, so the reduction stays bit-for-bit identical to the verifier.
+    for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
+      Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
+      T acc[VEC];
+      #pragma unroll
+      for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
+      int s = 1;
+      for (; s + 3 < nRanks; s += 4) {  // four peer loads in flight before folding
+        Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
+        Pack c = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 2))[myBaseP + pk];
+        Pack d = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 3))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, a.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, b.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, c.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, d.e[e], nRanks));
+      }
+      for (; s + 1 < nRanks; s += 2) {  // two-peer remainder
+        Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, a.e[e], nRanks));
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, b.e[e], nRanks));
+      }
+      for (; s < nRanks; s++) {  // odd peer tail
+        Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++)
+          acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+      }
+      Pack o;
+      #pragma unroll
+      for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+      dstP[pk] = o;
+    }
+  } else {
+    // ---- large: warp-strided pack-unrolled (U outstanding coalesced loads) ----
+    // U=4 matches RCCL's symmetric LD UnrollPacks and is the measured sweet spot
+    // (U=8 adds a few % at >=512 MiB but costs occupancy); fp8 (VEC16) drops to 2
+    // to bound the acc[] footprint. Within one load a warp's lanes read WARP
+    // consecutive packs; the U loads stride by WARP so lane varies fastest.
+    constexpr int U = (VEC <= 8) ? 4 : 2;
+    constexpr int WARP = 64;  // CDNA wavefront
+    const int lane = tid & (WARP - 1);
+    const size_t warpId = (size_t)(tid / WARP);
+    const size_t nWarps = (size_t)(nthreads / WARP);
+    const size_t tile = (size_t)U * WARP;
+    const size_t gridStride = nWarps * tile;
+
+    // Software-pipelined source-0 seed: the source-0 tile for the NEXT full
+    // iteration is loaded while the current iteration reduces peers 1..N-1 and
+    // writes its output, hiding source 0's xGMI read latency across grid-stride
+    // iterations (mirrors the next-iteration prefetch in RCCL's symmetric LD
+    // reduceDeep). A warp's full tiles are contiguous with a fixed stride, so at
+    // most one trailing partial tile follows the last full one -- the prefetch
+    // guard (nb + tile <= nPacks) simply skips priming when the next tile is that
+    // partial remainder, which the tail branch handles without a seed.
+    const Pack* src0Base = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0) + myBaseP;
+    size_t wbase = warpId * tile;
+    Pack seed[U];
+    if (wbase + tile <= nPacks) {  // prime the pipeline for this warp's first full tile
+      const Pack* sp = src0Base + wbase + (size_t)lane;
+      #pragma unroll
+      for (int u = 0; u < U; u++) seed[u] = sp[(size_t)u * WARP];
+    }
+    for (; wbase < nPacks; wbase += gridStride) {
+      if (wbase + tile <= nPacks) {
+        // ---- fully coalesced tile: 2*U outstanding 128-bit loads ----
+        // Combine pack-unroll (U packs/source, stride WARP) with PEER-unroll (two
+        // source ranks issued before either reduces): 2*U loads are in flight,
+        // mirroring RCCL's symmetric LD kernel (UnrollPacks=4 x UnrollPeers=2 = 8).
+        // Pack-ILP alone left the per-source dependency chain exposed at large
+        // sizes; adding peer-ILP overlaps consecutive ranks' xGMI read latency and
+        // is what closes the gap to the host path. Ascending source-rank fold
+        // (s, then s+1) is preserved, so the reduction stays bit-for-bit identical.
+        const size_t p0 = wbase + (size_t)lane;  // this lane's first pack
+        T acc[U][VEC];
+        #pragma unroll  // source s == 0: consume the prefetched seed (ascending fold)
+        for (int u = 0; u < U; u++)
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) acc[u][e] = gin_sdma_reduce::preOp(redOp, seed[u].e[e], nRanks);
+        int s = 1;
+        for (; s + 1 < nRanks; s += 2) {
+          const Pack* sa = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s)     + myBaseP + p0;
+          const Pack* sb = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1) + myBaseP + p0;
+          Pack ta[U], tb[U];
+          #pragma unroll
+          for (int u = 0; u < U; u++) ta[u] = sa[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++) tb[u] = sb[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, ta[u].e[e], nRanks));
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, tb[u].e[e], nRanks));
+        }
+        for (; s < nRanks; s++) {  // odd peer tail
+          const Pack* sp = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s) + myBaseP + p0;
+          Pack t[U];
+          #pragma unroll
+          for (int u = 0; u < U; u++) t[u] = sp[(size_t)u * WARP];
+          #pragma unroll
+          for (int u = 0; u < U; u++)
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[u][e] = gin_sdma_reduce::combine(redOp, acc[u][e], gin_sdma_reduce::preOp(redOp, t[u].e[e], nRanks));
+        }
+        // Prefetch source 0 for the next full tile; the loads overlap the output
+        // write below (and the back-edge into the next iteration's peer loads).
+        const size_t nb = wbase + gridStride;
+        if (nb + tile <= nPacks) {
+          const Pack* spn = src0Base + nb + (size_t)lane;
+          #pragma unroll
+          for (int u = 0; u < U; u++) seed[u] = spn[(size_t)u * WARP];
+        }
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+          Pack o;
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[u][e], nRanks);
+          dstP[p0 + (size_t)u * WARP] = o;
+        }
+      } else {
+        // ---- tail: partial warp-tile; each lane covers packs wbase+u*WARP+lane ----
+        #pragma unroll
+        for (int u = 0; u < U; u++) {
+          const size_t pk = wbase + (size_t)u * WARP + (size_t)lane;
+          if (pk >= nPacks) continue;
+          Pack v = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
+          T acc[VEC];
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v.e[e], nRanks);
+          for (int s = 1; s < nRanks; s++) {
+            Pack vs = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
+            #pragma unroll
+            for (int e = 0; e < VEC; e++)
+              acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
+          }
+          Pack o;
+          #pragma unroll
+          for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
+          dstP[pk] = o;
+        }
+      }
+    }
+  }
+
+  // NO exit barrier: this is an own-writes-local pull (each rank writes ONLY its
+  // local recvbuff and reads peers' read-only sendbuffs), so there is no cross-
+  // rank write to publish and no memset race to fence -- the same reasoning that
+  // makes the AllGather LSA pull tier entry-only. The entry barrier already
+  // guarantees every peer's sendbuff is filled before any read; a rank that
+  // finishes early cannot corrupt what a slow peer still reads (sendbuff is never
+  // written by the kernel), and the next collective's entry barrier resynchronizes
+  // before sendbuff is re-read. In the looped timed kernel each iteration's entry
+  // barrier is itself a full inter-iteration sync, so entry-only stays lockstep.
+}
+
+// -D 3 kernel: one ReduceScatter. sdmaThreshold/scratch args retained for ABI.
+template <typename T>
+__global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
+  (void)sdmaThresholdOverride; (void)scratchHandle; (void)root;
+  ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+}
+
+// Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
+// ReduceScatter bodies under ONE persistent launch, bracketing only the timed region
+// with wall_clock64() per CTA. Every body re-derives its entry LSA barrier, which
+// is itself a full inter-iteration sync, so looping is correct with no extra
+// bookkeeping (pure LSA -> no GIN cadence concern).
+template <typename T>
+__global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int loop, int skip, long long* start_time, long long* end_time) {
+  (void)root;
+  for (int i = 0; i < skip + loop; i++) {
+    if (i == skip) {
+      __syncthreads();
+      if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
+    }
+    ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
+}
+
+// ReduceScatter -D 3 launch with an EXPLICIT grid size (gridCtas) instead of the
+// global deviceCtaCount, so the kernel self-selects a size-adaptive CTA count
+// (gin_sdma_reducescatter::reduceScatterCtas) decoupled from -V, like the
+// broadcast/reduce rings. gridCtas must be <= the barrier/lsaBarrier count
+// registered in ReduceScatterGetDevCommRequirements (sized to
+// max(deviceCtaCount, tuned)); the kernel indexes devComm.lsaBarrier by blockIdx.x,
+// so over-launching would corrupt/hang. sdmaThreshold/scratch args are forwarded
+// (inert; retained for ABI). Self-contained here (the target common.h has no
+// testLaunchDeviceKernelThresholdScratchGrid).
+template <typename F>
+static testResult_t ReduceScatterLaunchDeviceKernelGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  return testSuccess;
+}
+#endif
 
 testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl, void* bias = nullptr) {
   if (deviceImpl == 0) {
@@ -61,10 +506,90 @@ testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvb
     char* rptr = (char*)recvbuff + recvoffset;
     NCCLCHECK(ncclReduceScatter(sptr, rptr, count, type, op, comm, stream));
   } else {
-    return testNotImplemented;
+    switch(deviceImpl) {
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+      case 3: {
+        if (count == 0) return testSuccess;
+        // Single-tier LSA read-reduce, launched at a SIZE-ADAPTIVE CTA count
+        // decoupled from -V (mirrors the broadcast/reduce rings). The read-reduce is
+        // occupancy-bound in the grid-stride mid-band (~8-48 MiB) and peaks at ~48
+        // CTAs (33 MiB 88->~100% of host, 16 MiB ->86%), while the warp-unrolled
+        // large tier (>=48 MiB) and the small tier peak at 32 (more CTAs crater the
+        // unroll path, e.g. 67 MiB 249->153). The bare -V default (16) badly
+        // under-launches the mid-band (16 MiB ~46%, 33 MiB ~43% of host); self-
+        // selecting repairs that for callers that don't pass -V. sdmaThreshold/
+        // scratch args stay inert (ABI stability).
+        const ncclDevComm* rsDc = (const ncclDevComm*)comm;
+        const int rsNRanks = (rsDc != nullptr) ? rsDc->nRanks : 1;
+        const size_t rsTotalBytes = count * (size_t)wordSize(type) * (size_t)rsNRanks;
+        static const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
+        const int rsGridCtas = gin_sdma_reducescatter::reduceScatterCtas(rsTotalBytes, rsCtasEnv);
+        TESTCHECK(ReduceScatterLaunchDeviceKernelGrid(SPECIALIZE_REDUCE_KERNEL(GinReduceScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, op, root, comm, stream, gin_sdma_reducescatter::kThresholdUnset, g_rsScratchHandle, rsGridCtas));
+        return testSuccess;
+      }
+#endif
+      default:
+        return testNotImplemented;
+    }
   }
   return testSuccess;
 }
+
+// Device-side (in-kernel wall_clock64) timing for the GIN-SDMA ReduceScatter (-D 3),
+// via the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING
+// (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra #[rs-devtime]
+// line next to the graph numbers), 2=device-time-only (report the in-kernel latency
+// as the out-of-place metric; in-place keeps normal timing). loop/skip via
+// NCCL_GIN_ANVIL_RS_DEVTIME_LOOP/_SKIP (default 10/10).
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
+testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_LOOP", 10);
+  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_SKIP", 10);
+
+  const size_t count = args->nbytes / wordSize(type);   // per-rank output-slice count
+  if (count == 0 || loop < 1) return testSuccess;
+
+  auto kernel = SPECIALIZE_REDUCE_KERNEL(GinReduceScatterTimedKernel, type, op);
+  if (kernel == nullptr) return testSuccess;
+
+  // Match the perf path: self-select the size-adaptive CTA count (decoupled from
+  // -V) so the device-timed number reflects the launched configuration.
+  const int nRanksGlobalCta = args->nProcs * args->nThreads * args->nGpus;
+  const size_t totalBytesCta = count * wordSize(type) * (size_t)nRanksGlobalCta;
+  static const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
+  const int gridCtas = gin_sdma_reducescatter::reduceScatterCtas(totalBytesCta, rsCtasEnv);
+  double devUs = 0.0;
+  TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
+      [&](int i, long long* d_start, long long* d_end) {
+        ncclDevComm* devComm = args->devComms + i;
+        ncclWindow_t sendwin = (ncclWindow_t)(in_place ? args->recvRegHandles[i] : args->sendRegHandles[i]);
+        ncclWindow_t recvwin = (ncclWindow_t)args->recvRegHandles[i];
+        size_t sendoff = in_place ? args->sendInplaceOffset * (size_t)devComm->rank : 0;
+        size_t recvoff = in_place ? args->recvInplaceOffset * (size_t)devComm->rank : 0;
+        kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, sendoff, recvwin, recvoff, count, root, *devComm,
+                 (int)op, loop, skip, d_start, d_end);
+      },
+      &devUs));
+
+  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+
+  if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
+    int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
+    const size_t totalBytes = count * wordSize(type) * (size_t)nRanksGlobal;
+    double sec = devUs * 1.0e-6;
+    double algBw = (double)totalBytes / 1.0e9 / sec;
+    double busBw = algBw * ((double)(nRanksGlobal - 1) / (double)nRanksGlobal);
+    printf("#[rs-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+           totalBytes, gridCtas, loop, skip, devUs, algBw, busBw);
+    fflush(stdout);
+  }
+  return testSuccess;
+}
+#else
+testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
+  return testSuccess;  // device API path not available in this build
+}
+#endif
 
 struct testColl reduceScatterTest = {
   "ReduceScatter",
@@ -73,7 +598,8 @@ struct testColl reduceScatterTest = {
   ReduceScatterGetBw,
   ReduceScatterRunColl,
   ReduceScatterGetAlgoProtoChannels,
-  ReduceScatterGetSymkInfo
+  ReduceScatterGetSymkInfo,
+  ReduceScatterDeviceTime
 };
 
 void ReduceScatterGetBuffSize(size_t *sendcount, size_t *recvcount, size_t count, int nranks) {
@@ -110,11 +636,19 @@ testResult_t ReduceScatterRunTest(struct threadArgs* args, int root, ncclDataTyp
 
   for (int i=0; i<type_count; i++) {
     for (int j=0; j<op_count; j++) {
+      // The GIN device path (deviceImpl != 0) has no PreMulSum ("mulsum") kernel
+      // for any type (deferred), and no prod kernel for fp8; SPECIALIZE_REDUCE_KERNEL
+      // returns nullptr for those, which would abort the op x type matrix on
+      // testNotImplemented. Skip them here so the device sweep only exercises the
+      // implemented combos. The host path (deviceImpl == 0) supports them all via
+      // ncclReduceScatter, so it keeps full coverage.
+      if (deviceImpl != 0) {
+        if (strcmp(run_opnames[j], "mulsum") == 0) continue;
 #if defined(RCCL_FLOAT8)
-// fp8 avg is supported; fp8 prod/mulsum remain out of scope for fp8.
-if((run_types[i] == ncclFloat8e4m3 || run_types[i] == ncclFloat8e5m2) && (run_ops[j] == ncclProd || strcmp(run_opnames[j],"mulsum") == 0))
-    continue;
+        if ((run_types[i] == ncclFloat8e4m3 || run_types[i] == ncclFloat8e5m2) && run_ops[j] == ncclProd)
+          continue;
 #endif
+      }
       TESTCHECK(TimeTest(args, run_types[i], run_typenames[i], run_ops[j], run_opnames[j], -1));
     }
   }
@@ -123,5 +657,8 @@ if((run_types[i] == ncclFloat8e4m3 || run_types[i] == ncclFloat8e5m2) && (run_op
 
 struct testEngine ncclTestEngine = {
   .getBuffSize = ReduceScatterGetBuffSize,
-  .runTest = ReduceScatterRunTest
+  .runTest = ReduceScatterRunTest,
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+  .getDevCommRequirements = ReduceScatterGetDevCommRequirements
+#endif
 };
