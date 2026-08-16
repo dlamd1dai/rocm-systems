@@ -361,11 +361,18 @@ fi
 # gin.put (Anvil-SDMA copy engines). The single NCCL_GIN_ANVIL_SDMA_THRESHOLD
 # governs both the kernel LSA<->put crossover (rsCtx->sdmaThreshold) and the
 # gin.put inline-vs-copy-engine selection, so one value cleanly separates the
-# tiers. Default 2 MiB/rank exercises LSA for small/mid and SDMA for large; set
-# AG_THRESHOLD=0 to force all-SDMA puts, or a huge value to force all-LSA.
+# tiers. Default 32 KiB/rank is the measured LSA<->SDMA crossover on 8x MI355X
+# (gfx950): LSA-direct xGMI stores win at/below it (lower latency, but plateau
+# ~6.3 GB/s), Anvil-SDMA copy engines win above it (scale to ~390 GB/s). At
+# 32 KiB/rank LSA (~5.6 GB/s) still edges SDMA; by 64 KiB/rank SDMA (~9 GB/s)
+# pulls ahead and the gap widens fast (~10x by 2 MiB/rank), so the old 2 MiB
+# default left large gathers stuck on the slow tier. Set AG_THRESHOLD=0 to force
+# all-SDMA puts, or a value >= the max per-rank chunk to force all-LSA (note: the
+# backend reads this env as a 32-bit int, so keep it < 2^31; values >= 2 GiB wrap
+# and are treated as 0/all-SDMA).
 if _run_test 3; then
   _trace_on
-  AG_THRESHOLD="${AG_THRESHOLD:-2097152}"
+  AG_THRESHOLD="${AG_THRESHOLD:-32768}"
   AG_CTA_COUNT="${AG_CTA_COUNT:-8}"
   TEST3_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${AG_THRESHOLD}"
