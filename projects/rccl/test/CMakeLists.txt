@@ -401,6 +401,42 @@ if(BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test")
     add_test(NAME rccl-UnitTestsGinSdmaReduceOps COMMAND rccl-UnitTestsGinSdmaReduceOps)
     set_tests_properties(rccl-UnitTestsGinSdmaReduceOps PROPERTIES LABELS "unit")
+
+    # GIN-SDMA AllReduce reduction-ops ON-GPU correctness test. Compiles the
+    # device-only gin_sdma_reduce.h UNCHANGED for the GPU (real __device__
+    # intrinsics) with the REAL element types -- __half, hip_bfloat16, and the
+    # fp8 e4m3/e5m2 rccl_float8/rccl_bfloat8 -- and folds actual contributions in
+    # a kernel on hardware. This validates the one thing the host companion
+    # cannot: the exact low-precision narrow-on-every-step rounding that must
+    # bit-match verifiable.cu, using the real f32<->f8/f16/bf16 hardware
+    # conversions. Two layers: hand-computed exact-value checks plus a broad
+    # randomized device-vs-host-spec bit-match. Requires a visible GPU at run
+    # time (skips cleanly otherwise), so it carries a "gpu" label alongside
+    # "unit" for filtering on CPU-only runners.
+    if (EXISTS "${_gin_sdma_ar_policy_hdr_dir}/rccl_float8.h")
+      add_executable(rccl-UnitTestsGinSdmaReduceOpsGpu gin/gin_sdma_reduce_ops_gpu_test.cpp)
+      target_include_directories(rccl-UnitTestsGinSdmaReduceOpsGpu PRIVATE
+        "${_gin_sdma_ar_policy_hdr_dir}")
+      # Offload for the configured GPU arch(s); hipcc (the CXX compiler) handles
+      # the HIP language, so no separate enable_language(HIP) is needed.
+      set(_gin_sdma_ar_gpu_offload "")
+      foreach(_g IN LISTS GPU_TARGETS)
+        if(_g)
+          list(APPEND _gin_sdma_ar_gpu_offload "--offload-arch=${_g}")
+        endif()
+      endforeach()
+      if(_gin_sdma_ar_gpu_offload)
+        target_compile_options(rccl-UnitTestsGinSdmaReduceOpsGpu PRIVATE ${_gin_sdma_ar_gpu_offload})
+        target_link_options(rccl-UnitTestsGinSdmaReduceOpsGpu PRIVATE ${_gin_sdma_ar_gpu_offload})
+      endif()
+      target_link_libraries(rccl-UnitTestsGinSdmaReduceOpsGpu PRIVATE
+        ${GTEST_BOTH_LIBRARIES} hip::host hip::device Threads::Threads)
+      set_target_properties(rccl-UnitTestsGinSdmaReduceOpsGpu PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test"
+        CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+      add_test(NAME rccl-UnitTestsGinSdmaReduceOpsGpu COMMAND rccl-UnitTestsGinSdmaReduceOpsGpu)
+      set_tests_properties(rccl-UnitTestsGinSdmaReduceOpsGpu PROPERTIES LABELS "unit;gpu")
+    endif()
   else()
     message(STATUS "Skipping GIN-SDMA AllReduce host unit tests (sibling rccl-tests checkout not found at ${_gin_sdma_ar_policy_hdr_dir})")
   endif()
