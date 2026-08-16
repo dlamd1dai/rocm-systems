@@ -4,7 +4,10 @@
 #
 # Usage: ./gin-sdma-ar-test.bash [NP] [MAX_BYTES]
 #   NP         ranks / local GPUs (default 8)
-#   MAX_BYTES  max message size for the -b..-e sweep (default 128M)
+#   MAX_BYTES  max message size for the -b..-e sweep (default 128M; up to 4G ok)
+#   MIN_BYTES  env: min message size for the sweep (default 128)
+#   GIN_CONN_RETRIES env: re-launch the GIN test up to N times on the intermittent
+#              gfx950 cuMem-VMM connectivity-gate abort (default 5; 0 disables)
 #
 # Tests (RCCL_GIN_RUN_TESTS, comma list; default "0,5"):
 #   0 = host baseline  : all_reduce_perf -D 0 (ncclAllReduce) reference busbw + datacheck
@@ -49,6 +52,16 @@ AR_CTA_COUNT="${AR_CTA_COUNT:-8}"
 # default GIN-SDMA AllReduce. d6 = two-launch (RS kernel then AG kernel on the
 # same stream; boundary = launch boundary, cannot deadlock on grid size).
 AR_MODE="${AR_MODE:-d5}"
+
+# [CONN-GATE-RETRY] The RCCL GIN anvil-sdma plugin runs an LSA signal
+# connectivity gate at communicator init. On gfx950 (MI300/350/355) a cuMem-VMM
+# peer mapping can intermittently come up broken; the plugin detects this and
+# aborts (instead of hanging) with "LSA signal connectivity gate failed ...
+# Re-launch the job". The fault is far more frequent when the registered
+# symmetric window is large (multi-GiB -e), so re-launch the GIN test up to
+# GIN_CONN_RETRIES times when we see that specific gate abort. Set to 0 to
+# disable retries.
+GIN_CONN_RETRIES="${GIN_CONN_RETRIES:-5}"
 
 _run_test() { [[ ",${RCCL_GIN_RUN_TESTS}," == *",$1,"* ]]; }
 _trace_on()  { [[ "${RCCL_GIN_ECHO:-1}" == 1 ]] && set -x; return 0; }
@@ -106,6 +119,12 @@ _check_datacheck() {  # $1=logfile $2=label
   tail -n 40 "$1" >&2
   echo "----------------------------------------------------------------------" >&2
   return 1
+}
+
+# True if the log shows the intermittent gfx950 cuMem-VMM peer-map fault that the
+# GIN plugin's connectivity gate aborts on (safe/expected to re-launch).
+_is_conn_gate_fault() {  # $1=logfile
+  grep -qE "LSA signal connectivity gate failed|cuMem-VMM peer-map fault|cuMem VMM peer mapping broken" "$1"
 }
 
 _common_perf_args() {  # $1=deviceImpl
@@ -187,21 +206,36 @@ if _run_test 5; then
   echo "=== Test#5: AllReduce, ${NP} gpus, GIN Anvil-SDMA -D ${_ar_impl} (${AR_MODE}, op=${AR_OP}, ${AR_DTYPE}, V=${AR_CTA_COUNT}, NCCL_GIN_TYPE=5, devtime=${AR_DEVICE_TIMING}, w=${AR_WARMUP}, n=${AR_ITERS}) ==="
   mapfile -t _args < <(_common_perf_args "${_ar_impl}")
   _log5="$(mktemp)"
-  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
-    mpirun -n "${NP}" ${MPI_OPT} \
-    "${MPI_BASE[@]}" \
-    "${GIN_PLUGIN_X[@]}" \
-    -x NCCL_CUMEM_ENABLE=1 \
-    -x NCCL_NET_PLUGIN=none \
-    -x NCCL_ENV_PLUGIN=none \
-    -x ROCSHMEM_SDMA_ENABLED=0 \
-    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
-    -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=5 \
-    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${AR_NUM_CHANNELS:-1}" \
-    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    "${AR_MPI_EXTRA[@]}" \
-    rccl-tests/all_reduce_perf "${_args[@]}" 2>&1 | tee "${_log5}"
+  _attempt=1
+  _max_attempts=$(( GIN_CONN_RETRIES + 1 ))
+  while :; do
+    ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+      mpirun -n "${NP}" ${MPI_OPT} \
+      "${MPI_BASE[@]}" \
+      "${GIN_PLUGIN_X[@]}" \
+      -x NCCL_CUMEM_ENABLE=1 \
+      -x NCCL_NET_PLUGIN=none \
+      -x NCCL_ENV_PLUGIN=none \
+      -x ROCSHMEM_SDMA_ENABLED=0 \
+      -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
+      -x NCCL_GIN_ENABLE=1 \
+      -x NCCL_GIN_TYPE=5 \
+      -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${AR_NUM_CHANNELS:-1}" \
+      -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+      "${AR_MPI_EXTRA[@]}" \
+      rccl-tests/all_reduce_perf "${_args[@]}" 2>&1 | tee "${_log5}"
+    # Re-launch only for the intermittent gfx950 cuMem-VMM connectivity-gate
+    # abort; a genuine datacheck mismatch is a real failure and must not retry.
+    if ! grep -qE "Out of bounds values : 0 OK" "${_log5}" \
+       && _is_conn_gate_fault "${_log5}" \
+       && [[ "${_attempt}" -lt "${_max_attempts}" ]]; then
+      echo "=== Test#5 GIN -D ${_ar_impl}: gfx950 cuMem-VMM connectivity-gate fault on attempt ${_attempt}/${_max_attempts}; re-launching ===" >&2
+      _attempt=$(( _attempt + 1 ))
+      sleep 3
+      continue
+    fi
+    break
+  done
   _check_datacheck "${_log5}" "Test#5 GIN -D ${_ar_impl}" || RC=1
   rm -f "${_log5}"
   _trace_off
