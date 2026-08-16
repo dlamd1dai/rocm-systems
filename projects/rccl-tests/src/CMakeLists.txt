@@ -73,6 +73,7 @@ set(COMMON_FILES
   collector.cu
   common.h
   common.cu
+  gin_sdma_allgather_policy.h
   gin_sdma_devtime.h
   nccl1_compat.h
   rccl_compat.h
@@ -152,6 +153,13 @@ if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
     # from this executable (librccl.so is built with ENABLE_ROCSHMEM_GIN which
     # leaves rocshmem host symbols unresolved)
     target_link_options(alltoall_perf PRIVATE -fgpu-rdc --hip-link ${_rocshmem_offload_arch_flags} -rdynamic)
+
+    # GIN-SDMA hybrid AllGather (all_gather_perf -D 3): same device-RDC link as
+    # alltoall_perf so the GinHybridAllGatherKernel resolves the GIN device backend.
+    target_compile_definitions(all_gather_perf PRIVATE ENABLE_ROCSHMEM_GIN)
+    target_compile_options(all_gather_perf PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
+    target_link_libraries(all_gather_perf PRIVATE roc::rocshmem)
+    target_link_options(all_gather_perf PRIVATE -fgpu-rdc --hip-link ${_rocshmem_offload_arch_flags} -rdynamic)
 endif()
 if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem AND RCCL_SOURCE_DIR)
     add_executable(gin_rocshmem_gda_factory_test ${CMAKE_CURRENT_SOURCE_DIR}/gin_rocshmem_gda_factory_test.cu)
