@@ -114,16 +114,19 @@ GIN_SDMA_RS_HD inline DevReqs reduceScatterDevReqs(int deviceCtaCount) {
 // ReduceScatter -D 3 size-adaptive CTA count (decoupled from -V, mirrors the
 // broadcast/reduce rings). The LSA read-reduce is occupancy-bound in the
 // grid-stride mid-band [kReduceScatterCtaMidLo, kReduceScatterCtaMidHi): ~48 CTAs
-// peaks there (33 MiB 88->~100% of host, 16 MiB ->86%), while the small tier and
-// the warp-unrolled large tier (>= kReduceScatterCtaMidHi) peak at 32 -- more CTAs
-// crater the unroll path (67 MiB 249->153 busbw at 64 CTAs). The bare -V default
-// (16) badly under-launches the mid-band (16 MiB ~46%, 33 MiB ~43% of host);
-// self-selecting repairs that for callers that don't pass -V.
-// NCCL_GIN_ANVIL_RS_CTAS pins a fixed count for all sizes (diagnostic).
+// peaks there (33 MiB ~100% of host, 16 MiB ->98%), while the small tier and the
+// large sizes (>= kReduceScatterCtaMidHi) peak at 32 -- more CTAs add xGMI incast
+// (4 MiB 194->168 busbw at 48 CTAs; large sizes prefer 32 even now that the grid-
+// stride 8-way path covers them). The bare -V default (16) badly under-launches
+// the mid-band (16 MiB ~46%, 33 MiB ~43% of host); self-selecting repairs that for
+// callers that don't pass -V. NCCL_GIN_ANVIL_RS_CTAS pins a fixed count (diagnostic).
+// NOTE: the shipped kernel now runs the grid-stride path for ALL sizes (the warp-
+// unroll large tier is disabled by default, see reduce_scatter.cu ReduceScatter-
+// UnrollMinBytes); this ladder's >=kReduceScatterCtaMidHi arm applies to that path.
 static constexpr int    kReduceScatterCtasMid   = 48;                    // grid-stride mid-band
-static constexpr int    kReduceScatterCtasOther = 32;                    // small + warp-unroll large
+static constexpr int    kReduceScatterCtasOther = 32;                    // small + large sizes
 static constexpr size_t kReduceScatterCtaMidLo  = 8ull  * 1024 * 1024;   // >= -> mid band
-static constexpr size_t kReduceScatterCtaMidHi  = 48ull * 1024 * 1024;   // <  -> mid band (== RS_UNROLL_MIN)
+static constexpr size_t kReduceScatterCtaMidHi  = 48ull * 1024 * 1024;   // <  -> mid band
 GIN_SDMA_RS_HD inline int reduceScatterCtas(size_t totalBytes, size_t envCtas) {
   if (envCtas != kThresholdUnset && envCtas > 0)
     return (envCtas > 128) ? 128 : (int)envCtas;

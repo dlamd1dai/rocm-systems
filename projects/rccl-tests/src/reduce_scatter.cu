@@ -56,6 +56,23 @@ static inline size_t ReduceScatterParseCtasEnv(const char* name) {
   return (size_t)v;
 }
 
+// Mid/large SCHEDULE crossover (total message bytes) for the -D 3 read-reduce.
+// DEFAULT 0 -> the warp-unroll large tier is DISABLED and the mid grid-stride path
+// (8-way peer ILP + source-0 prefetch) runs for all sizes. Measured on 8x MI355X,
+// the improved mid tier beats the old warp-unroll large tier at EVERY size >= 64 MiB
+// (64 MiB 246->370, 128 MiB 300->389, 2 GiB 383->409 GB/s busBw) and matches it at
+// 32 MiB, so the large tier -- tuned for the earlier 4-way mid loop -- is obsolete.
+// NCCL_GIN_ANVIL_RS_UNROLL_MIN (MiB, e.g. "48") re-enables the large tier at that
+// crossover for diagnostics/regression; absent/unparseable -> the 0 default.
+static inline size_t ReduceScatterUnrollMinBytes() {
+  const char* e = getenv("NCCL_GIN_ANVIL_RS_UNROLL_MIN");
+  if (e == nullptr || e[0] == '\0') return 0;
+  char* end = nullptr;
+  unsigned long long mib = strtoull(e, &end, 10);
+  if (end == e) return 0;
+  return (size_t)mib << 20;
+}
+
 // Op-aware dispatch for the reduction collective (ReduceScatter). Unlike the
 // shared SPECIALIZE_KERNEL (which forces op==ncclSum), this selects kernel<T>
 // across the full element-type set for any built-in reduction op
@@ -232,7 +249,7 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // (see the file-top note). The sdmaThreshold/scratch launch args are retained for
 // ABI compatibility but unused.
 template <typename T>
-__device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, int redOp) {
+__device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, int redOp, size_t unrollMinBytes) {
   const int nRanks = devComm.nRanks;
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
   const int nthreads = blockDim.x * gridDim.x;
@@ -253,21 +270,20 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
   // Adaptive load schedule. Both branches are the identical direct LSA read-reduce
   // (same ascending source-rank fold, bit-for-bit); they differ ONLY in how loads
   // are scheduled:
-  //   * small/mid (< RS_UNROLL_MIN total bytes): a register-light grid-stride loop
-  //     (one 128-bit load per iter) that maximizes wave occupancy -- best latency
-  //     hiding when there isn't enough data to saturate xGMI via ILP alone.
-  //   * large: a warp-strided loop unrolled over packs AND peers -- U independent
-  //     128-bit loads per source rank (each fully coalesced across the warp) times
-  //     two source ranks in flight = 2*U outstanding loads, mirroring RCCL's
-  //     symmetric LD UnrollPacks=4 x UnrollPeers=2. Pack-ILP fills the per-source
-  //     pipe; peer-ILP overlaps consecutive sources' latency -- saturates xGMI at
-  //     large sizes (~parity with host).
-  // The crossover (~48 MiB total) is where the unrolled path measurably overtakes
-  // the occupancy-bound loop on 8x MI355X; below it the grid-stride loop is faster.
-  constexpr size_t RS_UNROLL_MIN = (size_t)48 << 20;  // 48 MiB total message
+  //   * grid-stride path (DEFAULT for ALL sizes): a register-light grid-stride loop
+  //     (one 128-bit pack per thread) with FULL N-way peer ILP + source-0 prefetch.
+  //     Maximizes wave occupancy AND outstanding loads; measured fastest across the
+  //     whole 8x MI355X sweep.
+  //   * warp-unroll path (LEGACY, off by default): a warp-strided loop unrolled over
+  //     packs AND peers (2*U outstanding loads, mirroring RCCL's symmetric LD
+  //     UnrollPacks=4 x UnrollPeers=2). This was the large-size tier when the grid-
+  //     stride loop only did 4-way ILP; the 8-way + prefetch loop now BEATS it at
+  //     every size >= 64 MiB, so it is disabled unless NCCL_GIN_ANVIL_RS_UNROLL_MIN
+  //     re-enables it at a chosen MiB crossover (diagnostics/regression only).
+  const size_t RS_UNROLL_MIN = unrollMinBytes;
   const size_t totalBytes = count * (size_t)nRanks * sizeof(T);
 
-  if (totalBytes < RS_UNROLL_MIN) {
+  if (RS_UNROLL_MIN == 0 || totalBytes < RS_UNROLL_MIN) {
     // ---- small/mid: high-occupancy grid-stride, FULL N-way PEER ILP + src0 prefetch ----
     // One pack per thread (register-light -> max wave occupancy). This band is
     // xGMI-read-LATENCY bound (the host ring fans out to ~128 WarpSpeed channels
@@ -486,9 +502,9 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
 
 // -D 3 kernel: one ReduceScatter. sdmaThreshold/scratch args retained for ABI.
 template <typename T>
-__global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle) {
+__global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, size_t sdmaThresholdOverride, int redOp, ncclDevResourceHandle scratchHandle, size_t unrollMinBytes) {
   (void)sdmaThresholdOverride; (void)scratchHandle; (void)root;
-  ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+  ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp, unrollMinBytes);
 }
 
 // Device-timing kernel (shared gin_devtime methodology): run skip+loop back-to-back
@@ -497,14 +513,14 @@ __global__ void GinReduceScatterKernel(ncclWindow_t sendwin, size_t sendoffset, 
 // is itself a full inter-iteration sync, so looping is correct with no extra
 // bookkeeping (pure LSA -> no GIN cadence concern).
 template <typename T>
-__global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int loop, int skip, long long* start_time, long long* end_time) {
+__global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm, int redOp, int loop, int skip, long long* start_time, long long* end_time, size_t unrollMinBytes) {
   (void)root;
   for (int i = 0; i < skip + loop; i++) {
     if (i == skip) {
       __syncthreads();
       if (threadIdx.x == 0) start_time[blockIdx.x] = wall_clock64();
     }
-    ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp);
+    ginReduceScatterBody<T>(sendwin, sendoffset, recvwin, recvoffset, count, devComm, redOp, unrollMinBytes);
   }
   __syncthreads();
   if (threadIdx.x == 0) end_time[blockIdx.x] = wall_clock64();
@@ -520,13 +536,13 @@ __global__ void GinReduceScatterTimedKernel(ncclWindow_t sendwin, size_t sendoff
 // (inert; retained for ABI). Self-contained here (the target common.h has no
 // testLaunchDeviceKernelThresholdScratchGrid).
 template <typename F>
-static testResult_t ReduceScatterLaunchDeviceKernelGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas) {
+static testResult_t ReduceScatterLaunchDeviceKernelGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclDevResourceHandle scratchHandle, int gridCtas, size_t unrollMinBytes) {
   if (kernel == nullptr) return testNotImplemented;
   ncclDevComm* devComm = (ncclDevComm*)comm;
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
   if (gridCtas < 1) gridCtas = 1;
-  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle);
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, (int)op, scratchHandle, unrollMinBytes);
   return testSuccess;
 }
 #endif
@@ -541,21 +557,22 @@ testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvb
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         if (count == 0) return testSuccess;
-        // Single-tier LSA read-reduce, launched at a SIZE-ADAPTIVE CTA count
-        // decoupled from -V (mirrors the broadcast/reduce rings). The read-reduce is
-        // occupancy-bound in the grid-stride mid-band (~8-48 MiB) and peaks at ~48
-        // CTAs (33 MiB 88->~100% of host, 16 MiB ->86%), while the warp-unrolled
-        // large tier (>=48 MiB) and the small tier peak at 32 (more CTAs crater the
-        // unroll path, e.g. 67 MiB 249->153). The bare -V default (16) badly
-        // under-launches the mid-band (16 MiB ~46%, 33 MiB ~43% of host); self-
-        // selecting repairs that for callers that don't pass -V. sdmaThreshold/
-        // scratch args stay inert (ABI stability).
+        // Single-tier LSA read-reduce (grid-stride, 8-way peer ILP + src0 prefetch;
+        // the warp-unroll large tier is off by default -- see ReduceScatterUnrollMin-
+        // Bytes), launched at a SIZE-ADAPTIVE CTA count decoupled from -V (mirrors the
+        // broadcast/reduce rings). It is occupancy-bound in the grid-stride mid-band
+        // (~8-48 MiB) and peaks at ~48 CTAs (33 MiB ~100% of host, 16 MiB ->98%);
+        // small and >=48 MiB sizes peak at 32 (more CTAs add xGMI incast, e.g. 4 MiB
+        // 194->168 at 48 CTAs). The bare -V default (16) badly under-launches the
+        // mid-band; self-selecting repairs that for callers that don't pass -V.
+        // sdmaThreshold/scratch args stay inert (ABI stability).
         const ncclDevComm* rsDc = (const ncclDevComm*)comm;
         const int rsNRanks = (rsDc != nullptr) ? rsDc->nRanks : 1;
         const size_t rsTotalBytes = count * (size_t)wordSize(type) * (size_t)rsNRanks;
         static const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
         const int rsGridCtas = gin_sdma_reducescatter::reduceScatterCtas(rsTotalBytes, rsCtasEnv);
-        TESTCHECK(ReduceScatterLaunchDeviceKernelGrid(SPECIALIZE_REDUCE_KERNEL(GinReduceScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, op, root, comm, stream, gin_sdma_reducescatter::kThresholdUnset, g_rsScratchHandle, rsGridCtas));
+        static const size_t rsUnrollMin = ReduceScatterUnrollMinBytes();
+        TESTCHECK(ReduceScatterLaunchDeviceKernelGrid(SPECIALIZE_REDUCE_KERNEL(GinReduceScatterKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, op, root, comm, stream, gin_sdma_reducescatter::kThresholdUnset, g_rsScratchHandle, rsGridCtas, rsUnrollMin));
         return testSuccess;
       }
 #endif
@@ -589,6 +606,7 @@ testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t typ
   const size_t totalBytesCta = count * wordSize(type) * (size_t)nRanksGlobalCta;
   static const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
   const int gridCtas = gin_sdma_reducescatter::reduceScatterCtas(totalBytesCta, rsCtasEnv);
+  static const size_t rsUnrollMin = ReduceScatterUnrollMinBytes();
   double devUs = 0.0;
   TESTCHECK(gin_devtime::measure(args, gridCtas, loop,
       [&](int i, long long* d_start, long long* d_end) {
@@ -598,7 +616,7 @@ testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t typ
         size_t sendoff = in_place ? args->sendInplaceOffset * (size_t)devComm->rank : 0;
         size_t recvoff = in_place ? args->recvInplaceOffset * (size_t)devComm->rank : 0;
         kernel<<<gridCtas, 512, 0, args->streams[i]>>>(sendwin, sendoff, recvwin, recvoff, count, root, *devComm,
-                 (int)op, loop, skip, d_start, d_end);
+                 (int)op, loop, skip, d_start, d_end, rsUnrollMin);
       },
       &devUs));
 
