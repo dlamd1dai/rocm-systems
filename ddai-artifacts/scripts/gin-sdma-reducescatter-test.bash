@@ -15,9 +15,13 @@
 #          reads its owned output slice directly from EVERY peer's sendbuff via LSA
 #          and folds the N contributions in ascending source-rank order (bit-for-bit
 #          matching rccl-tests' verifiable oracle). SINGLE-TIER balanced LSA
-#          read-reduce for all sizes (the load SCHEDULE adapts by total bytes:
-#          grid-stride 4-peer ILP < 48 MiB, warp-strided pack+peer unroll above);
-#          no scratch, no signals, entry LSA barrier only.
+#          read-reduce for all sizes: a grid-stride loop with FULL N-way peer ILP
+#          + source-0 cross-iteration prefetch, which beats the host ring across the
+#          whole >=64 MiB range and matches host DDA in the medium band. (A legacy
+#          warp-strided pack+peer unroll tier exists but is DISABLED by default --
+#          the 8-way grid-stride path now wins at every size; re-enable it at a
+#          chosen MiB crossover via NCCL_GIN_ANVIL_RS_UNROLL_MIN for regression.)
+#          No scratch, no signals, entry LSA barrier only.
 #
 # The SM reduction mirrors rccl-tests' verifiable oracle exactly (see
 # gin_sdma_reduce.h), so correctness holds across ops/types; fp8 prod & mulsum
