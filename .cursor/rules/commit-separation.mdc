@@ -1,0 +1,34 @@
+---
+description: Never mix ddai-artifacts/ and projects/ changes in one git commit
+alwaysApply: true
+---
+
+# Commit separation: ddai-artifacts/ vs projects/
+
+NEVER stage or commit files under `ddai-artifacts/` together with files under
+`projects/` in the same git commit. These two trees must always go into separate
+commits.
+
+When a change touches both trees:
+
+1. Stage and commit the `projects/` files in one commit.
+2. Stage and commit the `ddai-artifacts/` files in a separate commit.
+
+The order between the two is not important, but they must never share a commit.
+
+Example (two changed files, one in each tree):
+
+```bash
+# ✅ GOOD — two separate commits
+git add projects/rccl-tests/src/reduce_scatter.cu
+git commit -m "rccl-tests: ..."
+git add ddai-artifacts/scripts/gin-sdma-reducescatter-test.bash
+git commit -m "artifacts: ..."
+
+# ❌ BAD — both trees in one commit
+git add projects/... ddai-artifacts/...
+git commit -m "..."
+```
+
+When using `git commit -a` or `git add -A`/`git add .`, check `git status`
+first and stage each tree explicitly so the two never end up in one commit.
