@@ -5,6 +5,8 @@
 # chunks <= AG_THRESHOLD, all-peers GIN puts (SDMA copy engines) above it.
 # Usage: ./gin-sdma-ag-test.bash [NP] [MAX_BYTES]
 # Tests: #0 host baseline (-D 0), #3 GIN Anvil-SDMA (-D 3). Select via RUN_TESTS.
+# Optional device timing (Test#3): AG_DEVICE_TIMING=1|2 prints/reports the in-kernel
+# wall_clock64 latency (AG_DEVTIME_LOOP/AG_DEVTIME_SKIP default to AG_ITERS/AG_WARMUP).
 
 NP=${1:-8}
 MAX_BYTES="${2:-128M}"
@@ -376,9 +378,27 @@ if _run_test 3; then
   _trace_on
   AG_THRESHOLD="${AG_THRESHOLD:-32768}"
   AG_CTA_COUNT="${AG_CTA_COUNT:-8}"
+  # Optional in-kernel (wall_clock64) device-time measurement for the hybrid
+  # AllGather, via the shared gin_devtime scaffold (AllGatherDeviceTime). It times
+  # ONLY the device function body -- excludes host launch, stream/graph, and
+  # teardown overhead. Mirrors the A2A harness knobs. Modes (NCCL_GIN_ANVIL_DEVICE_TIMING):
+  #   0 = off (default).
+  #   1 = augment: normal graph/hipEvent run PLUS an extra "#[ag-devtime]" line.
+  #   2 = device-time-only: skip the graph/hipEvent timed loop for the out-of-place
+  #       pass and report the device time as THE metric (warmup + datacheck still
+  #       run for #wrong). Fastest, cleanest single number.
+  # The mode env is the shared NCCL_GIN_ANVIL_DEVICE_TIMING (common.cu also honors
+  # the legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING); LOOP/SKIP are AG-specific and
+  # default to the shared harness counts so the measurement window matches -w/-n.
+  AG_DEVICE_TIMING="${AG_DEVICE_TIMING:-0}"
+  AG_DEVTIME_LOOP="${AG_DEVTIME_LOOP:-${AG_ITERS}}"
+  AG_DEVTIME_SKIP="${AG_DEVTIME_SKIP:-${AG_WARMUP}}"
   TEST3_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER=${AG_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=${AG_NUM_CHANNELS:-1}"
+    -x "NCCL_GIN_ANVIL_DEVICE_TIMING=${AG_DEVICE_TIMING}"
+    -x "NCCL_GIN_ANVIL_AG_DEVTIME_LOOP=${AG_DEVTIME_LOOP}"
+    -x "NCCL_GIN_ANVIL_AG_DEVTIME_SKIP=${AG_DEVTIME_SKIP}"
   )
   _ag_gin() {  # re-launchable GIN AllGather run (stdout+stderr -> $1)
     ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
