@@ -359,7 +359,7 @@ fi
 # GinHybridAllGatherKernel (NCCL_GIN_TYPE=5): per-rank chunk <= AG_THRESHOLD uses
 # a direct LSA all-peers store (xGMI); above it uses one-round all-peers
 # gin.put (Anvil-SDMA copy engines). The kernel SELF-SELECTS a size-adaptive CTA
-# count decoupled from -V (like ReduceScatter): ~16 CTAs for the LSA-direct tier
+# count decoupled from -V: ~16 CTAs for the LSA-direct tier
 # (grid-stride store scales with threads) and few (4) for the GIN-put/SDMA tier
 # (only nRanks threads issue the puts, so extra CTAs are pure barrier overhead;
 # fixed -V 32 cost ~13% at 8 MiB, ~21% at 512 KiB). -V/AG_CTA_COUNT now only sizes
