@@ -156,7 +156,15 @@ std::string rccl_output_file;
 std::string rccl_output_format;
 static int report_cputime = 0;
 static int report_timestamps = 0;
-static int deviceImpl = 0;
+int deviceImpl = 0;  // non-static: per-collective device-timing hooks read this to pick the matching timed kernel
+int deviceTimingMode = 0;
+int devtimeLoop = 10;
+int devtimeSkip = 10;
+int devtimeLoopMid = 0;
+int devtimeLoopLarge = 0;
+int devtimeSkipMid = -1;
+int devtimeSkipLarge = -1;
+int devtimeCheck = 0;
 int unalign = 0;
 int memory_report = 0;
 
@@ -661,6 +669,10 @@ void ReduceProcessMaxIterTimes(double* iterTimes, const double* allProcessTimes,
   }
 }
 
+// Explicit instantiations so other TUs (e.g. gin_sdma_devtime.h via alltoall.cu)
+// can call Allreduce through the common.h declaration.
+template void Allreduce<double>(struct threadArgs* args, double* value, int average);
+template void Allreduce<long long>(struct threadArgs* args, long long* value, int average);
 testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int64_t *wrongElts) {
   int nranks = args->nProcs*args->nGpus*args->nThreads;
   size_t count = args->expectedBytes/wordSize(type);
@@ -946,10 +958,21 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   Barrier(args);
 
+  // Device-time-only mode (--device_timing=2): for collectives that provide a
+  // device-timing hook, skip the host/graph timed loop entirely and report the
+  // in-kernel wall_clock64 measurement as the metric. Warmup and datacheck still
+  // run (correctness). Mode 1 keeps the normal timed loop and augments with an
+  // extra line; mode 0 is off.
+  const int devTimeMode =
+      (deviceImpl != 0 && args->collTest->deviceTime != nullptr) ? deviceTimingMode : 0;
+  // Device-time-only applies to the out-of-place pass (the reported metric). The
+  // in-place pass keeps normal timing so its column stays valid.
+  const bool deviceOnly = (devTimeMode == 2) && (in_place == 0);
+
 #if HIP_VERSION >= 50221310
   std::vector<cudaGraph_t> graphs(args->nGpus);
   std::vector<cudaGraphExec_t> graphExec(args->nGpus);
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     // Begin cuda graph capture
     for (int i=0; i<args->nGpus; i++) {
       // Thread local mdoe is needed for:
@@ -968,25 +991,27 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   double collOnlySec = 0;
   int pairedEvents = record && blocking_coll == 3;
   timer tim;
-  for (int iter = 0; iter < iters; iter++) {
-    double t0 = tim.elapsed();
-    if (agg_iters>1) NCCLCHECK(ncclGroupStart());
-    if (record) TESTCHECK(recordEvents(args, iters, iter));
-    for (int aiter = 0; aiter < agg_iters; aiter++) {
-      TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
-    }
-    if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
-    if (blocking_coll == 3) {
-      TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
-      if (pairedEvents) TESTCHECK(recordEvents(args, iters, iter, 1));
-      collOnlySec += tim.elapsed() - t0;
-      Barrier(args);
+  if (!deviceOnly) {
+    for (int iter = 0; iter < iters; iter++) {
+      double t0 = tim.elapsed();
+      if (agg_iters>1) NCCLCHECK(ncclGroupStart());
+      if (record) TESTCHECK(recordEvents(args, iters, iter));
+      for (int aiter = 0; aiter < agg_iters; aiter++) {
+        TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
+      }
+      if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
+      if (blocking_coll == 3) {
+        TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
+        if (pairedEvents) TESTCHECK(recordEvents(args, iters, iter, 1));
+        collOnlySec += tim.elapsed() - t0;
+        Barrier(args);
+      }
     }
   }
   if (record && !pairedEvents) TESTCHECK(recordEvents(args, iters, iters));
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     // HIP (and CUDA) graph limitation: in single-process multi-GPU mode (-g N),
     // graph nodes are associated with the calling thread's current device at
     // capture time, not the stream's device. RCCL internally calls cudaSetDevice()
@@ -1057,10 +1082,64 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     TESTCHECK(destroyEvents(args, iters));
   }
 
-  Allreduce(args, &deltaSec, average);
+  if (!deviceOnly) Allreduce(args, &deltaSec, average);
+
+  if (deviceOnly) {
+    // The reported metric is the in-kernel wall_clock64 device latency
+    // (per iteration, max across ranks), measured by the collective's hook.
+    // Note: the datacheck loop below re-inits buffers and re-runs the PRODUCTION
+    // kernel via startColl before CheckData, so it validates the production path,
+    // not the timed kernel (whose output is overwritten first). By default the
+    // *TimedKernel bodies call the same __device__ collective functions as the
+    // production kernels, so collective correctness is covered; only the timing-only
+    // loop/skip/stamp wrapper around them is not exercised by that datacheck.
+    // deviceTime() leaves this negative when the timing hook produced no
+    // measurement -- the timed kernel never ran (non-GIN impl, unsupported op/type,
+    // count == 0, or loop < 1). Reporting that as the metric would divide by zero in
+    // getBw (0.00 us / inf GB/s), and the DEVTIME_CHECK below would validate a stale
+    // buffer -- the warmup/production result (false pass), or raw init scratch under
+    // -w 0 (false fail) -- for a kernel that never executed. So WARN once and skip
+    // this row rather than emit a bogus metric or a misleading check verdict.
+    double deviceDeltaSec = -1.0;
+    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, &deviceDeltaSec));
+    if (deviceDeltaSec <= 0.0) {
+      if (args->proc == 0 && args->thread == 0) {
+        fprintf(stderr, "# WARN --device_timing=2: no in-kernel device-time "
+                        "measurement for this size (timed kernel did not run: non-GIN impl, "
+                        "unsupported op/type, count==0, or loop<1); skipping row "
+                        "(size %ld bytes)\n", args->expectedBytes);
+      }
+      return testSuccess;
+    }
+    deltaSec = deviceDeltaSec;
+    cputimeSec = deviceDeltaSec;
+
+    // Opt-in validation of the TIMED path itself (--devtime_check=1).
+    // Reached only when the timed kernel actually ran (deviceDeltaSec > 0 above), so
+    // recvbuff holds the timed kernel's output -- not a stale warmup/production
+    // buffer. The hook just ran skip+loop back-to-back collectives into recvbuff;
+    // each iteration is a full deterministic collective over the unchanged sendbuff,
+    // so the final recvbuff equals `expected` from initData. Validate it HERE -- the
+    // only point the timed kernel's output is live, before the datacheck loop below
+    // re-inits buffers and overwrites it with the production path. Needs datacheck on
+    // (that is what populates `expected`). Combines wrong-element counts across
+    // threads/ranks so any rank's mismatch fails the run.
+    if (devtimeCheck && datacheck) {
+      int64_t timedWrong = 0;
+      TESTCHECK(CheckData(args, type, op, root, in_place, &timedWrong));
+      long long timedWrong1 = timedWrong;
+      Allreduce(args, &timedWrong1, /*sum*/4);
+      if (timedWrong1) {
+        fprintf(stderr, "\nERROR: --devtime_check: timed-kernel output datacheck "
+                        "failed with %lld wrong elements (size %ld bytes)\n",
+                        timedWrong1, args->expectedBytes);
+        return testInternalError;
+      }
+    }
+  }
 
 #if HIP_VERSION >= 50221310
-  if (cudaGraphLaunches >= 1) {
+  if (cudaGraphLaunches >= 1 && !deviceOnly) {
     //destroy cuda graph
     for (int i=0; i<args->nGpus; i++) {
 #ifdef __HIP_PLATFORM_AMD__
@@ -1147,9 +1226,8 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       if (wrongElts) break;
   }
 
-  int useCputimeCol = report_cputime && (deviceImpl == 0);
-  double timeUsec = (useCputimeCol ? cputimeSec : deltaSec)*1.0E6;
-  writeBenchmarkLineBody(timeUsec, algBw, busBw, args->reportErrors, wrongElts, useCputimeCol, report_timestamps, in_place==0);
+  double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
+  writeBenchmarkLineBody(timeUsec, algBw, busBw, args->reportErrors, wrongElts, report_cputime, report_timestamps, in_place==0);
 
   auto largestMessageSize = std::max(args->sendBytes, args->expectedBytes);
   if (args->reporter) {
@@ -1196,6 +1274,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   args->bw[0] += busBw;
   args->bw_count[0]++;
+
+  // Mode 1 (augment): print an extra device-only line alongside the normal
+  // graph/hipEvent numbers above. Mode 2 already reported device time as THE
+  // metric before getBw, so no extra line here.
+  if (in_place == 0 && devTimeMode == 1) {
+    TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, nullptr));
+  }
   return testSuccess;
 }
 
@@ -1818,13 +1903,21 @@ int main(int argc, char* argv[], char **envp) {
     {"output_algo_proto_channels", required_argument, 0, 'A'},      //RCCL (changed from M)
     {"per_iter_timing", required_argument, 0, 'I'},
     {"per_iter_skip", required_argument, 0, 'K'},
+    {"device_timing", required_argument, 0, 'B'},
+    {"devtime_loop", required_argument, 0, 'L'},
+    {"devtime_skip", required_argument, 0, 'P'},
+    {"devtime_loop_mid", required_argument, 0, 'W'},
+    {"devtime_loop_large", required_argument, 0, 'Q'},
+    {"devtime_skip_mid", required_argument, 0, 'j'},
+    {"devtime_skip_large", required_argument, 0, 'k'},
+    {"devtime_check", required_argument, 0, 'H'},
     {"help", no_argument, 0, 'h'},
     {}
   };
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:I:K:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:u:Y:U:O:q:F:E:Z:X:A:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:I:K:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:u:Y:U:O:q:F:E:Z:X:A:B:L:P:W:Q:H:j:k:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -2014,6 +2107,35 @@ int main(int argc, char* argv[], char **envp) {
           return -1;
         }
         break;
+      case 'B':
+        deviceTimingMode = (int)strtol(optarg, NULL, 0);
+        if (deviceTimingMode < 0 || deviceTimingMode > 2) {
+          fprintf(stderr, "device_timing (-B) must be 0 (off), 1 (augment), or 2 (device-only), got %d\n",
+                  deviceTimingMode);
+          return -1;
+        }
+        break;
+      case 'L':
+        devtimeLoop = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'P':
+        devtimeSkip = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'W':
+        devtimeLoopMid = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'Q':
+        devtimeLoopLarge = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'j':
+        devtimeSkipMid = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'k':
+        devtimeSkipLarge = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'H':
+        devtimeCheck = (int)strtol(optarg, NULL, 0);
+        break;
       case 'u':
         unalign = (int)strtol(optarg, NULL, 0);
         break;
@@ -2070,6 +2192,14 @@ int main(int argc, char* argv[], char **envp) {
             "    i_p99 uses nearest-rank percentile and may equal i_max\n\t"
             "    with <100 samples) (default: 0)] \n\t"
             "[-K,--per_iter_skip <count> exclude leading samples from -I summary stats (default: 0)] \n\t"
+            "[-B,--device_timing <0/1/2> in-kernel device timing: 0=off, 1=augment (extra line), 2=device-only metric (default: 0)] \n\t"
+            "[-L,--devtime_loop <count> timed-kernel loop iterations (default: 10)] \n\t"
+            "[-P,--devtime_skip <count> timed-kernel warmup skip iterations (default: 10)] \n\t"
+            "[-W,--devtime_loop_mid <count> loop at per-peer >= 8 MiB (0=use -L; default: 0)] \n\t"
+            "[-Q,--devtime_loop_large <count> loop at per-peer >= 64 MiB (0=use tier below; default: 0)] \n\t"
+            "[-j,--devtime_skip_mid <count> skip at mid tier (-1=min(-P,2); default: -1)] \n\t"
+            "[-k,--devtime_skip_large <count> skip at large tier (-1=min(-P,1); default: -1)] \n\t"
+            "[-H,--devtime_check <0/1> validate timed-kernel output before datacheck (default: 0)] \n\t"
             "[-h,--help]\n",
           programName);
         return 0;

@@ -121,6 +121,10 @@ struct testColl {
   // does not wire it or the library lacks the symbol (older librccl).
   testResult_t (*getCollImplInfo)(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op,
       const void* sendbuff, void* recvbuff, int graphCapturing, int* algo, int* proto, int* nchannels);
+  // Optional device-side (in-kernel wall_clock64) timing hook. Non-null only for
+  // collectives that implement it (AllToAll, AllGather). Driven by BenchTime via
+  // --device_timing (0=off, 1=augment, 2=device-time-only).
+  testResult_t (*deviceTime)(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec);
 };
 extern struct testColl allReduceTest;
 extern struct testColl allGatherTest;
@@ -237,6 +241,8 @@ struct testThread {
 
 // Provided by common.cu
 extern void Barrier(struct threadArgs* args);
+// Inter-thread/process reduce: average 0=bcast(r0),1=avg,2=min,3=max,4=sum.
+template<typename T> void Allreduce(struct threadArgs* args, T* value, int average);
 extern testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* typeName, ncclRedOp_t op,  const char* opName, int root);
 extern testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks);
 extern testResult_t InitDataApplyBias(void* expected, void* bias, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op);
