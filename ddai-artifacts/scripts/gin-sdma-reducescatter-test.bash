@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GIN Anvil SDMA ReduceScatter gate + perf (docker or bare-metal).
 # Companion to gin-sdma-ag-test.bash / gin-sdma-a2a-test.bash for the GIN
-# Anvil-SDMA ReduceScatter (reduce_scatter_perf -D 3, NCCL_GIN_TYPE=6).
+# Anvil-SDMA ReduceScatter (reduce_scatter_perf -D 3, NCCL_GIN_TYPE=5).
 # ReduceScatter is the first REDUCTION collective, so it adds an op dimension
 # (-o) over the two-way host-vs-GIN comparison.
 #
@@ -11,7 +11,7 @@
 #
 # Checks (order: RS-C1 host baseline -> RS-C2 GIN):
 #   RS-C1  Host-initiated ncclReduceScatter          (reduce_scatter_perf -D 0)
-#   RS-C2  GIN Anvil-SDMA ReduceScatter (-D 3, NCCL_GIN_TYPE=6, -V 32): every rank
+#   RS-C2  GIN Anvil-SDMA ReduceScatter (-D 3, NCCL_GIN_TYPE=5, -V 32): every rank
 #          reads its owned output slice directly from EVERY peer's sendbuff via LSA
 #          and folds the N contributions in ascending source-rank order (bit-for-bit
 #          matching rccl-tests' verifiable oracle). SINGLE-TIER balanced LSA
@@ -135,12 +135,12 @@ if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
-# --- RS-C2: GIN Anvil-SDMA ReduceScatter kernel (-D 3, NCCL_GIN_TYPE=6) ---
+# --- RS-C2: GIN Anvil-SDMA ReduceScatter kernel (-D 3, NCCL_GIN_TYPE=5) ---
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
   echo "RS-C2: GIN ReduceScatter -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, op ${OP}, single-tier LSA read-reduce)"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none \
-    -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=6 \
+    -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS}" \
     ${THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER="${THRESHOLD}"} \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \

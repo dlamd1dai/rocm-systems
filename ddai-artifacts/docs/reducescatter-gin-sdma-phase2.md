@@ -3,7 +3,7 @@
 Work on the GIN-SDMA ReduceScatter device kernel (`rccl-tests/src/reduce_scatter.cu`)
 and an investigation into whether SDMA copy engines can push large-message
 ReduceScatter past the CU load-reduce ceiling. All numbers on **8× MI355X
-(gfx950)**, single node xGMI, `NCCL_GIN_TYPE=6`.
+(gfx950)**, single node xGMI, `NCCL_GIN_TYPE=5`.
 
 - Image: `rccl-gin-gda-sdma-713-rs` (host symmetric RS device kernel present, for the `-D 0` baseline)
 - Tool: `rccl-tests/reduce_scatter_perf`, `-g 1 -R 2 -V 32 -n 20 -w 5 -o sum -d float -z 0`

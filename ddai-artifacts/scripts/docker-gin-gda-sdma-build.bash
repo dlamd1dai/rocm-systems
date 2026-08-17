@@ -163,7 +163,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Build hardening: GIN Anvil-SDMA ReduceScatter (-D 3) smoke assert.
-# Runs the ReduceScatter harness RS-C2 (GIN only, NCCL_GIN_TYPE=6) so a broken
+# Runs the ReduceScatter harness RS-C2 (GIN only, NCCL_GIN_TYPE=5) so a broken
 # GinReduceScatterKernel or GIN bring-up is caught at image build time, alongside
 # the A2A / AllGather gates above. The single-tier LSA read-reduce is exercised
 # across the sweep; the SM reduction is validated against rccl-tests' verifiable
@@ -179,7 +179,7 @@ if [ "${RCCL_IMAGE_RS_SMOKE}" = "1" ]; then
   if [ ! -e /dev/kfd ]; then
     echo "WARN: ReduceScatter GIN smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_RS_SMOKE=0 to silence." >&2
   else
-    echo "=== Build hardening: GIN Anvil-SDMA ReduceScatter smoke assert (NP=${RS_SMOKE_NP}, -D 3, NCCL_GIN_TYPE=6, -e ${RS_SMOKE_SIZE}) ==="
+    echo "=== Build hardening: GIN Anvil-SDMA ReduceScatter smoke assert (NP=${RS_SMOKE_NP}, -D 3, NCCL_GIN_TYPE=5, -e ${RS_SMOKE_SIZE}) ==="
     RS_SMOKE_LOG="$(mktemp)"
     RUN_HOST_BASELINE=0 RUN_GIN_SDMA=1 \
       bash "${DEV_ARTI_DIR}/scripts/gin-sdma-reducescatter-test.bash" "${RS_SMOKE_NP}" "${RS_SMOKE_SIZE}" \
