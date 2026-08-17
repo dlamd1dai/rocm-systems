@@ -359,8 +359,14 @@ fi
 
 # --- Test#3: GIN Anvil-SDMA hybrid AllGather (all_gather_perf -D 3) ---
 # GinHybridAllGatherKernel (NCCL_GIN_TYPE=5): per-rank chunk <= AG_THRESHOLD uses
-# a direct LSA all-peers store (all CTAs, xGMI); above it uses one-round all-peers
-# gin.put (Anvil-SDMA copy engines). The AllGather tier crossover is now a
+# a direct LSA all-peers store (xGMI); above it uses one-round all-peers
+# gin.put (Anvil-SDMA copy engines). The kernel SELF-SELECTS a size-adaptive CTA
+# count decoupled from -V (like ReduceScatter): ~16 CTAs for the LSA-direct tier
+# (grid-stride store scales with threads) and few (4) for the GIN-put/SDMA tier
+# (only nRanks threads issue the puts, so extra CTAs are pure barrier overhead;
+# fixed -V 32 cost ~13% at 8 MiB, ~21% at 512 KiB). -V/AG_CTA_COUNT now only sizes
+# the devComm barrier pool (max(-V, 16)); NCCL_GIN_ANVIL_AG_CTAS pins a fixed count
+# (diagnostic). The AllGather tier crossover is now a
 # per-collective knob, NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER, host-resolved and
 # passed to the kernel; it falls back to the global NCCL_GIN_ANVIL_SDMA_THRESHOLD
 # and then a compiled default. This is decoupled from the backend gin.put
@@ -377,6 +383,9 @@ fi
 if _run_test 3; then
   _trace_on
   AG_THRESHOLD="${AG_THRESHOLD:-32768}"
+  # -V now only sizes the barrier pool (max(-V,16)); the kernel self-selects the
+  # launched CTA count. 8 -> pool 16, which covers the adaptive max. Override the
+  # launched count for diagnostics via NCCL_GIN_ANVIL_AG_CTAS instead of -V.
   AG_CTA_COUNT="${AG_CTA_COUNT:-8}"
   # Optional in-kernel (wall_clock64) device-time measurement for the hybrid
   # AllGather, via the shared gin_devtime scaffold (AllGatherDeviceTime). It times
