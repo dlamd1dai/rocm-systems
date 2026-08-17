@@ -268,24 +268,51 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
   const size_t totalBytes = count * (size_t)nRanks * sizeof(T);
 
   if (totalBytes < RS_UNROLL_MIN) {
-    // ---- small/mid: high-occupancy grid-stride with 4-way PEER ILP ----
-    // One pack per thread (register-light -> max wave occupancy), but peers are
-    // consumed FOUR at a time: up to four independent 128-bit peer loads are
-    // issued before any is folded, so four source ranks' xGMI read latencies
-    // overlap. RS is read-latency-bound in this occupancy-limited mid-band (16-33
-    // MiB grid-stride tier), and the CTA count is already maxed (48 CTAs; more
-    // crater it), so the remaining lever is per-thread load ILP -- the host
-    // symmetric kernel's latency hiding, adapted to grid-stride granularity (vs
-    // its warp-strided UnrollPacks x UnrollPeers, which collapses occupancy here).
-    // Four Pack temps (64 B) is far lighter than the large tier's U=4 accumulator
-    // set, so occupancy holds. Ascending source-rank fold (s, s+1, s+2, s+3) is
-    // preserved, so the reduction stays bit-for-bit identical to the verifier.
-    for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
-      Pack v0 = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0))[myBaseP + pk];
+    // ---- small/mid: high-occupancy grid-stride, FULL N-way PEER ILP + src0 prefetch ----
+    // One pack per thread (register-light -> max wave occupancy). This band is
+    // xGMI-read-LATENCY bound (the host ring fans out to ~128 WarpSpeed channels
+    // and hides latency across many small pairwise steps; our flat all-peer pull
+    // runs on 32-48 CTAs, so more CTAs only add xGMI incast -- confirmed by the
+    // pinned-CTA sweep -- and the remaining lever is per-thread load ILP + cross-
+    // iteration pipelining), so we attack it two ways:
+    //   (1) up to EIGHT independent 128-bit peer loads issued before any fold, so
+    //       all N=8 source ranks' xGMI read latencies overlap (was 4-way; doubling
+    //       the outstanding-load count is the mid-band's dominant lever). Eight
+    //       Pack temps (128 B) still keeps enough waves resident to matter.
+    //   (2) software-prefetch source 0 of the NEXT grid-stride pack while this pack
+    //       reduces peers 1..N-1 and writes its output, hiding source 0's read
+    //       latency across iterations (mirrors the large tier's next-iter seed).
+    // Loads may land out of order, but the fold still runs in ascending source-rank
+    // order (s = 0,1,...,N-1), so the result is bit-for-bit identical to the verifier.
+    const Pack* src0Base = (const Pack*)ncclGetLsaPointer(sendwin, sendoffset, 0) + myBaseP;
+    size_t pk = (size_t)tid;
+    Pack seed0;
+    if (pk < nPacks) seed0 = src0Base[pk];  // prime source-0 for this thread's first pack
+    for (; pk < nPacks; pk += (size_t)nthreads) {
       T acc[VEC];
-      #pragma unroll
-      for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, v0.e[e], nRanks);
-      int s = 1;
+      int s;
+      if (nRanks >= 8) {
+        // ---- 8-wide peer batch: 8 outstanding 128-bit loads before any fold ----
+        // t[0] is the prefetched source-0 seed (no load here); t[1..7] issue fresh,
+        // so 7 fresh loads overlap the already-in-flight seed and next-seed prefetch.
+        Pack t[8];
+        t[0] = seed0;
+        #pragma unroll
+        for (int j = 1; j < 8; j++)
+          t[j] = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, j))[myBaseP + pk];
+        #pragma unroll
+        for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, t[0].e[e], nRanks);
+        #pragma unroll
+        for (int j = 1; j < 8; j++)
+          #pragma unroll
+          for (int e = 0; e < VEC; e++)
+            acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, t[j].e[e], nRanks));
+        s = 8;
+      } else {
+        #pragma unroll
+        for (int e = 0; e < VEC; e++) acc[e] = gin_sdma_reduce::preOp(redOp, seed0.e[e], nRanks);
+        s = 1;
+      }
       for (; s + 3 < nRanks; s += 4) {  // four peer loads in flight before folding
         Pack a = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s))[myBaseP + pk];
         Pack b = ((const Pack*)ncclGetLsaPointer(sendwin, sendoffset, s + 1))[myBaseP + pk];
@@ -320,6 +347,10 @@ __device__ __forceinline__ void ginReduceScatterBody(ncclWindow_t sendwin, size_
         for (int e = 0; e < VEC; e++)
           acc[e] = gin_sdma_reduce::combine(redOp, acc[e], gin_sdma_reduce::preOp(redOp, vs.e[e], nRanks));
       }
+      // Prefetch source 0 for the next grid-stride pack; the load overlaps the
+      // output store below and the back-edge into the next iteration's peer loads.
+      const size_t nb = pk + (size_t)nthreads;
+      if (nb < nPacks) seed0 = src0Base[nb];
       Pack o;
       #pragma unroll
       for (int e = 0; e < VEC; e++) o.e[e] = gin_sdma_reduce::postOp(redOp, acc[e], nRanks);
