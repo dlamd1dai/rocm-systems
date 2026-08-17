@@ -31,6 +31,8 @@
 # Full gate (default): RS-C1 + RS-C2.
 # Skip sections: RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0
 # GPU reset first: GPU_RESET_BEFORE_TEST=1
+# Optional device timing (RS-C2): RS_DEVICE_TIMING=1|2 prints/reports the in-kernel
+# wall_clock64 latency (RS_DEVTIME_LOOP/RS_DEVTIME_SKIP default 10/10).
 
 set -euo pipefail
 
@@ -62,6 +64,24 @@ DTYPE="${DTYPE:-}"              # element type; empty -> perf binary sweeps all 
 # setting THRESHOLD is currently a no-op; retained for the future put-partials
 # large tier (see reducescatter-gin-sdma-phase2.md).
 THRESHOLD="${THRESHOLD:-}"
+
+# Optional in-kernel (wall_clock64) device-time measurement for the GIN
+# ReduceScatter, via the shared gin_devtime scaffold (ReduceScatterDeviceTime). It
+# times ONLY the device function body -- excludes host launch, stream/graph, and
+# teardown overhead. Mirrors the A2A/AllGather harness knobs. Modes
+# (NCCL_GIN_ANVIL_DEVICE_TIMING):
+#   0 = off (default).
+#   1 = augment: normal graph/hipEvent run PLUS an extra "#[rs-devtime]" line.
+#   2 = device-time-only: skip the graph/hipEvent timed loop for the out-of-place
+#       pass and report the device time as THE metric (warmup + datacheck still
+#       run for #wrong). Fastest, cleanest single number.
+# The mode env is the shared NCCL_GIN_ANVIL_DEVICE_TIMING (common.cu also honors
+# the legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING); LOOP/SKIP are RS-specific and
+# default to the ReduceScatterDeviceTime built-in 10/10 (RS-C2 uses the perf
+# binary's default -w/-n, so there is no harness -w/-n to inherit).
+RS_DEVICE_TIMING="${RS_DEVICE_TIMING:-0}"
+RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP:-10}"
+RS_DEVTIME_SKIP="${RS_DEVTIME_SKIP:-10}"
 
 _HOST="$(hostname -s 2>/dev/null || hostname)"
 REDUCE_SCATTER_PERF="${REDUCE_SCATTER_PERF:-rccl-tests/reduce_scatter_perf}"
@@ -143,6 +163,9 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS}" \
     ${THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER="${THRESHOLD}"} \
+    -x NCCL_GIN_ANVIL_DEVICE_TIMING="${RS_DEVICE_TIMING}" \
+    -x NCCL_GIN_ANVIL_RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP}" \
+    -x NCCL_GIN_ANVIL_RS_DEVTIME_SKIP="${RS_DEVTIME_SKIP}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
     "${REDUCE_SCATTER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 "${OP_ARG[@]}" "${DTYPE_ARG[@]}"
   sleep "${TEST_GAP_SEC:-3}"
