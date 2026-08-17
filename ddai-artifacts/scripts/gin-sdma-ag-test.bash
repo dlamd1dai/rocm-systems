@@ -362,9 +362,10 @@ fi
 # count decoupled from -V: ~16 CTAs for the LSA-direct tier
 # (grid-stride store scales with threads) and few (4) for the GIN-put/SDMA tier
 # (only nRanks threads issue the puts, so extra CTAs are pure barrier overhead;
-# fixed -V 32 cost ~13% at 8 MiB, ~21% at 512 KiB). -V/AG_CTA_COUNT now only sizes
-# the devComm barrier pool (max(-V, 16)); NCCL_GIN_ANVIL_AG_CTAS pins a fixed count
-# (diagnostic). The AllGather tier crossover is now a
+# fixed -V 32 cost ~13% at 8 MiB, ~21% at 512 KiB). -V is therefore NOT passed here
+# (the kernel self-selects; the barrier pool defaults to a size that covers the
+# adaptive max); NCCL_GIN_ANVIL_AG_CTAS pins a fixed launched count (diagnostic).
+# The AllGather tier crossover is now a
 # per-collective knob, NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER, host-resolved and
 # passed to the kernel; it falls back to the global NCCL_GIN_ANVIL_SDMA_THRESHOLD
 # and then a compiled default. This is decoupled from the backend gin.put
@@ -381,10 +382,6 @@ fi
 if _run_test 3; then
   _trace_on
   AG_THRESHOLD="${AG_THRESHOLD:-32768}"
-  # -V now only sizes the barrier pool (max(-V,16)); the kernel self-selects the
-  # launched CTA count. 8 -> pool 16, which covers the adaptive max. Override the
-  # launched count for diagnostics via NCCL_GIN_ANVIL_AG_CTAS instead of -V.
-  AG_CTA_COUNT="${AG_CTA_COUNT:-8}"
   TEST3_MPI_EXTRA=(
     -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER=${AG_THRESHOLD}"
     -x "NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=${AG_NUM_CHANNELS:-1}"
@@ -403,10 +400,10 @@ if _run_test 3; then
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
       "${TEST3_MPI_EXTRA[@]}" \
       rccl-tests/all_gather_perf -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -d "${AG_DTYPE}" \
-      -A 1 -V "${AG_CTA_COUNT}" -w "${AG_WARMUP}" -n "${AG_ITERS}" 2>&1 | tee "$1"
+      -A 1 -w "${AG_WARMUP}" -n "${AG_ITERS}" 2>&1 | tee "$1"
     return "${PIPESTATUS[0]}"
   }
-  echo "=== Test#3: AllGather, ${NP} gpus, GIN Anvil-SDMA -D 3 hybrid (LSA<=${AG_THRESHOLD}B/rank, SDMA above; V=${AG_CTA_COUNT}, NCCL_GIN_TYPE=5, ${MIN_BYTES}..${MAX_BYTES}) ==="
+  echo "=== Test#3: AllGather, ${NP} gpus, GIN Anvil-SDMA -D 3 hybrid (LSA<=${AG_THRESHOLD}B/rank, SDMA above; adaptive CTAs, NCCL_GIN_TYPE=5, ${MIN_BYTES}..${MAX_BYTES}) ==="
   _ag_log="$(mktemp)"
   _ag_rc=1
   for _try in $(seq 1 "${GIN_CONN_RETRIES}"); do
