@@ -32,7 +32,7 @@
 # Skip sections: RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0
 # GPU reset first: GPU_RESET_BEFORE_TEST=1
 # Optional device timing (RS-C2): RS_DEVICE_TIMING=1|2 prints/reports the in-kernel
-# wall_clock64 latency (RS_DEVTIME_LOOP/RS_DEVTIME_SKIP default 10/10).
+# wall_clock64 latency (RS_DEVTIME_LOOP/RS_DEVTIME_SKIP default to RS_ITERS/RS_WARMUP).
 
 set -euo pipefail
 
@@ -57,6 +57,11 @@ DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-32}"
 NUM_CHANNELS="${NUM_CHANNELS:-1}"
 FACTOR="${FACTOR:-2}"
 HOST_NCHANNELS="${HOST_NCHANNELS:-32}"
+# Measurement iteration counts (-w/-n) applied to BOTH RS-C1 and RS-C2 so the host
+# and GIN paths are timed over the SAME warmup/timed counts (mirrors the AG/A2A
+# harnesses; matches the perf binary defaults warmup=5/iters=20 used elsewhere).
+RS_WARMUP="${RS_WARMUP:-5}"
+RS_ITERS="${RS_ITERS:-20}"
 OP="${OP:-sum}"                 # reduction op(s): sum|prod|min|max|avg|all or CSV
 DTYPE="${DTYPE:-}"              # element type; empty -> perf binary sweeps all types
 # Reserved: NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER (bytes/rank-slice). The
@@ -77,11 +82,11 @@ THRESHOLD="${THRESHOLD:-}"
 #       run for #wrong). Fastest, cleanest single number.
 # The mode env is the shared NCCL_GIN_ANVIL_DEVICE_TIMING (common.cu also honors
 # the legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING); LOOP/SKIP are RS-specific and
-# default to the ReduceScatterDeviceTime built-in 10/10 (RS-C2 uses the perf
-# binary's default -w/-n, so there is no harness -w/-n to inherit).
+# default to the harness RS_ITERS/RS_WARMUP so the in-kernel device-timed window
+# matches RS-C2's host-timed -w/-n window (true parity with the AG/A2A harnesses).
 RS_DEVICE_TIMING="${RS_DEVICE_TIMING:-0}"
-RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP:-10}"
-RS_DEVTIME_SKIP="${RS_DEVTIME_SKIP:-10}"
+RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP:-${RS_ITERS}}"
+RS_DEVTIME_SKIP="${RS_DEVTIME_SKIP:-${RS_WARMUP}}"
 
 _HOST="$(hostname -s 2>/dev/null || hostname)"
 REDUCE_SCATTER_PERF="${REDUCE_SCATTER_PERF:-rccl-tests/reduce_scatter_perf}"
@@ -150,7 +155,7 @@ if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
   echo "RS-C1: host ReduceScatter -D 0, ${MIN_BYTES}..${MAX_BYTES} (-R ${HOST_RANKS}, nch ${HOST_NCHANNELS}, op ${OP})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} "${MPI_BASE_HOST[@]}" \
     -x NCCL_MIN_NCHANNELS="${HOST_NCHANNELS}" -x NCCL_MAX_NCHANNELS="${HOST_NCHANNELS}" \
-    "${REDUCE_SCATTER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 "${OP_ARG[@]}" "${DTYPE_ARG[@]}"
+    "${REDUCE_SCATTER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${HOST_RANKS}" -D 0 -w "${RS_WARMUP}" -n "${RS_ITERS}" "${OP_ARG[@]}" "${DTYPE_ARG[@]}"
   RS_C1_STATUS="passed"
   sleep "${TEST_GAP_SEC:-3}"
 fi
@@ -167,7 +172,7 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     -x NCCL_GIN_ANVIL_RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP}" \
     -x NCCL_GIN_ANVIL_RS_DEVTIME_SKIP="${RS_DEVTIME_SKIP}" \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    "${REDUCE_SCATTER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 "${OP_ARG[@]}" "${DTYPE_ARG[@]}"
+    "${REDUCE_SCATTER_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -w "${RS_WARMUP}" -n "${RS_ITERS}" "${OP_ARG[@]}" "${DTYPE_ARG[@]}"
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
