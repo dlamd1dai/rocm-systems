@@ -273,7 +273,10 @@ ENV RCCL_INSTALL_PREFIX=${WORKDIR}/rccl
 # aborts on undefined rocshmem symbols. Override at build time with
 # --build-arg ONLY_FUNCS="..." (empty = all).
 ARG ONLY_FUNCS="SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce"
-ENV ONLY_FUNCS=${ONLY_FUNCS}
+# Quote the value: fine-grained ONLY_FUNCS entries contain spaces
+# (e.g. "ReduceScatter * * Sum *"); an unquoted ENV assignment would split on the
+# first space and silently drop the filter (falling back to generating all kernels).
+ENV ONLY_FUNCS="${ONLY_FUNCS}"
 RUN if [ "${USE_LOCAL_SRC}" = "1" ]; then \
       [ -d /tmp/local/projects/rccl ]       || { echo "ERROR: projects/rccl not in build context";       exit 1; }; \
       [ -d /tmp/local/projects/rccl-tests ] || { echo "ERROR: projects/rccl-tests not in build context"; exit 1; }; \

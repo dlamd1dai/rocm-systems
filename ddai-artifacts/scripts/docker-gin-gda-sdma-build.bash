@@ -33,6 +33,38 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # RCCL's symmetric RS GIN kernel (RailA2A_LsaLD) references rocshmem::envvar::log_flags, which
 # librccl.so leaves unresolved by design; reduce_scatter_perf links roc::rocshmem with -rdynamic
 # (see rccl-tests/src/CMakeLists.txt) to export it, matching alltoall_perf/all_gather_perf.
+#
+# Fast-iteration knob: COLLECTIVE=rs|ag|a2a|ar narrows the generated device-kernel set
+# (ONLY_FUNCS) AND the post-build smoke gates to just that collective, so the compile and
+# device link only cover what that collective's tests exercise. AlltoAll* is kept in every
+# preset because the GIN Anvil-SDMA bring-up depends on it. An explicit ONLY_FUNCS (or the
+# individual RCCL_IMAGE_*_SMOKE vars) always wins. Unset (default) => full set + all gates.
+#
+# The reduction collectives (ReduceScatter/AllReduce/Reduce) are the whole cost: a bare
+# collective name expands to the full proto x redop x type fan-out (~40 kernel files each),
+# whereas SendRecv+AlltoAll* (the actual GIN device path) is only ~5. The "*-min" presets
+# pin redop=Sum on the reduction collective (all datatypes/protos kept, so the -D 0 host
+# baseline's default DTYPE=all sweep still resolves). This is another ~3x smaller than the
+# plain preset and matches the harness default OP=sum. CAVEAT: a Sum-pinned image will fault
+# ("ncclDevFuncId not found") if you run an op sweep (OP=all / OP="sum,max,avg"); use the
+# plain "rs" preset (or an explicit ONLY_FUNCS) for those runs.
+COLLECTIVE="${COLLECTIVE:-}"
+case "${COLLECTIVE}" in
+  rs)     : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|ReduceScatter}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=1}" ;;
+  rs-min) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|ReduceScatter * * Sum *}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=1}" ;;
+  ag)     : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllGather}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}"; : "${RCCL_IMAGE_RS_SMOKE:=0}" ;;
+  a2a)    : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=0}" ;;
+  ar)     : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllReduce|Reduce}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=0}" ;;
+  ar-min) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllReduce * * Sum *|Reduce * * Sum *}"
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=0}" ;;
+  "")     ;;
+  *)      echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use rs|rs-min|ag|a2a|ar|ar-min); building full set" >&2 ;;
+esac
 ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce|ReduceScatter}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
