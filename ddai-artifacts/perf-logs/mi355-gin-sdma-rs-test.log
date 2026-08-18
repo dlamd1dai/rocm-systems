@@ -1,0 +1,114 @@
+ReduceScatter gate: NP=8 host=smci355-ccs-aus-m03-17 op=sum dtype=all
+RS-C1: host ReduceScatter -D 0, 128..4G (-R 0, nch 32, op sum)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=4294967296 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=0 -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=0 -x NCCL_GIN_TYPE=0 -x NCCL_MIN_NCHANNELS=32 -x NCCL_MAX_NCHANNELS=32 rccl-tests/reduce_scatter_perf -b 128 -e 4G -f 2 -g 1 -R 0 -D 0 -w 5 -n 20 -o sum ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23004 rccl-library=23004
+# Collective test starting: reduce_scatter_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 4294967296 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.4-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong  
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)          
+         128             4     float     sum      -1     7.24    0.02    0.02       0     7.84    0.02    0.01       0
+         256             8     float     sum      -1     7.21    0.04    0.03       0     7.61    0.03    0.03       0
+         512            16     float     sum      -1    11.38    0.04    0.04       0     7.28    0.07    0.06       0
+        1024            32     float     sum      -1     7.34    0.14    0.12       0     7.45    0.14    0.12       0
+        2048            64     float     sum      -1     7.16    0.29    0.25       0     7.48    0.27    0.24       0
+        4096           128     float     sum      -1     7.22    0.57    0.50       0     7.39    0.55    0.48       0
+        8192           256     float     sum      -1     7.20    1.14    1.00       0     9.27    0.88    0.77       0
+       16384           512     float     sum      -1     7.53    2.18    1.90       0     7.96    2.06    1.80       0
+       32768          1024     float     sum      -1     7.89    4.15    3.63       0     8.08    4.06    3.55       0
+       65536          2048     float     sum      -1    10.69    6.13    5.36       0     8.41    7.79    6.82       0
+      131072          4096     float     sum      -1     8.43   15.55   13.60       0     8.65   15.15   13.26       0
+      262144          8192     float     sum      -1     8.91   29.41   25.73       0     8.66   30.26   26.48       0
+      524288         16384     float     sum      -1     8.64   60.67   53.09       0     8.89   58.99   51.62       0
+     1048576         32768     float     sum      -1     9.70  108.06   94.56       0    10.81   96.96   84.84       0
+     2097152         65536     float     sum      -1    12.87  162.93  142.56       0    12.63  166.08  145.32       0
+     4194304        131072     float     sum      -1    17.51  239.50  209.56       0    17.17  244.33  213.79       0
+     8388608        262144     float     sum      -1    28.14  298.10  260.84       0    28.12  298.27  260.99       0
+    16777216        524288     float     sum      -1    48.08  348.91  305.30       0    47.74  351.43  307.50       0
+    33554432       1048576     float     sum      -1    87.85  381.97  334.22       0    87.74  382.42  334.62       0
+    67108864       2097152     float     sum      -1   166.59  402.84  352.48       0   166.96  401.95  351.70       0
+   134217728       4194304     float     sum      -1   325.84  411.91  360.42       0   325.57  412.26  360.73       0
+   268435456       8388608     float     sum      -1  2200.65  121.98  106.73       0  2030.87  132.18  115.66       0
+   536870912      16777216     float     sum      -1  4276.61  125.54  109.84       0  3935.75  136.41  119.36       0
+  1073741824      33554432     float     sum      -1  8562.70  125.40  109.72       0  7901.27  135.89  118.91       0
+  2147483648      67108864     float     sum      -1  17893.9  120.01  105.01       0  16704.0  128.56  112.49       0
+  4294967296     134217728     float     sum      -1  34718.5  123.71  108.24       0  34824.6  123.33  107.91       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 104.689 
+#
+# Collective test concluded: reduce_scatter_perf
+#
+
+RS-C2: GIN ReduceScatter -D 3, 128..4G (-R 2, -V 32, op sum, single-tier LSA read-reduce)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=4294967296 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 -x NCCL_GIN_ANVIL_DEVICE_TIMING=0 -x NCCL_GIN_ANVIL_RS_DEVTIME_LOOP=20 -x NCCL_GIN_ANVIL_RS_DEVTIME_SKIP=5 -x HSA_FORCE_FINE_GRAIN_PCIE=1 rccl-tests/reduce_scatter_perf -b 128 -e 4G -f 2 -g 1 -R 2 -V 32 -D 3 -w 5 -n 20 -o sum ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23004 rccl-library=23004
+# Collective test starting: reduce_scatter_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 4294967296 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.4-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong  
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)          
+         128             4     float     sum      -1     7.55    0.02    0.01       0     7.79    0.02    0.01       0
+         256             8     float     sum      -1     7.02    0.04    0.03       0    10.00    0.03    0.02       0
+         512            16     float     sum      -1     6.96    0.07    0.06       0     6.73    0.08    0.07       0
+        1024            32     float     sum      -1     6.89    0.15    0.13       0     6.79    0.15    0.13       0
+        2048            64     float     sum      -1     9.61    0.21    0.19       0     6.86    0.30    0.26       0
+        4096           128     float     sum      -1     7.04    0.58    0.51       0     6.81    0.60    0.53       0
+        8192           256     float     sum      -1     8.04    1.02    0.89       0     6.87    1.19    1.04       0
+       16384           512     float     sum      -1     6.99    2.34    2.05       0     7.25    2.26    1.98       0
+       32768          1024     float     sum      -1     7.57    4.33    3.79       0    10.32    3.18    2.78       0
+       65536          2048     float     sum      -1     7.87    8.33    7.29       0     7.94    8.25    7.22       0
+      131072          4096     float     sum      -1     8.13   16.13   14.11       0     8.11   16.15   14.13       0
+      262144          8192     float     sum      -1     8.47   30.97   27.10       0     8.40   31.21   27.31       0
+      524288         16384     float     sum      -1     9.16   57.23   50.08       0     9.04   57.97   50.72       0
+     1048576         32768     float     sum      -1    10.83   96.81   84.71       0    10.63   98.66   86.33       0
+     2097152         65536     float     sum      -1    14.25  147.17  128.77       0    14.02  149.63  130.93       0
+     4194304        131072     float     sum      -1    19.70  212.95  186.33       0    19.32  217.04  189.91       0
+     8388608        262144     float     sum      -1    31.02  270.38  236.58       0    31.14  269.36  235.69       0
+    16777216        524288     float     sum      -1    52.84  317.51  277.82       0    52.11  321.96  281.72       0
+    33554432       1048576     float     sum      -1    87.94  381.54  333.85       0    87.06  385.43  337.25       0
+    67108864       2097152     float     sum      -1   156.67  428.35  374.81       0   157.02  427.40  373.97       0
+   134217728       4194304     float     sum      -1   302.07  444.33  388.79       0   303.02  442.94  387.57       0
+   268435456       8388608     float     sum      -1   592.21  453.28  396.62       0   589.19  455.60  398.65       0
+   536870912      16777216     float     sum      -1  1168.97  459.27  401.86       0  1167.21  459.96  402.47       0
+  1073741824      33554432     float     sum      -1  2308.78  465.07  406.94       0  2309.62  464.90  406.79       0
+  2147483648      67108864     float     sum      -1  4565.89  470.33  411.54       0  4565.28  470.40  411.60       0
+  4294967296     134217728     float     sum      -1  9038.90  475.16  415.77       0  9027.67  475.76  416.29       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 159.923 
+#
+# Collective test concluded: reduce_scatter_perf
+#
+
+PASS: gin-sdma-reducescatter-test np=8 op=sum RS-C1=passed RS-C2=128..4G
