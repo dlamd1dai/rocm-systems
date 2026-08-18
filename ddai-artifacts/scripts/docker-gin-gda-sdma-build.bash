@@ -28,6 +28,26 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
 # range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
 # pattern.
+# Fast-iteration knob: COLLECTIVE=ag|a2a narrows the generated device-kernel set (ONLY_FUNCS)
+# AND the post-build smoke gates to just that collective, so the compile and device link only
+# cover what that collective's tests exercise. AlltoAll* is kept in every preset because the
+# GIN Anvil-SDMA bring-up depends on it. An explicit ONLY_FUNCS (or the individual
+# RCCL_IMAGE_*_SMOKE vars) always wins. Unset (default) => full set + all gates.
+#
+# The heavy device kernels come from the reduction collectives' proto x redop x type fan-out;
+# SendRecv+AlltoAll*+AllGather (the AG GIN device path plus its host baseline) is small, and
+# AllGather is op-less (Sum/i8 only) so it has no redop fan-out to pin -- the "ag" preset is
+# already minimal. (rs/ar presets from the RS branch are intentionally omitted here: this AG
+# branch has no ReduceScatter/AllReduce GIN smoke gate to validate them.)
+COLLECTIVE="${COLLECTIVE:-}"
+case "${COLLECTIVE}" in
+  ag)  : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllGather}"
+       : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}" ;;
+  a2a) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda}"
+       : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}" ;;
+  "")  ;;
+  *)   echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use ag|a2a); building full set" >&2 ;;
+esac
 ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
 
 GIT_CLONE_ROOT="${GIT_CLONE_ROOT:-$PWD}"
