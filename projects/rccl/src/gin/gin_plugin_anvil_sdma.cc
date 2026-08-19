@@ -440,31 +440,47 @@ static ncclResult_t ginAnvilCheckSignalConnectivity(ginAnvilGinCtx* ctx, void* l
   int localMissing = 0;
   for (int attempt = 0; attempt < MAX_ATTEMPTS && !ok; attempt++) {
     unsigned long long stamp = 0xC0FFEE00ULL + (unsigned long long)(attempt + 1);
+    // A per-rank infra error (write/verify kernel, D2H copy, reset memset) must NOT
+    // bail this rank early: the other ranks would then block forever on the shared
+    // bootstrapBarrier/allgather below. Instead we record it locally and fold it
+    // into the collective decision as "everything missing", so every rank sees a
+    // non-zero global count and aborts together (the same guarantee the gate makes
+    // for a real connectivity miss). Only a failure of a collective op itself
+    // (barrier/allgather) -- which fails on all ranks together -- bails via goto.
+    bool localFail = false;
 
     // 1) Store my stamp into every peer's test slot [rank].
     if (rank == injRank) {
       WARN("GIN anvil-sdma: [TEST] injecting connectivity fault on rank %d (skipping signal writes)", rank);
     } else if (ginAnvilConnWrite(ctx->signal_remote_addrs_dev, nRanks, rank, stamp) != 0) {
       WARN("GIN anvil-sdma: conn-check write kernel failed (rank %d)", rank);
-      ret = ncclSystemError;
-      goto cleanup;
+      localFail = true;
     }
-    // 2) All ranks finished writing.
+    // 2) All ranks finished writing (or recorded a local failure). This barrier
+    //    keeps every rank in lock-step so a failing rank never leaves peers hung.
     NCCLCHECKGOTO(bootstrapBarrier(comm->bootstrap, rank, nRanks, 0x51611), ret, cleanup);
-    // 3) Verify each source x reached my local slot x.
-    if (ginAnvilConnCheck(lsaSelf, nRanks, stamp, missingDev) != 0) {
-      WARN("GIN anvil-sdma: conn-check verify kernel failed (rank %d)", rank);
-      ret = ncclSystemError;
-      goto cleanup;
-    }
-    if (hipMemcpy(missingHost, missingDev, sizeof(int) * (size_t)nRanks, hipMemcpyDeviceToHost) != hipSuccess) {
-      ret = ncclSystemError;
-      goto cleanup;
-    }
+    // 3) Verify each source x reached my local slot x (skip if already failed).
     localMissing = 0;
-    for (int x = 0; x < nRanks; x++) localMissing += missingHost[x];
-    // 4) Reset the touched slots so the first real collective starts from zero.
-    CUDACHECKGOTO(hipMemset(lsaSelf, 0, sizeof(uint64_t) * (size_t)nRanks), ret, cleanup);
+    if (!localFail) {
+      if (ginAnvilConnCheck(lsaSelf, nRanks, stamp, missingDev) != 0) {
+        WARN("GIN anvil-sdma: conn-check verify kernel failed (rank %d)", rank);
+        localFail = true;
+      } else if (hipMemcpy(missingHost, missingDev, sizeof(int) * (size_t)nRanks,
+                           hipMemcpyDeviceToHost) != hipSuccess) {
+        WARN("GIN anvil-sdma: conn-check D2H copy failed (rank %d)", rank);
+        localFail = true;
+      } else {
+        for (int x = 0; x < nRanks; x++) localMissing += missingHost[x];
+        // 4) Reset the touched slots so the first real collective starts from zero.
+        if (hipMemset(lsaSelf, 0, sizeof(uint64_t) * (size_t)nRanks) != hipSuccess) {
+          WARN("GIN anvil-sdma: conn-check slot reset failed (rank %d)", rank);
+          localFail = true;
+        }
+      }
+    }
+    // A local infra failure counts as "all peers missing" so the collective sum
+    // trips on every rank and we abort together instead of hanging.
+    if (localFail) localMissing = nRanks;
     // 5) Make the decision collective: sum missing counts across all ranks.
     memset(gathered, 0, sizeof(int) * (size_t)nRanks);
     gathered[rank] = localMissing;

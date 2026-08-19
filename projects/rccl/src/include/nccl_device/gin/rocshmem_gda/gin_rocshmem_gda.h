@@ -159,7 +159,11 @@ struct ncclGinApi_Get<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx, Coop, int, ncclGinWindow_t, size_t,
                                       ncclGinWindow_t, size_t, size_t, bool,
                                       ncclGinDescriptorSmem*, uint32_t = ncclGinOptFlagsDefault) {
-    __builtin_unreachable();
+    // Present only so BackendMask::get() links; no caller today. Fail loudly
+    // rather than __builtin_unreachable() so a future get() on this backend is a
+    // diagnosable trap instead of silent UB (elided surrounding code).
+    printf("ncclGinApi_Get<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call is not implemented\n");
+    __trap();
   }
 };
 

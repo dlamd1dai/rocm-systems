@@ -35,9 +35,9 @@
 
 // --------------------------------------------------------------------------
 // Stub definitions for rocshmem::QueuePair device methods.
-//   put_nbi   : byte-copy laddr -> raddr (observe data landing at remote VA)
-//   atomic_add: atomic add into the remote signal word (observe signal deliver)
-//   quiet     : bump a device-global call counter (observe completion sync)
+//   put_nbi       : byte-copy laddr -> raddr (observe data landing at remote VA)
+//   atomic_add    : atomic add into the remote signal word (observe signal deliver)
+//   quiet         : bump a device-global call counter (observe completion sync)
 // Non-RDC build: these must be defined in the same TU as the kernels that
 // (via the inlined template) call them.
 // --------------------------------------------------------------------------
@@ -53,8 +53,19 @@ __device__ void QueuePair::put_nbi(void* raddr, uint32_t /*rkey*/, const void* l
   for (size_t i = 0; i < length; ++i) d[i] = s[i];
 }
 
-__device__ void QueuePair::atomic_add(void* raddr, uint32_t /*rkey*/, int64_t value, ActiveWFInfo& /*wf_info*/,
-                                      bool /*fence*/) {
+// Matches queue_pair_device.h: atomic_add(void* raddr, uint32_t rkey, int64_t
+// value, ActiveWFInfo&, bool fence). The template's signal path calls this
+// (gin_rocshmem_gda.h:54,101); rkey/fence are unused by the byte-accurate stub.
+// atomic_add_single is the single-thread variant (declared for parity; the
+// template drives the wavefront form, but define both so the TU links either way).
+__device__ void QueuePair::atomic_add(void* raddr, uint32_t /*rkey*/, int64_t value,
+                                      ActiveWFInfo& /*wf_info*/, bool /*fence*/) {
+  if (raddr == nullptr) return;
+  atomicAdd(reinterpret_cast<unsigned long long*>(raddr), static_cast<unsigned long long>(value));
+}
+
+__device__ void QueuePair::atomic_add_single(void* raddr, uint32_t /*rkey*/, int64_t value,
+                                             bool /*fence*/) {
   if (raddr == nullptr) return;
   atomicAdd(reinterpret_cast<unsigned long long*>(raddr), static_cast<unsigned long long>(value));
 }
