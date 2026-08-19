@@ -90,40 +90,13 @@ static inline size_t testResolveSdmaThreshold(const char* collVar, size_t collDe
 }
 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-// Overflow-safe AND hang-safe gin.put for the Anvil-SDMA backend. Two distinct
-// single-descriptor limits apply, and we clamp to the smaller of the two:
-//   1) Correctness: the SDMA linear-copy count field is 30 bits and 1-based
-//      (count = bytes-1), so a put of >1 GiB (kGinPutMaxBytes) silently
-//      truncates and corrupts data.
-//   2) Reliability: on MI355X + ROCm 7.13 a single copy descriptor at/above
-//      256 MiB stalls the SDMA engine on the fused copy+signal packet, so the
-//      copy never lands and the SignalInc never fires -> waitSignal hangs. A
-//      128 MiB cap (gin_sdma::kGinSdmaSafeCopyBytes) is measured hang-free.
-// Split the transfer into <=kGinSdmaSafeCopyBytes segments and carry the
-// caller's remote action (e.g. SignalInc) ONLY on the final segment: the SDMA
-// queue is in-order, so a single signal still means "the whole message landed".
-template <typename RemoteAction>
-__device__ __forceinline__ void ginPutChunked(
-    ncclGin& gin, ncclTeam team, int peer,
-    ncclWindow_t dstWin, size_t dstOff,
-    ncclWindow_t srcWin, size_t srcOff,
-    size_t bytes, RemoteAction finalAction) {
-  const size_t kMax = gin_sdma::kGinSdmaSafeCopyBytes < gin_sdma::kGinPutMaxBytes
-                          ? gin_sdma::kGinSdmaSafeCopyBytes
-                          : gin_sdma::kGinPutMaxBytes;
-  size_t off = 0;
-  do {
-    const size_t rem = bytes - off;
-    const size_t seg = rem > kMax ? kMax : rem;
-    if (off + seg >= bytes) {
-      // Final (or only) segment carries the signal / remote action.
-      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg, finalAction);
-    } else {
-      gin.put(team, peer, dstWin, dstOff + off, srcWin, srcOff + off, seg);
-    }
-    off += seg;
-  } while (off < bytes);
-}
+// NOTE: large-put segmentation is NOT done here anymore. The Anvil-SDMA backend
+// ncclGinApi_Put (gin_anvil_sdma.h) internally splits any put into <=128 MiB
+// (gin_sdma::kGinPutSegBytes) in-order copies, carrying the remote action on the
+// final segment, so a single gin.put() of an arbitrarily large message is both
+// overflow-safe (30-bit SDMA copy-count) and hang-safe (MI355X 256 MiB stall) for
+// ALL callers. The test therefore issues plain gin.put() calls and exercises the
+// same path a real application would; see gin_anvil_sdma_put_policy.h.
 
 // Like common.h's testLaunchDeviceKernel but threads a per-collective LSA<->GIN
 // threshold override as the last kernel argument (the flat/SAG GIN kernels).
@@ -501,12 +474,11 @@ __global__ void GinHybridBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset
       BroadcastLocalCopy<T>(ldst, lsrc, count, tid, nthreads);
     }
 
-    // Flat fan-out: one put per non-self peer; skip self. Chunked to <=1 GiB
-    // segments to avoid the 30-bit SDMA copy-count overflow on >1 GiB messages;
-    // the signal rides the final segment.
+    // Flat fan-out: one put per non-self peer; skip self. The backend segments
+    // large messages internally (<=128 MiB copies, signal on the final one).
     for (int r = tid; r < devComm.nRanks; r += nthreads) {
       if (r == root) continue;
-      ginPutChunked(gin, ncclTeamWorld(devComm), r,
+      gin.put(ncclTeamWorld(devComm), r,
           recvwin, recvoffset,
           sendwin, sendoffset,
           msgBytes, ncclGin_SignalInc{signalIndex});
@@ -591,8 +563,8 @@ __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t 
       if (r == root) continue;
       const gin_sdma::Chunk rChunk = gin_sdma::sagChunk(count, N, r);
       const size_t rOff = rChunk.eltOffset * sizeof(T);
-      // Chunked to <=1 GiB segments (30-bit SDMA copy-count guard).
-      ginPutChunked(gin, ncclTeamWorld(devComm), r,
+      // Backend segments large copies internally (<=128 MiB, 30-bit-safe).
+      gin.put(ncclTeamWorld(devComm), r,
           recvwin, recvoffset + rOff,
           sendwin, sendoffset + rOff,
           rChunk.count * sizeof(T), ncclGin_SignalInc{sigScatter});
@@ -614,8 +586,8 @@ __global__ void GinScatterAllgatherBroadcastKernel(ncclWindow_t sendwin, size_t 
   const size_t myWinOff = (rank == root) ? (sendoffset + myByteOff) : (recvoffset + myByteOff);
   for (int r = tid; r < N; r += nthreads) {
     if (r == rank) continue;
-    // Chunked to <=1 GiB segments (30-bit SDMA copy-count guard).
-    ginPutChunked(gin, ncclTeamWorld(devComm), r,
+    // Backend segments large copies internally (<=128 MiB, 30-bit-safe).
+    gin.put(ncclTeamWorld(devComm), r,
         recvwin, recvoffset + myByteOff,
         myWin, myWinOff,
         myBytes, ncclGin_SignalInc{sigGather});
@@ -705,7 +677,7 @@ __global__ void GinRingBroadcastKernel(ncclWindow_t sendwin, size_t sendoffset, 
       // they just received into their recvwin.
       ncclWindow_t srcWin = isRoot ? sendwin : recvwin;
       const size_t srcOff = (isRoot ? sendoffset : recvoffset) + offBytes;
-      ginPutChunked(gin, ncclTeamWorld(devComm), nextRank,
+      gin.put(ncclTeamWorld(devComm), nextRank,
           recvwin, recvoffset + offBytes,
           srcWin, srcOff,
           cBytes, ncclGin_SignalInc{sig});
@@ -1137,7 +1109,7 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
       case 3: {
         // Broadcast-specific LSA<->GIN threshold. Default = 256 KiB (full
-        // message): on 8x MI355X (NCCL_GIN_TYPE=6) LSA wins <=256K and GIN wins
+        // message): on 8x MI355X (NCCL_GIN_TYPE=5) LSA wins <=256K and GIN wins
         // >=512K (measured 2026-07-24). Override with
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST, or the shared
         // NCCL_GIN_ANVIL_SDMA_THRESHOLD.
