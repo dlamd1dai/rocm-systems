@@ -29,15 +29,6 @@ NCCL_DEVICE_INLINE bool anvilCtxValid(ncclGinAnvilSdmaGPUContext* rsCtx) {
   return rsCtx != nullptr && loadConst(&rsCtx->layoutMagic) == NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC;
 }
 
-__device__ uint64_t anvilGinDummySignal;
-
-NCCL_DEVICE_INLINE uint64_t* anvilSignalPtrOrDummy(ncclGinAnvilSdmaGPUContext* rsCtx, ncclGinSignal_t signalId) {
-  if (!anvilCtxValid(rsCtx)) return &anvilGinDummySignal;
-  uint64_t* signals = loadConst(&rsCtx->signals);
-  if (signals == nullptr) return &anvilGinDummySignal;
-  return signals + signalId;
-}
-
 NCCL_DEVICE_INLINE void* resolveRemotePeerVa(ncclGinAnvilSdmaGPUContext* rsCtx, ncclGinAnvilSdmaMemHandle* mh, int peer,
                                              size_t off) {
   ptrdiff_t stride = loadConst(&mh->vmmStride);
