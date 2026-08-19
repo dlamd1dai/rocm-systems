@@ -17,11 +17,27 @@ FROM ${BASE_IMAGE}
 # Overlay only the changed rccl-tests source, then relink using the pre-configured
 # build tree. broadcast.cu #includes gin_sdma_broadcast_policy.h (pure host/device
 # tier policy), so both must be overlaid for the relink to see the current design.
+#
+# The RCCL build hipifies sources+headers into /workspace/rccl-tests/src/hipify/ and
+# compiles the translated broadcast.cu.cpp from THERE (quote-include resolves next to
+# it). An incremental relink only re-hipifies the changed .cu, so a brand-new header
+# is NOT auto-staged into hipify/. gin_sdma_broadcast_policy.h has no CUDA constructs
+# (pure host/device C++), so a raw copy into the hipify dir is equivalent to a
+# hipified one -- stage it there too so the compile finds it, and into the source
+# tree so a future clean re-hipify picks it up.
+# The updated CMakeLists.txt adds the broadcast_perf -fgpu-rdc rocSHMEM-GIN device
+# link (the base image predates it and built broadcast_perf host-only), so it must
+# be overlaid and cmake re-run below, or the -D 3 kernels' gin.put fails to link
+# ("undefined hidden symbol: rocshmem::QueuePair::put_nbi").
 COPY projects/rccl-tests/src/broadcast.cu /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu
 COPY projects/rccl-tests/src/gin_sdma_broadcast_policy.h /workspace/rccl/src/projects/rccl-tests/src/gin_sdma_broadcast_policy.h
+COPY projects/rccl-tests/src/gin_sdma_broadcast_policy.h /workspace/rccl-tests/src/hipify/gin_sdma_broadcast_policy.h
+COPY projects/rccl-tests/src/CMakeLists.txt /workspace/rccl/src/projects/rccl-tests/src/CMakeLists.txt
 
 RUN set -eux; \
     grep -n "kBroadcastScatterAgMinDefault : v" /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu; \
     grep -n "GinRingSmTableBroadcastKernel" /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu; \
-    cd /workspace/rccl-tests && make -j16 broadcast_perf; \
+    cd /workspace/rccl-tests; \
+    cmake . >/tmp/bcast_reconfigure.log 2>&1 || { tail -n 40 /tmp/bcast_reconfigure.log; exit 1; }; \
+    make -j16 broadcast_perf; \
     strings /workspace/rccl-tests/broadcast_perf | grep -c ScatterAllgather

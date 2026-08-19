@@ -14,7 +14,7 @@
 #          ONLY_FUNCS="...|Broadcast" (Dockerfile / docker-gin-gda-sdma-build.bash). On an RCCL
 #          build without them it fails "ncclDevFuncId ... not found for coll:0"; disable with
 #          RUN_HOST_BASELINE=0 in that case.
-#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=6, -V 32), root sweep (-r all by default)
+#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=5, -V 32), root sweep (-r all by default)
 #
 # Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4, §4.8):
 #   Small/medium: flat/star fan-out from root; non-roots complete via receiver-side
@@ -334,7 +334,10 @@ if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
-# --- BC-C2: GIN hybrid Broadcast kernel (-D 3, NCCL_GIN_TYPE=6) ---
+# --- BC-C2: GIN hybrid Broadcast kernel (-D 3, NCCL_GIN_TYPE=5) ---
+# NCCL_GIN_TYPE=5 == NCCL_NET_DEVICE_GIN_ANVIL_SDMA in this (NCCL-2.30.7) tree. The
+# 2.28-era source branch this was ported from had ROCSHMEM_GDA at 5 and ANVIL_SDMA
+# at 6; here ROCSHMEM_GDA is 4 and ANVIL_SDMA is 5, so use 5 (matches AllGather AG-C2).
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
   echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
@@ -344,7 +347,7 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     -x NCCL_NET_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 \
     -x NCCL_GIN_ENABLE=1 \
-    -x NCCL_GIN_TYPE=6 \
+    -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS:-1}" \
     ${NCCL_GIN_ANVIL_SDMA_THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"} \
     ${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST="${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST}"} \
