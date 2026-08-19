@@ -45,8 +45,13 @@ case "${COLLECTIVE}" in
        : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}" ;;
   a2a) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda}"
        : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}" ;;
+  bcast) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast}"
+       # Broadcast needs its host baseline (broadcast_perf -D 0) too, so keep
+       # Broadcast in the generated kernel set. The GIN bring-up (A2A) gate still
+       # guards image validity; the Broadcast -D 3 gate runs via gin-sdma-bcast-test.bash.
+       : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}" ;;
   "")  ;;
-  *)   echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use ag|a2a); building full set" >&2 ;;
+  *)   echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use ag|a2a|bcast); building full set" >&2 ;;
 esac
 ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
 

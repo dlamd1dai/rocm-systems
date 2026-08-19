@@ -1,0 +1,27 @@
+# Clean, reproducible relink of broadcast_perf onto the canonical GIN Anvil-SDMA image.
+#
+# Rationale: a from-scratch `docker-gin-gda-sdma-build.bash` is heavy (it rebuilds
+# rocSHMEM + RCCL from source) and can be blocked by Docker Hub's anonymous pull
+# rate limit on `FROM ubuntu:24.04`. Since RCCL and rocSHMEM are unchanged and only
+# the rccl-tests Broadcast source changed (projects/rccl-tests/src/broadcast.cu plus
+# its pure policy header gin_sdma_broadcast_policy.h), this stage recompiles just
+# rccl-tests from the updated source using the exact cmake config already baked into
+# /workspace/rccl-tests. This is Dockerfile-based (reproducible), not a
+# `docker commit` of an interactive container. Build context = repo root.
+#
+#   docker build -f ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma-bcast-relink \
+#       -t rccl-gin-gda-sdma-713:latest .
+ARG BASE_IMAGE=rccl-gin-gda-sdma-713:latest
+FROM ${BASE_IMAGE}
+
+# Overlay only the changed rccl-tests source, then relink using the pre-configured
+# build tree. broadcast.cu #includes gin_sdma_broadcast_policy.h (pure host/device
+# tier policy), so both must be overlaid for the relink to see the current design.
+COPY projects/rccl-tests/src/broadcast.cu /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu
+COPY projects/rccl-tests/src/gin_sdma_broadcast_policy.h /workspace/rccl/src/projects/rccl-tests/src/gin_sdma_broadcast_policy.h
+
+RUN set -eux; \
+    grep -n "kBroadcastScatterAgMinDefault : v" /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu; \
+    grep -n "GinRingSmTableBroadcastKernel" /workspace/rccl/src/projects/rccl-tests/src/broadcast.cu; \
+    cd /workspace/rccl-tests && make -j16 broadcast_perf; \
+    strings /workspace/rccl-tests/broadcast_perf | grep -c ScatterAllgather
