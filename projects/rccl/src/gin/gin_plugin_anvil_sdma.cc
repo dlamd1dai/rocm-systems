@@ -7,7 +7,7 @@
 #ifdef ENABLE_ROCSHMEM_GIN
 
 /**
- * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=5).
+ * GIN plugin: SDMA Anvil device path (NCCL_GIN_TYPE=6).
  * Small messages use inlined IPC flat stores via GIN-owned device-memory peer table in GPU context.
  * Large messages use standalone Anvil SDMA (gin_anvil_sdma_factory).
  */
@@ -149,6 +149,16 @@ static ncclResult_t ginAnvilDevices(int* ndev) {
   return ncclSuccess;
 }
 
+// v14 GIN plugins expose GIN capability flags via getGinProperties. The Anvil
+// SDMA backend uses intra-node LSA (flat) signals, which behave as both strong
+// and VA-addressable signals; report both as supported (matches the behavior
+// previously injected by the v13->v14 shim for internal plugins).
+static ncclResult_t ginAnvilGetGinProperties(ncclGinProperties_t* ginProps) {
+  ginProps->supportsStrongSignals = true;
+  ginProps->supportsVASignals = true;
+  return ncclSuccess;
+}
+
 static ncclResult_t ginAnvilGetProperties(int dev, ncclNetProperties_v12_t* props) {
   memset(props, 0, sizeof(*props));
   props->name = const_cast<char*>("gin-anvil-sdma");
@@ -187,11 +197,7 @@ static int ginAnvilSdmaNumChannels() {
   // Forced to a single SDMA channel. Multi-channel (>=4 channels) at
   // >=256 MiB/peer aborts with a fail-loud "unhandled system error" on
   // 8x MI355X, and the collective GIN-put paths issue their puts from a single
-  // warp anyway (channel 0), so additional channels provide no benefit. The
-  // multi-channel machinery (per-(peer,channel) queue handles, effectiveChannel,
-  // dirty tracking, Flush) is retained and simply operates with numChannels==1,
-  // so nothing downstream changes. The former NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS
-  // tunable is intentionally no longer honored.
+  // warp anyway (channel 0), so additional channels provide no benefit.
   return 1;
 }
 
@@ -489,7 +495,7 @@ fail:
   return ret;
 }
 
-static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_v13_t* config, void** outGinCtx,
+static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_t* config, void** outGinCtx,
                                           ncclNetDeviceHandle_v11_t** outDevHandle) {
   ginAnvilCollCtx* cctx = (ginAnvilCollCtx*)collComm;
   ncclResult_t ret = ncclSuccess;
@@ -629,6 +635,7 @@ __attribute__((visibility("default"))) ncclGin_t ncclGinAnvilSdmaPlugin = {
   .name = "gin-anvil-sdma",
   .init = ginAnvilInit,
   .devices = ginAnvilDevices,
+  .getGinProperties = ginAnvilGetGinProperties,
   .getProperties = ginAnvilGetProperties,
   .listen = ginAnvilListen,
   .connect = ginAnvilConnect,
@@ -639,11 +646,6 @@ __attribute__((visibility("default"))) ncclGin_t ncclGinAnvilSdmaPlugin = {
   .destroyContext = ginAnvilDestroyContext,
   .closeColl = ginAnvilCloseColl,
   .closeListen = ginAnvilCloseListen,
-  .iput = NULL,
-  .iputSignal = NULL,
-  .iget = NULL,
-  .iflush = NULL,
-  .test = NULL,
   .ginProgress = ginAnvilGinProgress,
   .queryLastError = ginAnvilQueryLastError,
   .finalize = ginAnvilFinalize,
