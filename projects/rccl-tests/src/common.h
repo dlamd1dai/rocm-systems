@@ -339,6 +339,15 @@ typedef enum { ncclCoarse        = 0,
                nccl_NUM_MTYPES   = 4 } ncclMemoryType_t;
 extern const char *test_memorytypes[nccl_NUM_MTYPES];
 extern int deviceCtaCount; // number of CTAs for device implementation
+extern int deviceImpl;     // selected -D device implementation (0 = host)
+extern int deviceTimingMode;
+extern int devtimeLoop;
+extern int devtimeSkip;
+extern int devtimeLoopMid;
+extern int devtimeLoopLarge;
+extern int devtimeSkipMid;
+extern int devtimeSkipLarge;
+extern int devtimeCheck;
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
