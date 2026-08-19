@@ -378,9 +378,14 @@ struct ncclGinApi_ResetCounter<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 
 template <>
 struct ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
-  NCCL_DEVICE_INLINE static uint64_t* call(ncclGinCtx ctx, ncclGinSignal_t signalId) {
+  NCCL_DEVICE_INLINE static ncclGinOffsetPtr call(ncclGinCtx ctx, ncclGinSignal_t signalId) {
+    using nccl::gin::anvil::detail::anvilCtxValid;
+    using nccl::utility::loadConst;
     ncclGinAnvilSdmaGPUContext* rsCtx = (ncclGinAnvilSdmaGPUContext*)ctx.handle;
-    return nccl::gin::anvil::detail::anvilSignalPtrOrDummy(rsCtx, signalId);
+    assert(anvilCtxValid(rsCtx));
+    uint64_t* signals = loadConst(&rsCtx->signals);
+    assert(signals != nullptr);
+    return {signals + signalId, 0};
   }
 };
 
@@ -399,7 +404,10 @@ struct ncclGinApi_ResetSignal<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
 template <>
 struct ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ANVIL_SDMA> {
   template <typename Coop>
-  NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, Coop coop, cuda::memory_order ord, uint32_t* abortFlag) {
+  NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, Coop coop, bool hasDescriptor,
+                                      ncclGinDescriptorSmem* descriptor, cuda::memory_order ord, uint32_t* abortFlag) {
+    (void)hasDescriptor;
+    (void)descriptor;
     (void)ord;
     (void)abortFlag;
     using nccl::utility::loadConst;
