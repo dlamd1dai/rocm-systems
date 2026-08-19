@@ -133,12 +133,25 @@ testResult_t testLaunchDeviceKernelThresholdCtas(F kernel, void* sendbuff, size_
 // fast path; the handle is a small POD ({bufHandle, nSlots}) assigned during
 // ncclDevCommCreate.
 template <typename F>
-testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle) {
+testResult_t testLaunchDeviceKernelThresholdLL(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, size_t sdmaThresholdOverride, ncclLLA2AHandle llHandle, int gridCtas) {
   if (kernel == nullptr) return testNotImplemented;
   ncclDevComm* devComm = (ncclDevComm*)comm;
   ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
   ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
-  kernel<<<deviceCtaCount, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm, sdmaThresholdOverride, llHandle);
+  return testSuccess;
+}
+
+// Like common.h's testLaunchDeviceKernel but the caller picks the grid (CTA count).
+template <typename F>
+testResult_t testLaunchDeviceKernelCtas(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int gridCtas) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclDevComm* devComm = (ncclDevComm*)comm;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  if (gridCtas < 1) gridCtas = 1;
+  kernel<<<gridCtas, 512, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
   return testSuccess;
 }
 #endif  // ENABLE_DEVICE_API && >= 2.28.0
@@ -211,6 +224,18 @@ static inline int bcastRingCtas() {
   return p2;
 }
 
+// Parse NCCL_GIN_ANVIL_BCAST_CTAS (diagnostic pin) into a size_t, returning the
+// "unset" sentinel when absent/empty/unparseable so bcastHybridCtas()/bcastSagCtas()
+// fall back to the size-adaptive ladder.
+static inline size_t BroadcastParseCtasEnv() {
+  const char* e = getenv("NCCL_GIN_ANVIL_BCAST_CTAS");
+  if (e == nullptr || e[0] == '\0') return gin_sdma::kBroadcastCtasUnset;
+  char* end = nullptr;
+  unsigned long long v = strtoull(e, &end, 10);
+  if (end == e) return gin_sdma::kBroadcastCtasUnset;
+  return (size_t)v;
+}
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
 testResult_t BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
   if (!reqs || !commProperties) return testInternalError;
@@ -221,10 +246,10 @@ testResult_t BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirem
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
-      // Barriers must cover BOTH the -V/deviceCtaCount kernels (SAG, flat, P2P) and
-      // the ring's own (larger) CTA count, which it launches decoupled from -V.
+      // Barriers must cover BOTH the size-adaptive hybrid/SAG grids (pool =
+      // max(-V, ladder peak)) and the ring's own (larger) CTA count.
       {
-        int barCtas = deviceCtaCount > bcastRingCtas() ? deviceCtaCount : bcastRingCtas();
+        int barCtas = gin_sdma::bcastPoolCtas(deviceCtaCount, bcastRingCtas());
         reqs->barrierCount = barCtas;
         reqs->lsaBarrierCount = barCtas;
       }
@@ -267,8 +292,8 @@ bool BroadcastGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* re
   switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: { // GinHybridBroadcastKernel: LSA direct (small) + root GIN puts (large)
-      // Cover both -V/deviceCtaCount kernels and the ring's own larger CTA count.
-      int barCtas = deviceCtaCount > bcastRingCtas() ? deviceCtaCount : bcastRingCtas();
+      // Cover hybrid/SAG size-adaptive grids and the ring's own larger CTA count.
+      int barCtas = gin_sdma::bcastPoolCtas(deviceCtaCount, bcastRingCtas());
       reqs->barrierCount = barCtas;
       reqs->lsaBarrierCount = barCtas;
       // >=2 for the scatter+allgather large tier's two signal indices (§4.8).
@@ -1167,6 +1192,8 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
         // struct rather than ncclCommCount (which would fault on a corrupted comm).
         const int sagRanks = (int)((struct ncclDevComm*)comm)->nRanks;
         const size_t msgBytes = count * wordSize(type);
+        static const size_t bcastCtasEnv = BroadcastParseCtasEnv();
+        const int hybridPool = gin_sdma::bcastHybridPoolCtas(deviceCtaCount);
         if (gin_sdma::bcastUseRing(msgBytes, count, sagRanks, bcastRingMin)) {
           const size_t nChunks = (size_t)gin_sdma::bcastRingChunks(msgBytes, bcastRingCtas(), bcastRingChunksEnv);
           // Full edge-disjoint decomposition (all N-1 links) built + uploaded
@@ -1211,14 +1238,19 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
           return testSuccess;
         }
         if (gin_sdma::bcastUseScatterAllgather(msgBytes, count, sagRanks, bcastSagMin)) {
-          TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinScatterAllgatherBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+          const int sagGrid = gin_sdma::bcastSagCtas(msgBytes, sagRanks, bcastThr, bcastCtasEnv, hybridPool);
+          TESTCHECK(testLaunchDeviceKernelCtas(SPECIALIZE_KERNEL(GinScatterAllgatherBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, sagGrid));
           return testSuccess;
         }
+        {
+          const int llSlots = g_bcastLLHandle.nSlots;
+          const int hybridGrid = gin_sdma::bcastHybridCtas(msgBytes, bcastThr, llSlots, g_bcastLLMaxBytes, bcastCtasEnv, hybridPool);
 #if defined(BC_HAVE_LL)
-        TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr, g_bcastLLHandle));
+          TESTCHECK(testLaunchDeviceKernelThresholdLL(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr, g_bcastLLHandle, hybridGrid));
 #else
-        TESTCHECK(testLaunchDeviceKernelThreshold(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr));
+          TESTCHECK(testLaunchDeviceKernelThresholdCtas(SPECIALIZE_KERNEL(GinHybridBroadcastKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, bcastThr, hybridGrid));
 #endif
+        }
         return testSuccess;
       }
 #endif

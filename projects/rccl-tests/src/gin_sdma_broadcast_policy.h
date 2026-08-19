@@ -198,6 +198,71 @@ GIN_SDMA_HD inline BcastTier bcastKernelTier(size_t msgBytes, size_t sdmaThresho
   return BcastTier::Flat;
 }
 
+// Sentinel meaning "CTA-count env var unset/empty/unparseable"; bcastHybridCtas() /
+// bcastSagCtas() fall back to the size-adaptive ladder when the env value is this.
+static constexpr size_t kBroadcastCtasUnset = (size_t)-1;
+
+// Broadcast -D 3 size-adaptive CTA count (decoupled from -V, like AllGather). Keyed
+// off the SAME tier predicates the kernels evaluate:
+//   * LL tier (tiny, eligible): 1 CTA (kernel returns early for blockIdx.x != 0).
+//   * LSA-direct tier (msg <= threshold, or SAG slice <= threshold): ~16 CTAs.
+//   * GIN-put / Anvil-SDMA tier: few (4) CTAs -- only nRanks threads issue puts.
+// NCCL_GIN_ANVIL_BCAST_CTAS pins a fixed count (diagnostic), clamped to the pool.
+static constexpr int kBroadcastCtasLsa  = 16;
+static constexpr int kBroadcastCtasSdma = 4;
+static constexpr int kBroadcastCtasLL   = 1;
+
+GIN_SDMA_HD inline int bcastHybridMaxCtas() {
+  return (kBroadcastCtasLsa > kBroadcastCtasSdma) ? kBroadcastCtasLsa : kBroadcastCtasSdma;
+}
+
+// Barrier/lsaBarrier/signal pool for the hybrid + SAG kernels: max(-V, ladder peak).
+GIN_SDMA_HD inline int bcastHybridPoolCtas(int deviceCtaCount) {
+  const int maxTier = bcastHybridMaxCtas();
+  return (deviceCtaCount > maxTier) ? deviceCtaCount : maxTier;
+}
+
+// Full pool covering hybrid/SAG/P2P grids AND the ring's independent CTA count.
+GIN_SDMA_HD inline int bcastPoolCtas(int deviceCtaCount, int ringCtasPeak) {
+  int pool = bcastHybridPoolCtas(deviceCtaCount);
+  return (ringCtasPeak > pool) ? ringCtasPeak : pool;
+}
+
+// Tier predicate for the flat hybrid kernel and SAG slice sizing.
+GIN_SDMA_HD inline bool bcastChunkUsesLsaTier(size_t msgBytes, size_t sdmaThreshold) {
+  return msgBytes <= sdmaThreshold;
+}
+
+// Launched grid for GinHybridBroadcastKernel (-D 3 flat/LL/LSA path).
+GIN_SDMA_HD inline int bcastHybridCtas(size_t msgBytes, size_t sdmaThreshold,
+                                       int llSlots, size_t llMaxBytes,
+                                       size_t envCtas, int poolCtas) {
+  if (poolCtas < 1) poolCtas = 1;
+  if (envCtas != kBroadcastCtasUnset && envCtas > 0)
+    return (envCtas > (size_t)poolCtas) ? poolCtas : (int)envCtas;
+  if (msgBytes <= sdmaThreshold) {
+    if (bcastLLEligible(msgBytes, llSlots, llMaxBytes))
+      return kBroadcastCtasLL;
+    const int adaptive = kBroadcastCtasLsa;
+    return (adaptive > poolCtas) ? poolCtas : adaptive;
+  }
+  const int adaptive = kBroadcastCtasSdma;
+  return (adaptive > poolCtas) ? poolCtas : adaptive;
+}
+
+// Launched grid for GinScatterAllgatherBroadcastKernel. Keys off the per-rank
+// allgather slice (msgBytes / nRanks), matching the AllGather adaptive ladder.
+GIN_SDMA_HD inline int bcastSagCtas(size_t msgBytes, int nRanks, size_t sdmaThreshold,
+                                    size_t envCtas, int poolCtas) {
+  if (poolCtas < 1) poolCtas = 1;
+  if (envCtas != kBroadcastCtasUnset && envCtas > 0)
+    return (envCtas > (size_t)poolCtas) ? poolCtas : (int)envCtas;
+  size_t sliceBytes = (nRanks > 0) ? (msgBytes / (size_t)nRanks) : msgBytes;
+  const int adaptive = bcastChunkUsesLsaTier(sliceBytes, sdmaThreshold)
+                           ? kBroadcastCtasLsa : kBroadcastCtasSdma;
+  return (adaptive > poolCtas) ? poolCtas : adaptive;
+}
+
 // ginSignalCount for Broadcast case 3: >=2 so the SAG two-signal scheme works.
 GIN_SDMA_HD inline int bcastSignalCount(int deviceCtaCount) {
   return (deviceCtaCount < 2) ? 2 : deviceCtaCount;

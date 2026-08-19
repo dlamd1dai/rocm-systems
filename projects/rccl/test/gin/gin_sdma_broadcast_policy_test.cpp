@@ -216,6 +216,67 @@ TEST(BcastSignalCount, FloorOfTwo) {
   EXPECT_EQ(bcastSignalCount(8), 8);
 }
 
+// ---- bcastHybridCtas / bcastSagCtas: size-adaptive ladder, clamped to pool ----
+
+TEST(BcastPolicyCtas, HybridLsaTierUsesLsaCtaCount) {
+  const int pool = bcastHybridPoolCtas(16);
+  const size_t thr = kBroadcastSdmaThresholdDefault;
+  EXPECT_EQ(bcastHybridCtas(thr, thr, 100000, kBroadcastLLMaxBytes, kBroadcastCtasUnset, pool),
+            kBroadcastCtasLsa);
+  EXPECT_EQ(bcastHybridCtas(1024, thr, 0, kBroadcastLLMaxBytes, kBroadcastCtasUnset, pool),
+            kBroadcastCtasLsa);
+}
+
+TEST(BcastPolicyCtas, HybridLLTierUsesOneCta) {
+  const int pool = bcastHybridPoolCtas(16);
+  const size_t thr = kBroadcastSdmaThresholdDefault;
+  EXPECT_EQ(bcastHybridCtas(800, thr, 100, kBroadcastLLMaxBytes, kBroadcastCtasUnset, pool),
+            kBroadcastCtasLL);
+}
+
+TEST(BcastPolicyCtas, HybridSdmaTierUsesSdmaCtaCount) {
+  const int pool = bcastHybridPoolCtas(16);
+  const size_t thr = kBroadcastSdmaThresholdDefault;
+  EXPECT_EQ(bcastHybridCtas(thr + 1, thr, 0, kBroadcastLLMaxBytes, kBroadcastCtasUnset, pool),
+            kBroadcastCtasSdma);
+  EXPECT_EQ(bcastHybridCtas(64ull << 20, thr, 0, kBroadcastLLMaxBytes, kBroadcastCtasUnset, pool),
+            kBroadcastCtasSdma);
+}
+
+TEST(BcastPolicyCtas, SagKeysOffPerRankSlice) {
+  const int pool = bcastHybridPoolCtas(16);
+  const size_t thr = kBroadcastSdmaThresholdDefault;
+  // 128 MiB / 8 ranks = 16 MiB slice -> SDMA tier -> 4 CTAs.
+  EXPECT_EQ(bcastSagCtas(128ull << 20, 8, thr, kBroadcastCtasUnset, pool), kBroadcastCtasSdma);
+  // 2 MiB / 8 = 256 KiB slice -> at threshold -> LSA tier -> 16 CTAs.
+  EXPECT_EQ(bcastSagCtas(2ull << 20, 8, thr, kBroadcastCtasUnset, pool), kBroadcastCtasLsa);
+}
+
+TEST(BcastPolicyCtas, EnvPinHonoredWithinPool) {
+  const int pool = bcastHybridPoolCtas(64);
+  const size_t thr = kBroadcastSdmaThresholdDefault;
+  EXPECT_EQ(bcastHybridCtas(1024, thr, 0, kBroadcastLLMaxBytes, 8, pool), 8);
+  EXPECT_EQ(bcastHybridCtas(64ull << 20, thr, 0, kBroadcastLLMaxBytes, 8, pool), 8);
+  EXPECT_EQ(bcastHybridCtas(1024, thr, 0, kBroadcastLLMaxBytes, 0, pool), kBroadcastCtasLsa);
+}
+
+TEST(BcastPolicyCtas, GridNeverExceedsPool) {
+  const size_t msgs[] = {128, 800, 262144, 262145, 64ull << 20};
+  const int deviceVs[] = {1, 4, 16, 32, 128};
+  const size_t pins[] = {kBroadcastCtasUnset, 0, 1, 8, 200, 100000};
+  for (int v : deviceVs) {
+    const int pool = bcastHybridPoolCtas(v);
+    for (size_t m : msgs) {
+      for (size_t pin : pins) {
+        const int g = bcastHybridCtas(m, kBroadcastSdmaThresholdDefault, 0,
+                                      kBroadcastLLMaxBytes, pin, pool);
+        EXPECT_GE(g, 1);
+        EXPECT_LE(g, pool) << "msg=" << m << " V=" << v << " pin=" << pin;
+      }
+    }
+  }
+}
+
 // --------------------------------- sagChunk ----------------------------------
 
 TEST(SagChunk, GuardsNonPositiveRanks) {

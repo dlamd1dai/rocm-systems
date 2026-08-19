@@ -14,7 +14,9 @@
 #          ONLY_FUNCS="...|Broadcast" (Dockerfile / docker-gin-gda-sdma-build.bash). On an RCCL
 #          build without them it fails "ncclDevFuncId ... not found for coll:0"; disable with
 #          RUN_HOST_BASELINE=0 in that case.
-#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=5, -V 32), root sweep (-r all by default)
+#   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=5, -V sets barrier/signal pool)
+#          Size-adaptive CTA count (like AllGather): ~16 for LSA tier, 4 for GIN/SDMA,
+#          1 for LL; decoupled from -V. Pin with NCCL_GIN_ANVIL_BCAST_CTAS. Root sweep
 #
 # Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4, §4.8):
 #   Small/medium: flat/star fan-out from root; non-roots complete via receiver-side
@@ -43,10 +45,10 @@ DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
 HOST_RANKS="${HOST_RANKS:-0}"     # -R register mode for host path (0 = none)
 GIN_RANKS="${GIN_RANKS:-2}"       # -R register mode for GIN path (2 = symmetric, REQUIRED for -D 3)
-# BC-C2 runs the -D 3 hybrid at -V 32: both the LSA branch (small/mid) and the SDMA branch
-# scale with CTAs for broadcast (8x MI355X, 2026-07-27, OOP): 131K 15.8us@V8 -> 10.1@V32,
-# 128M 41.8 GB/s@V8 -> 54.1@V32; V16 already recovers most of it (49.4), V24/V32 add the top
-# end. Extra SDMA channels (NUM_CHANNELS 2/4) did not help. Mirrors AllGather AG-C2 rationale.
+# BC-C2 runs the -D 3 hybrid with a size-adaptive CTA grid (decoupled from -V, like
+# AllGather): ~16 CTAs for the LSA-direct tier, 4 for the GIN-put/SDMA tier, 1 for
+# LL. -V sizes the barrier/signal pool (default 32 on MI355X gate). NCCL_GIN_ANVIL_BCAST_CTAS
+# pins a fixed count for diagnostics. Ring tier (>=32 MiB default) self-selects ~128 CTAs.
 DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-32}"
 ROOT="${ROOT:-all}"               # broadcast root: 'all' sweeps 0..NP-1, or pin an integer
 FACTOR="${FACTOR:-2}"
@@ -244,7 +246,7 @@ else
   echo "  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, CTAs=${DEVICE_CTA_COUNT}, LSA<->GIN threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:-${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-256K default}})"
+  echo "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, adaptive CTAs, pool=-V ${DEVICE_CTA_COUNT}, LSA<->GIN threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:-${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-256K default}})"
 else
   echo "  BC-C2 gin:   skipped (RUN_GIN_SDMA=0)"
 fi
@@ -339,7 +341,7 @@ fi
 # 2.28-era source branch this was ported from had ROCSHMEM_GDA at 5 and ANVIL_SDMA
 # at 6; here ROCSHMEM_GDA is 4 and ANVIL_SDMA is 5, so use 5 (matches AllGather AG-C2).
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default})"
+  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (pool=-V ${DEVICE_CTA_COUNT}, adaptive CTAs, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none \
