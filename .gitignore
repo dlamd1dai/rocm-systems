@@ -20,3 +20,6 @@ __pycache__
 /projects/cuid/_build
 build/
 .worktrees/
+
+# Python virtual environments
+.venv/
