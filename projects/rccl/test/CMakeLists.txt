@@ -456,6 +456,21 @@ if(BUILD_TESTS)
     endif()
   endif()
 
+  # rccl-UnitTestsGdr: Compiles the peer-memory detection helper (gdr_peermem.cc,
+  # shared by the net_ib and net_ib_cast transports) directly so the sysfs scan can
+  # be exercised against a mock `memory_peers` tree in a temp directory. The helper
+  # is pure (no HIP, no librccl.so symbols, no GPU), so this target builds in
+  # Release and Debug.
+  list(APPEND RCCL_TEST_EXECUTABLES rccl-UnitTestsGdr)
+
+  set(TEST_GDR_SOURCE_FILES
+    GdrPeerMemTests.cpp
+    ../src/misc/gdr_peermem.cc
+    common/main_altrsmi.cpp
+  )
+
+  add_executable(rccl-UnitTestsGdr ${TEST_GDR_SOURCE_FILES})
+
   # rccl-UnitTestsAmdSmi: tests for the amdsmi_wrap layer.
   #
   # AmdSmiFabricTests.cpp covers the fabric predicates and struct layout pinned in
@@ -545,11 +560,12 @@ if(BUILD_TESTS)
       transport/NetMPITests.cpp
       transport/ShmMPITests.cpp
       transport/NetIbMPI/GeneralTests.cpp
+      transport/NetIbMPI/GdrFlushTests.cpp
       transport/NetIbMPI/NicFusionTests.cpp
       transport/NetIbMPI/CastTests.cpp
       transport/NetIbMPI/FaultInjectTests.cpp
       transport/NetIbMPI/OpsFaultUnitTests.cpp
-      transport/GinMPI/GinMPITests.cpp
+      transport/RmaMPI/RmaMPITests.cpp
       transport/NetIbMPI/StressTests.cpp
       transport/GinDeviceMPITests.cpp
       WarpSpeedMPITests.cpp
@@ -599,7 +615,16 @@ if(BUILD_TESTS)
         set_target_properties(${test_executable} PROPERTIES LINK_FLAGS "${MPI_CXX_LINK_FLAGS}")
       endif()
     endif()
-    if(BUILD_SHARED_LIBS)
+    # rccl-UnitTestsGinAnvilPlugin is a self-contained host unit test: it compiles
+    # the plugin sources directly and provides its own stubs (bootstrap/devr/debug/
+    # factory), so it must NOT link librccl.so. When RCCL is built with
+    # ENABLE_ROCSHMEM_GIN=ON but ENABLE_ROCSHMEM=OFF, librccl.so carries unresolved
+    # rocSHMEM symbols (e.g. rocshmem::envvar::log_flags) that would fail at load
+    # time for any executable linking it.
+    if(test_executable STREQUAL "rccl-UnitTestsGinAnvilPlugin")
+      # Intentionally no rccl link; needed symbols come from the compiled-in
+      # source(s) + stubs and RCCL_COMMON_LINK_LIBS (hip/hsa/gtest/dl).
+    elseif(BUILD_SHARED_LIBS)
       target_link_libraries(${test_executable} PRIVATE rccl)
       if(${HOST_OS_ID} STREQUAL "debian")
         set_property(TARGET ${test_executable} PROPERTY INSTALL_RPATH "${CMAKE_BINARY_DIR}")
