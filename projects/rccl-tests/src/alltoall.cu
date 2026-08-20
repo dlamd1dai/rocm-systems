@@ -42,7 +42,7 @@ testResult_t AlltoAllInitData(struct threadArgs* args, ncclDataType_t type, nccl
   return testSuccess;
 }
 
-void AlltoAllGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
+void AlltoAllGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
   double baseBw = (double)(count * nranks * typesize) / 1.0E9 / sec;
 
   *algBw = baseBw;
@@ -52,8 +52,13 @@ void AlltoAllGetBw(size_t count, int typesize, double sec, double* algBw, double
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
 // set devComm reqs for alltoall device kernels
-testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
-  if (!reqs || !commProperties) return testInternalError;
+testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclComm_t comm) {
+  if (!reqs || !comm) return testInternalError;
+
+  ncclCommProperties_t commProperties = NCCL_COMM_PROPERTIES_INITIALIZER;
+  if (ncclCommQueryProperties(comm, &commProperties) != ncclSuccess) {
+    return testNcclError;
+  }
 
   switch(deviceImpl) {
     case 1: // NvlAlltoAllKernel
@@ -61,7 +66,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       reqs->lsaBarrierCount = deviceCtaCount;
       return testSuccess;
     case 3: // GinAlltoAllKernel: all CTAs participate, one barrier per CTA
-      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+      if (commProperties.ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
@@ -74,7 +79,7 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
 #endif
       return testSuccess;
     case 4: // HybridAlltoAllKernel: CTA 0 = GIN (1 barrier), CTAs 1..N = LSA
-      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+      if (commProperties.ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInternalError;
       }
@@ -435,10 +440,13 @@ testResult_t AlltoAllRunTest(struct threadArgs* args, int root, ncclDataType_t t
   return testSuccess;
 }
 
-struct testEngine ncclTestEngine = {
-  .getBuffSize = AlltoAllGetBuffSize,
-  .runTest = AlltoAllRunTest,
-#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-  .getDevCommRequirements = AlltoAllGetDevCommRequirements
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ AlltoAllGetBuffSize,
+  /* .runTest = */ AlltoAllRunTest,
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)
+  /* .initCommConfig = */ nullptr,
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0) || (defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0))
+  /* .getDevCommRequirements = */ AlltoAllGetDevCommRequirements
 #endif
 };
