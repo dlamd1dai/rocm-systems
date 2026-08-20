@@ -298,7 +298,7 @@ RUN cd rccl/src/projects/rccl \
        's/if (comm->enableRocshmem && comm->nNodes > 1 && (comm->nRanks\/comm->nNodes == 8) && comm->rocshmemThreshold <= 1048576)/if (comm->enableRocshmem)/' \
        src/rccl_wrap.cc
 RUN cd rccl/src/projects/rccl \
- && ./install.sh --amdgpu_targets=${GPU_TARGETS} --prefix=${RCCL_INSTALL_PREFIX} --no-device-linker --no_clean \
+ && ./install.sh --amdgpu_targets=${GPU_TARGETS} --prefix=${RCCL_INSTALL_PREFIX} --no_clean \
       --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem" \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "--debug")
 
