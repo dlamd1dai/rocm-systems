@@ -1,4 +1,5 @@
 #! /usr/bin/env bash
+set -euo pipefail
 
 # Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=6) needs rocSHMEM built with USE_SDMA=ON. Default
 # ROCSHMEM_USE_SDMA=1 passes --build-arg to the Dockerfile; set ROCSHMEM_USE_SDMA=0 to opt out.
