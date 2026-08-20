@@ -92,7 +92,7 @@ ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
 # Build hardening (runtime): assert real GIN Anvil-SDMA bring-up on GPUs.
 # A previous rebuild shipped an image whose communicator came up with
 # ginType=NONE ("GIN support is not enabled"); static checks cannot catch that,
-# so run a minimal Test#5 (NCCL_GIN_TYPE=5) and fail if GIN does not initialize.
+# so run a minimal Test#5 (NCCL_GIN_TYPE=6) and fail if GIN does not initialize.
 # Skips cleanly on GPU-less builders or when RCCL_IMAGE_GIN_SMOKE=0.
 #   RCCL_IMAGE_GIN_SMOKE=0  disable this assert
 #   GIN_SMOKE_NP=<n>        GPU/rank count (default 8)
@@ -105,7 +105,7 @@ if [ "${RCCL_IMAGE_GIN_SMOKE}" = "1" ]; then
   if [ ! -e /dev/kfd ]; then
     echo "WARN: GIN smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_GIN_SMOKE=0 to silence." >&2
   else
-    echo "=== Build hardening: GIN Anvil-SDMA smoke assert (NP=${GIN_SMOKE_NP}, NCCL_GIN_TYPE=5, -e ${GIN_SMOKE_SIZE}) ==="
+    echo "=== Build hardening: GIN Anvil-SDMA smoke assert (NP=${GIN_SMOKE_NP}, NCCL_GIN_TYPE=6, -e ${GIN_SMOKE_SIZE}) ==="
     GIN_SMOKE_LOG="$(mktemp)"
     RCCL_GIN_RUN_TESTS=5 TEST5_MLX5_PREFLIGHT=0 \
       bash "${DEV_ARTI_DIR}/scripts/gin-sdma-a2a-test.bash" "${GIN_SMOKE_NP}" "${GIN_SMOKE_SIZE}" \
