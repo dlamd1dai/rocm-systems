@@ -343,7 +343,7 @@ _should_run_test5() {
   return 0
 }
 
-# Host-initiated A2A paths (all -D 0), measured 8x MI355X (NCCL_GIN_TYPE=5,
+# Host-initiated A2A paths (all -D 0), measured 8x MI355X (NCCL_GIN_TYPE=6,
 # 2026-07-24), out-of-place busbw:
 #   * RING (SM copy): pin the channel count so the tuner does not collapse
 #     channels on large messages. Without the pin busbw cliffs hard past 8M
@@ -508,7 +508,7 @@ if _should_run_test5; then
     -x "NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP=${TEST5_A2A_DEVTIME_LOOP}"
     -x "NCCL_GIN_ANVIL_A2A_DEVTIME_SKIP=${TEST5_A2A_DEVTIME_SKIP}"
   )
-  # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=5), measured 8x MI355X
+  # GIN Anvil-SDMA A2A device paths (NCCL_GIN_TYPE=6), measured 8x MI355X
   # (2026-07-26), out-of-place:
   #   * -D 3 GinHybridAlltoAllKernel: size-hybrid. Per-peer chunk <=threshold
   #     uses a direct LSA all-peers copy (all CTAs; ~11us small-msg latency,
@@ -560,7 +560,7 @@ if _should_run_test5; then
       -x ROCSHMEM_SDMA_ENABLED=0 \
       -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
       -x NCCL_GIN_ENABLE=1 \
-      -x NCCL_GIN_TYPE=5 \
+      -x NCCL_GIN_TYPE=6 \
       -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
       "${TEST5_MPI_EXTRA[@]}" \
@@ -569,11 +569,11 @@ if _should_run_test5; then
   }
   case "${TEST5_MODE}" in
     d3)
-      echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=${TEST5_A2A_THRESHOLD}B/peer, SDMA above; V=${TEST5_D3_CTA_COUNT}, NCCL_GIN_TYPE=5, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=${TEST5_A2A_THRESHOLD}B/peer, SDMA above; V=${TEST5_D3_CTA_COUNT}, NCCL_GIN_TYPE=6, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
       _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     d4)
-      echo "=== Test#5: A2A, ${NP} gpus, GIN hybrid -D 4 LSA (V=${TEST5_D4_CTA_COUNT}, NCCL_GIN_TYPE=5, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GIN hybrid -D 4 LSA (V=${TEST5_D4_CTA_COUNT}, NCCL_GIN_TYPE=6, cudagraph=${TEST5_CUDAGRAPH}, w=${TEST5_WARMUP}, n=${TEST5_ITERS}) ==="
       _a2a_gin 4 "${TEST5_D4_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     *)

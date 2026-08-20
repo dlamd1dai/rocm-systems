@@ -1,6 +1,6 @@
 #! /usr/bin/env bash
 
-# Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=5) needs rocSHMEM built with USE_SDMA=ON. Default
+# Test#5 (GIN Anvil-SDMA, NCCL_GIN_TYPE=6) needs rocSHMEM built with USE_SDMA=ON. Default
 # ROCSHMEM_USE_SDMA=1 passes --build-arg to the Dockerfile; set ROCSHMEM_USE_SDMA=0 to opt out.
 # The Dockerfile upgrades rdma-core/libmlx5 from ${VERSION_CODENAME}-updates when available.
 # Optional CI: pass --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=1 to fail the build unless
