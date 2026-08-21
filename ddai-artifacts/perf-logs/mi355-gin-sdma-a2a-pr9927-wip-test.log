@@ -1,0 +1,82 @@
++ return 0
++ NCCL_GIN_ANVIL_SDMA_THRESHOLD=0
++ NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=8192
++ TEST5_A2A_THRESHOLD=2097152
++ TEST5_A2A_LSA_CTAS=0
++ TEST5_A2A_LL_MAX=0
++ TEST5_A2A_LL_CTAS=0
++ TEST5_A2A_SYNC_MODE=3
++ TEST5_A2A_DEVICE_TIMING=0
++ TEST5_A2A_DEVTIME_LOOP=20
++ TEST5_A2A_DEVTIME_SKIP=5
++ TEST5_MPI_EXTRA=(-x "NCCL_GIN_ANVIL_SDMA_THRESHOLD=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}" -x "NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=${NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK}" -x "NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=${TEST5_A2A_THRESHOLD}" -x "NCCL_GIN_ANVIL_A2A_LSA_CTAS=${TEST5_A2A_LSA_CTAS}" -x "NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=${TEST5_A2A_LL_MAX}" -x "NCCL_GIN_ANVIL_A2A_LL_CTAS=${TEST5_A2A_LL_CTAS}" -x "NCCL_GIN_ANVIL_A2A_SYNC_MODE=${TEST5_A2A_SYNC_MODE}" -x "NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=${TEST5_A2A_DEVICE_TIMING}" -x "NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP=${TEST5_A2A_DEVTIME_LOOP}" -x "NCCL_GIN_ANVIL_A2A_DEVTIME_SKIP=${TEST5_A2A_DEVTIME_SKIP}")
++ TEST5_MODE=d3
++ TEST5_D4_CTA_COUNT=8
++ TEST5_D3_CTA_COUNT=8
++ TEST5_CUDAGRAPH=0
++ TEST5_WARMUP=5
++ TEST5_ITERS=20
++ TEST5_GRAPH_ARGS=()
++ [[ 0 != 0 ]]
++ case "${TEST5_MODE}" in
++ echo '=== Test#5: A2A, 8 gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=2097152B/peer, SDMA above; V=8, NCCL_GIN_TYPE=6, cudagraph=0, w=5, n=20) ==='
+=== Test#5: A2A, 8 gpus, GIN Anvil SDMA -D 3 size-hybrid (LSA<=2097152B/peer, SDMA above; V=8, NCCL_GIN_TYPE=6, cudagraph=0, w=5, n=20) ===
++ _a2a_gin 3 8 128 4G
++ docker run --rm --init --ulimit memlock=-1:-1 --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged --group-add rdma rccl-gin-gda-sdma-a2a-pr9927 mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_DEBUG=VERSION -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=6 -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 -x HSA_FORCE_FINE_GRAIN_PCIE=1 -x NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 -x NCCL_GIN_ANVIL_SDMA_MAX_COPY_CHUNK=8192 -x NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLTOALL=2097152 -x NCCL_GIN_ANVIL_A2A_LSA_CTAS=0 -x NCCL_GIN_ANVIL_A2A_LL_MAX_BYTES=0 -x NCCL_GIN_ANVIL_A2A_LL_CTAS=0 -x NCCL_GIN_ANVIL_A2A_SYNC_MODE=3 -x NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=0 -x NCCL_GIN_ANVIL_A2A_DEVTIME_LOOP=20 -x NCCL_GIN_ANVIL_A2A_DEVTIME_SKIP=5 rccl-tests/alltoall_perf -b 128 -e 4G -f 2 -g 1 -R 2 -D 3 -A 1 -V 8 -w 5 -n 20
+# rccl-tests version 2.19.6-Unknown  rccl-headers=23007 rccl-library=23007
+# Collective test starting: alltoall_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 4294967296 step: 2(factor) warmup iters: 5 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.7-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                                          out-of-place                           in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong      algo     proto   nchannels 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)                                      
+         128             4     float    none      -1    13.38    0.01    0.01       0    13.63    0.01    0.01    N/A     N/A       N/A         N/A
+         256             8     float    none      -1    13.36    0.02    0.02       0    13.58    0.02    0.02    N/A     N/A       N/A         N/A
+         512            16     float    none      -1    14.62    0.04    0.03       0    14.89    0.03    0.03    N/A     N/A       N/A         N/A
+        1024            32     float    none      -1    17.33    0.06    0.05       0    17.40    0.06    0.05    N/A     N/A       N/A         N/A
+        2048            64     float    none      -1    26.47    0.08    0.07       0    23.71    0.09    0.08    N/A     N/A       N/A         N/A
+        4096           128     float    none      -1    23.74    0.17    0.15       0    23.74    0.17    0.15    N/A     N/A       N/A         N/A
+        8192           256     float    none      -1    24.06    0.34    0.30       0    23.84    0.34    0.30    N/A     N/A       N/A         N/A
+       16384           512     float    none      -1    32.47    0.50    0.44       0    25.52    0.64    0.56    N/A     N/A       N/A         N/A
+       32768          1024     float    none      -1    23.97    1.37    1.20       0    23.89    1.37    1.20    N/A     N/A       N/A         N/A
+       65536          2048     float    none      -1    24.02    2.73    2.39       0    23.97    2.73    2.39    N/A     N/A       N/A         N/A
+      131072          4096     float    none      -1    24.16    5.43    4.75       0    30.86    4.25    3.72    N/A     N/A       N/A         N/A
+      262144          8192     float    none      -1    25.30   10.36    9.07       0    24.60   10.66    9.32    N/A     N/A       N/A         N/A
+      524288         16384     float    none      -1    25.76   20.36   17.81       0    25.77   20.34   17.80    N/A     N/A       N/A         N/A
+     1048576         32768     float    none      -1    27.74   37.80   33.08       0    34.19   30.67   26.84    N/A     N/A       N/A         N/A
+     2097152         65536     float    none      -1    29.98   69.95   61.21       0    29.91   70.12   61.35    N/A     N/A       N/A         N/A
+     4194304        131072     float    none      -1    34.50  121.59  106.39       0    34.55  121.40  106.23    N/A     N/A       N/A         N/A
+     8388608        262144     float    none      -1    42.89  195.60  171.15       0    42.80  196.00  171.50    N/A     N/A       N/A         N/A
+    16777216        524288     float    none      -1    59.73  280.90  245.79       0    59.68  281.12  245.98    N/A     N/A       N/A         N/A
+    33554432       1048576     float    none      -1    94.41  355.43  311.00       0    94.74  354.18  309.91    N/A     N/A       N/A         N/A
+    67108864       2097152     float    none      -1   163.07  411.55  360.10       0   163.18  411.26  359.85    N/A     N/A       N/A         N/A
+   134217728       4194304     float    none      -1   300.22  447.06  391.18       0   300.24  447.04  391.16    N/A     N/A       N/A         N/A
+   268435456       8388608     float    none      -1   574.38  467.35  408.93       0   574.06  467.61  409.16    N/A     N/A       N/A         N/A
+   536870912      16777216     float    none      -1  1205.59  445.32  389.65       0  1160.56  462.60  404.77    N/A     N/A       N/A         N/A
+  1073741824      33554432     float    none      -1  2346.69  457.56  400.36       0  2280.51  470.83  411.98    N/A     N/A       N/A         N/A
+  2147483648      67108864     float    none      -1  4615.18  465.31  407.15       0  4516.73  475.45  416.02    N/A     N/A       N/A         N/A
+  4294967296     134217728     float    none      -1  8985.65  477.98  418.23       0  8932.89  480.80  420.70    N/A     N/A       N/A         N/A
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 144.453 
+#
+# Collective test concluded: alltoall_perf
+#
+
++ _trace_off
++ [[ 1 == 1 ]]
++ set +x
