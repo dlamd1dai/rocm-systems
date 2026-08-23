@@ -40,6 +40,7 @@ rcclTestsGetAlgoInfo_t rcclTestsGetAlgoInfo = NULL;
 rcclTestsGetProtocolName_t rcclTestsGetProtocolName = NULL;
 rcclTestsGetAlgoName_t rcclTestsGetAlgoName= NULL;
 rcclTestsGetSymkInfo_t rcclTestsGetSymkInfo = NULL;
+rcclTestsGetCollImplInfo_t rcclTestsGetCollImplInfo = NULL;
 
 static void loadRcclSyms() {
   static void* handle = NULL;
@@ -55,6 +56,7 @@ static void loadRcclSyms() {
   rcclTestsGetAlgoName      = (rcclTestsGetAlgoName_t)     dlsym(handle, "rcclGetAlgoName");
   rcclTestsGetProtocolName  = (rcclTestsGetProtocolName_t) dlsym(handle, "rcclGetProtocolName");
   rcclTestsGetSymkInfo      = (rcclTestsGetSymkInfo_t)     dlsym(handle, "rcclSymKGetInfo");
+  rcclTestsGetCollImplInfo  = (rcclTestsGetCollImplInfo_t) dlsym(handle, "rcclGetCollImplInfo");
 }
 
 // RCCL_FLOAT8 support
@@ -142,6 +144,14 @@ std::string rccl_output_format;
 static int report_cputime = 0;
 static int report_timestamps = 0;
 int deviceImpl = 0;  // non-static: per-collective device-timing hooks read this to pick the matching timed kernel
+int deviceTimingMode = 0;
+int devtimeLoop = 10;
+int devtimeSkip = 10;
+int devtimeLoopMid = 0;
+int devtimeLoopLarge = 0;
+int devtimeSkipMid = -1;
+int devtimeSkipLarge = -1;
+int devtimeCheck = 0;
 int unalign = 0;
 int memory_report = 0;
 
@@ -808,18 +818,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   Barrier(args);
 
-  // Device-time-only mode (NCCL_GIN_ANVIL_DEVICE_TIMING=2, legacy
-  // NCCL_GIN_ANVIL_A2A_DEVICE_TIMING=2): for collectives that provide a
+  // Device-time-only mode (--device_timing=2): for collectives that provide a
   // device-timing hook, skip the host/graph timed loop entirely and report the
   // in-kernel wall_clock64 measurement as the metric. Warmup and datacheck still
   // run (correctness). Mode 1 keeps the normal timed loop and augments with an
   // extra line; mode 0 is off.
-  int devTimeMode = 0;
-  if (deviceImpl != 0 && args->collTest->deviceTime != nullptr) {
-    const char* e = getenv("NCCL_GIN_ANVIL_DEVICE_TIMING");
-    if (!(e && *e)) e = getenv("NCCL_GIN_ANVIL_A2A_DEVICE_TIMING");
-    devTimeMode = (e && *e) ? atoi(e) : 0;
-  }
+  const int devTimeMode =
+      (deviceImpl != 0 && args->collTest->deviceTime != nullptr) ? deviceTimingMode : 0;
   // Device-time-only applies to the out-of-place pass (the reported metric). The
   // in-place pass keeps normal timing so its column stays valid.
   const bool deviceOnly = (devTimeMode == 2) && (in_place == 0);
@@ -924,30 +929,44 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     // *TimedKernel bodies call the same __device__ collective functions as the
     // production kernels, so collective correctness is covered; only the timing-only
     // loop/skip/stamp wrapper around them is not exercised by that datacheck.
-    double deviceDeltaSec = 0.0;
+    // deviceTime() leaves this negative when the timing hook produced no
+    // measurement -- the timed kernel never ran (non-GIN impl, unsupported op/type,
+    // count == 0, or loop < 1). Reporting that as the metric would divide by zero in
+    // getBw (0.00 us / inf GB/s), and the --devtime_check below would validate a stale
+    // buffer -- the warmup/production result (false pass), or raw init scratch under
+    // -w 0 (false fail) -- for a kernel that never executed. So WARN once and skip
+    // this row rather than emit a bogus metric or a misleading check verdict.
+    double deviceDeltaSec = -1.0;
     TESTCHECK(args->collTest->deviceTime(args, type, op, root, in_place, &deviceDeltaSec));
+    if (deviceDeltaSec <= 0.0) {
+      if (args->proc == 0 && args->thread == 0) {
+        fprintf(stderr, "# WARN --device_timing=2: no in-kernel device-time "
+                        "measurement for this size (timed kernel did not run: non-GIN impl, "
+                        "unsupported op/type, count==0, or loop<1); skipping row "
+                        "(size %ld bytes)\n", args->expectedBytes);
+      }
+      return testSuccess;
+    }
     deltaSec = deviceDeltaSec;
     cputimeSec = deviceDeltaSec;
 
-    // Opt-in validation of the TIMED path itself (NCCL_GIN_ANVIL_DEVTIME_CHECK=1).
-    // The hook just ran skip+loop back-to-back collectives into recvbuff; each
-    // iteration is a full deterministic collective over the unchanged sendbuff, so
-    // the final recvbuff equals `expected` from initData. Validate it HERE -- this
-    // is the only point the timed kernel's output is live, before the datacheck
-    // loop below re-inits buffers and overwrites it with the production path. Needs
-    // datacheck on (that is what populates `expected`). Combines wrong-element
-    // counts across threads/ranks so any rank's mismatch fails the run.
-    static const int devTimeCheck = []() {
-      const char* e = getenv("NCCL_GIN_ANVIL_DEVTIME_CHECK");
-      return (e && *e) ? atoi(e) : 0;
-    }();
-    if (devTimeCheck && datacheck) {
+    // Opt-in validation of the TIMED path itself (--devtime_check=1).
+    // Reached only when the timed kernel actually ran (deviceDeltaSec > 0 above), so
+    // recvbuff holds the timed kernel's output -- not a stale warmup/production
+    // buffer. The hook just ran skip+loop back-to-back collectives into recvbuff;
+    // each iteration is a full deterministic collective over the unchanged sendbuff,
+    // so the final recvbuff equals `expected` from initData. Validate it HERE -- the
+    // only point the timed kernel's output is live, before the datacheck loop below
+    // re-inits buffers and overwrites it with the production path. Needs datacheck on
+    // (that is what populates `expected`). Combines wrong-element counts across
+    // threads/ranks so any rank's mismatch fails the run.
+    if (devtimeCheck && datacheck) {
       int64_t timedWrong = 0;
       TESTCHECK(CheckData(args, type, op, root, in_place, &timedWrong));
       long long timedWrong1 = timedWrong;
       Allreduce(args, &timedWrong1, /*sum*/4);
       if (timedWrong1) {
-        fprintf(stderr, "\nERROR: NCCL_GIN_ANVIL_DEVTIME_CHECK: timed-kernel output datacheck "
+        fprintf(stderr, "\nERROR: --devtime_check: timed-kernel output datacheck "
                         "failed with %lld wrong elements (size %ld bytes)\n",
                         timedWrong1, args->expectedBytes);
         return testInternalError;
@@ -1177,23 +1196,32 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
       if (enable_in_place)
         TESTCHECK(BenchTime(args, type, op, root, 1));
       if(output_algo_proto_channels) {
-        if(args->collTest->getAlgoProtoChannels) {
+        if(args->collTest->getAlgoProtoChannels || args->collTest->getCollImplInfo) {
           int algo, proto, nchannels;
           const char* algoName = NULL;
           const char* protoName = NULL;
-          bool fromSymk = false;
+          bool haveInfo = false;
+          if (rcclTestsGetCollImplInfo && args->collTest->getCollImplInfo) {
+            int graphCapturing = (cudaGraphLaunches >= 1) ? 1 : 0;
+            if (args->collTest->getCollImplInfo(args->comms[0], args->nbytes / wordSize(type), type, op,
+                                                args->sendbuffs[0], args->recvbuffs[0], graphCapturing,
+                                                &algo, &proto, &nchannels) == testSuccess) {
+              haveInfo = true;
+            }
+          }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
-          if (test_ncclVersion >= NCCL_VERSION(2,27,0) && local_register == SYMMETRIC_REGISTER && ctaPolicy != NCCL_CTA_POLICY_ZERO && rcclTestsGetSymkInfo) {
+          if (!haveInfo && test_ncclVersion >= NCCL_VERSION(2,27,0) && local_register == SYMMETRIC_REGISTER && ctaPolicy != NCCL_CTA_POLICY_ZERO && rcclTestsGetSymkInfo) {
             if (args->collTest->getSymkInfo) {
               TESTCHECK(args->collTest->getSymkInfo(args->comms[0], args->nbytes / wordSize(type), type, op, &algo, &proto, &nchannels));
-              fromSymk = true;
+              haveInfo = true;
             }
           }
 #endif
-          if (!fromSymk) {
+          if (!haveInfo && args->collTest->getAlgoProtoChannels) {
             TESTCHECK(args->collTest->getAlgoProtoChannels(args->comms[0], args->nbytes / wordSize(type), type, &algo, &proto, &nchannels));
+            haveInfo = true;
           }
-          if (rcclTestsGetAlgoName && rcclTestsGetProtocolName) {
+          if (haveInfo && rcclTestsGetAlgoName && rcclTestsGetProtocolName) {
             NCCLCHECK(rcclTestsGetAlgoName(algo, &algoName));
             NCCLCHECK(rcclTestsGetProtocolName(proto, &protoName));
             PRINT("%8s  %8s  %10d", algoName, protoName, nchannels);
@@ -1664,13 +1692,21 @@ int main(int argc, char* argv[], char **envp) {
     {"rccl_output_format", required_argument, 0, 'Z'},              //RCCL
     {"rccl_output_file", required_argument, 0, 'X'},                //RCCL (output file for Reporter class)
     {"output_algo_proto_channels", required_argument, 0, 'A'},      //RCCL (changed from M)
+    {"device_timing", required_argument, 0, 'B'},
+    {"devtime_loop", required_argument, 0, 'L'},
+    {"devtime_skip", required_argument, 0, 'P'},
+    {"devtime_loop_mid", required_argument, 0, 'W'},
+    {"devtime_loop_large", required_argument, 0, 'Q'},
+    {"devtime_skip_mid", required_argument, 0, 'j'},
+    {"devtime_skip_large", required_argument, 0, 'k'},
+    {"devtime_check", required_argument, 0, 'H'},
     {"help", no_argument, 0, 'h'},
     {}
   };
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:u:Y:U:O:q:F:E:Z:X:A:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:J:S:M:u:Y:U:O:q:F:E:Z:X:A:B:L:P:W:Q:H:j:k:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -1854,6 +1890,35 @@ int main(int argc, char* argv[], char **envp) {
           return -1;
         }
         break;
+      case 'B':
+        deviceTimingMode = (int)strtol(optarg, NULL, 0);
+        if (deviceTimingMode < 0 || deviceTimingMode > 2) {
+          fprintf(stderr, "device_timing (-B) must be 0 (off), 1 (augment), or 2 (device-only), got %d\n",
+                  deviceTimingMode);
+          return -1;
+        }
+        break;
+      case 'L':
+        devtimeLoop = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'P':
+        devtimeSkip = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'W':
+        devtimeLoopMid = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'Q':
+        devtimeLoopLarge = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'j':
+        devtimeSkipMid = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'k':
+        devtimeSkipLarge = (int)strtol(optarg, NULL, 0);
+        break;
+      case 'H':
+        devtimeCheck = (int)strtol(optarg, NULL, 0);
+        break;
       case 'u':
         unalign = (int)strtol(optarg, NULL, 0);
         break;
@@ -1905,6 +1970,14 @@ int main(int argc, char* argv[], char **envp) {
             "[-Z,--rccl_output_format <output format <csv|json>] \n\t"                                              //RCCL
             "[-X,--rccl_output_file <file> RCCL Reporter output file for csv/json (used with -Z)] \n\t"             //RCCL
             "[-A,--output_algo_proto_channels <0/1> enable algorithm/protocol/channels output (default: 0)] \n\t"   //RCCL
+            "[-B,--device_timing <0/1/2> in-kernel device timing: 0=off, 1=augment (extra line), 2=device-only metric (default: 0)] \n\t"
+            "[-L,--devtime_loop <count> timed-kernel loop iterations (default: 10)] \n\t"
+            "[-P,--devtime_skip <count> timed-kernel warmup skip iterations (default: 10)] \n\t"
+            "[-W,--devtime_loop_mid <count> loop at per-peer >= 8 MiB (0=use -L; default: 0)] \n\t"
+            "[-Q,--devtime_loop_large <count> loop at per-peer >= 64 MiB (0=use tier below; default: 0)] \n\t"
+            "[-j,--devtime_skip_mid <count> skip at mid tier (-1=min(-P,2); default: -1)] \n\t"
+            "[-k,--devtime_skip_large <count> skip at large tier (-1=min(-P,1); default: -1)] \n\t"
+            "[-H,--devtime_check <0/1> validate timed-kernel output before datacheck (default: 0)] \n\t"
             "[-h,--help]\n",
           basename(argv[0]));
         return 0;
