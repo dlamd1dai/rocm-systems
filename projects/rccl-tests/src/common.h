@@ -115,19 +115,14 @@ struct testColl {
       size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int implIndex, void* bias);
   testResult_t (*getAlgoProtoChannels)(ncclComm_t comm, size_t count, ncclDataType_t type, int* algo, int* proto, int* nchannels);
   testResult_t (*getSymkInfo)(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op, int* algo, int* proto, int* nchannels);
+  // Reports the actual backend RCCL will dispatch (CE / DDA / symmetric / kernel),
+  // op/buffer/graph-capture aware, via rcclGetCollImplInfo. NULL when the collective
+  // does not wire it or the library lacks the symbol (older librccl).
+  testResult_t (*getCollImplInfo)(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op,
+      const void* sendbuff, void* recvbuff, int graphCapturing, int* algo, int* proto, int* nchannels);
   // Optional device-side (in-kernel wall_clock64) timing hook. Non-null only for
-  // collectives that implement it (currently AllToAll). Driven by BenchTime via
-  // NCCL_GIN_ANVIL_DEVICE_TIMING (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING)
-  // (0=off, 1=augment, 2=device-time-only):
-  //   - outDeltaSec == nullptr (mode 1): prints an extra device-only
-  //     latency/busbw line alongside the normal graph/hipEvent numbers (report,
-  //     not replace).
-  //   - outDeltaSec != nullptr (mode 2): stores the measured per-iteration
-  //     device latency (seconds, max across ranks) in *outDeltaSec; BenchTime
-  //     then reports that as THE metric, having skipped the graph/hipEvent
-  //     timed loop.
-  // Other collectives leave it nullptr via aggregate initialization, so no other
-  // struct needs to change.
+  // collectives that implement it (AllToAll, AllGather). Driven by BenchTime via
+  // --device_timing (0=off, 1=augment, 2=device-time-only).
   testResult_t (*deviceTime)(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec);
 };
 extern struct testColl allReduceTest;
@@ -375,8 +370,15 @@ typedef enum { ncclCoarse        = 0,
                nccl_NUM_MTYPES   = 4 } ncclMemoryType_t;
 extern const char *test_memorytypes[nccl_NUM_MTYPES];
 extern int deviceCtaCount; // number of CTAs for device implementation
-extern int deviceImpl;     // selected -D device implementation (0 = host); lets per-collective
-                           // device-timing hooks pick the matching timed kernel.
+extern int deviceImpl;     // selected -D device implementation (0 = host)
+extern int deviceTimingMode;
+extern int devtimeLoop;
+extern int devtimeSkip;
+extern int devtimeLoopMid;
+extern int devtimeLoopLarge;
+extern int devtimeSkipMid;
+extern int devtimeSkipLarge;
+extern int devtimeCheck;
 constexpr int test_opNumMax = (int)ncclNumOps + (NCCL_VERSION_CODE >= NCCL_VERSION(2,11,0) ? 1 : 0);
 extern int test_opnum;
 extern int test_typenum;
@@ -485,11 +487,14 @@ typedef ncclResult_t (*rcclTestsGetAlgoName_t)(int algo, const char** algoName);
 typedef ncclResult_t (*rcclTestsGetProtocolName_t)(int protocol, const char** protocolName);
 typedef ncclResult_t (*rcclTestsGetSymkInfo_t)(struct ncclComm* comm, ncclFunc_t coll, uint64_t count, ncclDataType_t dataType, ncclRedOp_t op,
     int* algo, int* protocol, int* maxChannels);
+typedef ncclResult_t (*rcclTestsGetCollImplInfo_t)(struct ncclComm* comm, ncclFunc_t coll, uint64_t count, ncclDataType_t dataType,
+    ncclRedOp_t op, const void* sendbuff, void* recvbuff, int graphCapturing, int* algo, int* protocol, int* maxChannels);
 
 extern rcclTestsGetAlgoInfo_t rcclTestsGetAlgoInfo;
 extern rcclTestsGetProtocolName_t rcclTestsGetProtocolName;
 extern rcclTestsGetAlgoName_t rcclTestsGetAlgoName;
 extern rcclTestsGetSymkInfo_t rcclTestsGetSymkInfo;
+extern rcclTestsGetCollImplInfo_t rcclTestsGetCollImplInfo;
 
 // Network counter collector (self-contained, see collector.h for full API)
 #include "collector.h"
