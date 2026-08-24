@@ -31,6 +31,16 @@
 # All-SDMA (BC-D4): NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RUN_HOST_BASELINE=0 ./gin-sdma-bcast-test.bash 8 128M
 # Single root:     ROOT=0 ./gin-sdma-bcast-test.bash 8 128M
 # GPU reset first: GPU_RESET_BEFORE_TEST=1
+#
+# Device-side timing (BC-C2 only; ring tier >= BC_RING_MIN, default 32 MiB):
+#   BC_C2_DEVICE_TIMING=1 ./gin-sdma-bcast-test.bash 8 2G   # augment: extra #[bcast-devtime] line
+#   BC_C2_DEVICE_TIMING=2 RUN_HOST_BASELINE=0 ./gin-sdma-bcast-test.bash 8 2G  # device-only metric
+# Knobs mirror broadcast_perf / common.cu CLI (passed as -B/-L/-P/-W/-Q/-j/-k/-H):
+#   BC_C2_DEVTIME_LOOP (default 10), BC_C2_DEVTIME_SKIP (default 10),
+#   BC_C2_DEVTIME_LOOP_MID, BC_C2_DEVTIME_LOOP_LARGE,
+#   BC_C2_DEVTIME_SKIP_MID (default -1), BC_C2_DEVTIME_SKIP_LARGE (default -1),
+#   BC_C2_DEVTIME_CHECK (default 0). BroadcastDeviceTime times the SM ring-table
+#   kernel only; sizes below BC_RING_MIN leave host timing unchanged.
 
 set -euo pipefail
 
@@ -57,6 +67,23 @@ FACTOR="${FACTOR:-2}"
 # (2 MiB). Set SCATTER_AG_MIN=0 to force the flat fan-out at all sizes (isolates
 # the §4.8 tier for A/B perf), or e.g. 8M to raise the crossover.
 SCATTER_AG_MIN="${SCATTER_AG_MIN:-}"
+
+# BC-C2 in-kernel device timing (broadcast_perf --device_timing / -B). 0=off (default),
+# 1=augment (extra #[bcast-devtime] line beside graph numbers), 2=device-only metric.
+# Only the ring tier (msg >= BC_RING_MIN) is timed; warmup must hit that tier so the
+# ring decomposition tables are built before BroadcastDeviceTime runs.
+BC_C2_DEVICE_TIMING="${BC_C2_DEVICE_TIMING:-0}"
+BC_C2_DEVTIME_LOOP="${BC_C2_DEVTIME_LOOP:-10}"
+BC_C2_DEVTIME_SKIP="${BC_C2_DEVTIME_SKIP:-10}"
+BC_C2_DEVTIME_LOOP_MID="${BC_C2_DEVTIME_LOOP_MID:-0}"
+BC_C2_DEVTIME_LOOP_LARGE="${BC_C2_DEVTIME_LOOP_LARGE:-0}"
+BC_C2_DEVTIME_SKIP_MID="${BC_C2_DEVTIME_SKIP_MID:--1}"
+BC_C2_DEVTIME_SKIP_LARGE="${BC_C2_DEVTIME_SKIP_LARGE:--1}"
+BC_C2_DEVTIME_CHECK="${BC_C2_DEVTIME_CHECK:-0}"
+# Ring-tier cutover for devtime warnings (matches gin_sdma::kBroadcastRingMinDefault).
+BC_RING_MIN="${BC_RING_MIN:-32M}"
+# Fast ring-tier devtime sweep: skip BC-C1 host baseline, default BC_C2_DEVICE_TIMING=1.
+RUN_BC_C2_DEVTIME_ONLY="${RUN_BC_C2_DEVTIME_ONLY:-0}"
 
 # BC-C1 host baseline is size-tuned (8x MI355X, 2026-07-27, out-of-place). The stock tuner
 # cliffs badly at large sizes (128M ~38 GB/s), so BC_C1_MODE=hybrid (default) picks the best
@@ -116,6 +143,7 @@ _format_bytes() {
   fi
 }
 HOST_MAX_BYTES_EFFECTIVE="$(_format_bytes "${HOST_MAX_BYTES_EFFECTIVE_INT}")"
+BC_RING_MIN_INT="$(_parse_size_to_bytes "${BC_RING_MIN}")"
 
 ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD:-${MAX_BYTES_INT}}"
 HOST_ROCSHMEM_THRESHOLD="${HOST_ROCSHMEM_THRESHOLD:-${HOST_MAX_BYTES_EFFECTIVE_INT}}"
@@ -125,6 +153,13 @@ BROADCAST_PERF="${BROADCAST_PERF:-rccl-tests/broadcast_perf}"
 # host kernels (ONLY_FUNCS includes Broadcast). Set RUN_HOST_BASELINE=0 to skip it.
 RUN_HOST_BASELINE="${RUN_HOST_BASELINE:-1}"
 RUN_GIN_SDMA="${RUN_GIN_SDMA:-1}"
+
+if [[ "${RUN_BC_C2_DEVTIME_ONLY}" == "1" ]]; then
+  RUN_HOST_BASELINE=0
+  if [[ "${BC_C2_DEVICE_TIMING}" == "0" ]]; then
+    BC_C2_DEVICE_TIMING=1
+  fi
+fi
 
 # Optional GPU reset before gate (off by default). Enable with GPU_RESET_BEFORE_TEST=1.
 GPU_RESET_BEFORE_TEST="${GPU_RESET_BEFORE_TEST:-0}"
@@ -181,6 +216,36 @@ _run() {
     "$@"
   fi
 }
+
+# Append broadcast_perf CLI flags for in-kernel device timing when BC_C2_DEVICE_TIMING != 0.
+BC_C2_DEVTIME_CLI=()
+_build_bc_c2_devtime_cli() {
+  BC_C2_DEVTIME_CLI=()
+  if [[ "${BC_C2_DEVICE_TIMING}" == "0" ]]; then
+    return 0
+  fi
+  BC_C2_DEVTIME_CLI=(
+    -B "${BC_C2_DEVICE_TIMING}"
+    -L "${BC_C2_DEVTIME_LOOP}"
+    -P "${BC_C2_DEVTIME_SKIP}"
+  )
+  if [[ "${BC_C2_DEVTIME_LOOP_MID}" != "0" ]]; then
+    BC_C2_DEVTIME_CLI+=(-W "${BC_C2_DEVTIME_LOOP_MID}")
+  fi
+  if [[ "${BC_C2_DEVTIME_LOOP_LARGE}" != "0" ]]; then
+    BC_C2_DEVTIME_CLI+=(-Q "${BC_C2_DEVTIME_LOOP_LARGE}")
+  fi
+  if [[ "${BC_C2_DEVTIME_SKIP_MID}" != "-1" ]]; then
+    BC_C2_DEVTIME_CLI+=(-j "${BC_C2_DEVTIME_SKIP_MID}")
+  fi
+  if [[ "${BC_C2_DEVTIME_SKIP_LARGE}" != "-1" ]]; then
+    BC_C2_DEVTIME_CLI+=(-k "${BC_C2_DEVTIME_SKIP_LARGE}")
+  fi
+  if [[ "${BC_C2_DEVTIME_CHECK}" != "0" ]]; then
+    BC_C2_DEVTIME_CLI+=(-H "${BC_C2_DEVTIME_CHECK}")
+  fi
+}
+_build_bc_c2_devtime_cli
 
 _docker_cleanup_stale() {
   if [[ "${USE_DOCKER}" != "1" ]] || [[ "${DOCKER_CLEANUP_BEFORE_TEST:-1}" == "0" ]]; then
@@ -246,9 +311,17 @@ else
   echo "  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, adaptive CTAs, pool=-V ${DEVICE_CTA_COUNT}, LSA<->GIN threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:-${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-256K default}})"
+  echo -n "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, adaptive CTAs, pool=-V ${DEVICE_CTA_COUNT}, LSA<->GIN threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:-${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-256K default}})"
+  if [[ "${BC_C2_DEVICE_TIMING}" != "0" ]]; then
+    echo -n ", device_timing=${BC_C2_DEVICE_TIMING} (ring tier >= ${BC_RING_MIN})"
+  fi
+  echo
 else
   echo "  BC-C2 gin:   skipped (RUN_GIN_SDMA=0)"
+fi
+
+if [[ "${BC_C2_DEVICE_TIMING}" != "0" && "${MAX_BYTES_INT}" -lt "${BC_RING_MIN_INT}" ]]; then
+  echo "WARN: BC_C2_DEVICE_TIMING=${BC_C2_DEVICE_TIMING} but MAX_BYTES=${MAX_BYTES} < BC_RING_MIN=${BC_RING_MIN}; BroadcastDeviceTime only runs on the ring tier (no #[bcast-devtime] expected)"
 fi
 
 if [[ "${MAX_BYTES_INT}" -lt $((1024 * 1024)) ]]; then
@@ -341,7 +414,7 @@ fi
 # 2.28-era source branch this was ported from had ROCSHMEM_GDA at 5 and ANVIL_SDMA
 # at 6; here ROCSHMEM_GDA is 4 and ANVIL_SDMA is 5, so use 5 (matches AllGather AG-C2).
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (pool=-V ${DEVICE_CTA_COUNT}, adaptive CTAs, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default})"
+  echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (pool=-V ${DEVICE_CTA_COUNT}, adaptive CTAs, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default}${BC_C2_DEVICE_TIMING:+, device_timing=${BC_C2_DEVICE_TIMING}})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none \
@@ -355,7 +428,8 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
     ${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST="${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST}"} \
     ${SCATTER_AG_MIN:+-x NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES="${SCATTER_AG_MIN}"} \
     -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
-    "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -r "${ROOT}"
+    "${BROADCAST_PERF}" -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -r "${ROOT}" \
+    "${BC_C2_DEVTIME_CLI[@]}"
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
