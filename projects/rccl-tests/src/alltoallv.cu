@@ -753,7 +753,7 @@ testResult_t AlltoAllvRunTest(struct threadArgs* args, int root, ncclDataType_t 
   return testSuccess;
 }
 
-NCCL_WEAK struct testEngine ncclTestEngine = {
+struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ AlltoAllvGetBuffSize,
   /* .runTest = */ AlltoAllvRunTest,
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)

@@ -123,7 +123,7 @@ testResult_t GatherRunTest(struct threadArgs* args, int root, ncclDataType_t typ
   return testSuccess;
 }
 
-NCCL_WEAK struct testEngine ncclTestEngine = {
+struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ GatherGetBuffSize,
   /* .runTest = */ GatherRunTest
 };

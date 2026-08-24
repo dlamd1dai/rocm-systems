@@ -119,7 +119,7 @@ testResult_t ScatterRunTest(struct threadArgs* args, int root, ncclDataType_t ty
   return testSuccess;
 }
 
-NCCL_WEAK struct testEngine ncclTestEngine = {
+struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ ScatterGetBuffSize,
   /* .runTest = */ ScatterRunTest
 };

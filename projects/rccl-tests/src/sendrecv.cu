@@ -126,7 +126,7 @@ testResult_t SendRecvRunTest(struct threadArgs* args, int root, ncclDataType_t t
   return testSuccess;
 }
 
-NCCL_WEAK struct testEngine ncclTestEngine = {
+struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ SendRecvGetBuffSize,
   /* .runTest = */ SendRecvRunTest,
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)
