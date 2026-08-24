@@ -1262,22 +1262,37 @@ testResult_t BroadcastRunColl(void* sendbuff, size_t sendoffset, void* recvbuff,
 }
 
 // Device-side (in-kernel wall_clock64) timing for the GIN-SDMA Broadcast (-D 3),
-// via the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING
-// (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra
-// #[bcast-devtime] line next to the graph numbers), 2=device-time-only (report the
-// in-kernel latency as the out-of-place metric; in-place keeps normal timing).
-// loop/skip via NCCL_GIN_ANVIL_BCAST_DEVTIME_LOOP/_SKIP (default 10/10). Times the
-// default large tier -- the SM edge-disjoint ring -- so it only runs when the ring
-// is the active tier (message >= cutover, decomposition built during warmup);
+// via the shared gin_devtime scaffold. Opt-in via --device_timing: 1=augment
+// (print an extra #[bcast-devtime] line next to the graph numbers), 2=device-time-only
+// (report the in-kernel latency as the out-of-place metric; in-place keeps normal
+// timing). loop/skip come from --devtime_loop/--devtime_skip (default 10/10); size-
+// tier overrides via --devtime_loop_mid/_large and --devtime_skip_mid/_large. Times
+// the default large tier -- the SM edge-disjoint ring -- so it only runs when the
+// ring is the active tier (message >= cutover, decomposition built during warmup);
 // otherwise it leaves the host-timed metric untouched.
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 testResult_t BroadcastDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
-  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_BCAST_DEVTIME_LOOP", 10);
-  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_BCAST_DEVTIME_SKIP", 10);
+  if (!deviceTimingMode) return testSuccess;
+
+  // Only the GIN hybrid impl (-D 3) provisions the GIN signals/barriers the timed
+  // body relies on. Other device impls would fault or hang on missing GIN state.
+  if (deviceImpl != 3) return testSuccess;
 
   const size_t count = args->nbytes / wordSize(type);   // broadcast message count
-  if (count == 0 || loop < 1) return testSuccess;
+  if (count == 0 || devtimeLoop < 1) return testSuccess;
   const size_t msgBytes = count * wordSize(type);
+
+  int loop = devtimeLoop;
+  int skip = devtimeSkip < 0 ? 0 : devtimeSkip;
+  if (devtimeLoopLarge > 0 && msgBytes >= (size_t)64 * 1024 * 1024) {
+    loop = devtimeLoopLarge;
+    if (devtimeSkipLarge >= 0) skip = devtimeSkipLarge;
+    else skip = (skip < 1) ? skip : 1;
+  } else if (devtimeLoopMid > 0 && msgBytes >= (size_t)8 * 1024 * 1024) {
+    loop = devtimeLoopMid;
+    if (devtimeSkipMid >= 0) skip = devtimeSkipMid;
+    else skip = (skip < 2) ? skip : 2;
+  }
 
   static const size_t bcastRingMin = []() {
     size_t v = testParseSdmaThresholdEnv("NCCL_GIN_ANVIL_BCAST_RING_MIN_BYTES");
@@ -1305,7 +1320,10 @@ testResult_t BroadcastDeviceTime(struct threadArgs* args, ncclDataType_t type, n
       },
       &devUs));
 
-  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+  if (outDeltaSec != nullptr) {
+    *outDeltaSec = (devUs > 0.0) ? devUs * 1.0e-6 : -1.0;
+    return testSuccess;
+  }
 
   if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
     double sec = devUs * 1.0e-6;
