@@ -15,7 +15,8 @@
 #   1. consume ROCm (provisioned on the head node) via .ci-out/rocm.env
 #   2. lib/build-ompi.sh      build OpenMPI (--with-rocm) -> ompi.env
 #   3. lib/build-rocshmem.sh  build rocSHMEM (IPC+SDMA)   -> rocshmem.env
-#   4. projects/rccl  install.sh  build RCCL (GIN/rocSHMEM) -> rccl.env
+#   4. projects/rccl  install.sh  build RCCL (GIN/rocSHMEM) + GIN Anvil unit
+#      tests (rccl-UnitTestsFixtures, GIN_ANVIL_UNIT_TESTS=ON) -> rccl.env
 #   5. projects/rccl-tests        build rccl-tests (DEVICE_API + ROCSHMEM)
 #   6. run-gin-ci.sh              run the GIN/rocSHMEM tests (non-gating)
 #
@@ -104,10 +105,13 @@ source "${workdir}/.ci-out/rocshmem.env"
 set +a
 
 # 4) RCCL with GIN / rocSHMEM. Mirrors the Dockerfile: patch the rocSHMEM
-# threshold guard, then install.sh with ENABLE_ROCSHMEM_GIN.
-echo "==> [4/6] build RCCL (GIN, targets=${gpu_targets})"
+# threshold guard, then install.sh with ENABLE_ROCSHMEM_GIN. Also build
+# rccl-UnitTestsFixtures with GIN_ANVIL_UNIT_TESTS=ON (device-template suites
+# for GDA + Anvil-SDMA shadow; no full librocshmem in librccl).
+echo "==> [4/6] build RCCL (GIN, targets=${gpu_targets}) + GIN Anvil unit tests"
 rccl_src="${workdir}/projects/rccl"
 rccl_prefix="${workdir}/.ci-out/rccl-install"
+rccl_fixtures_bin="${rccl_src}/build/release/test/rccl-UnitTestsFixtures"
 rm -rf "${rccl_prefix}"
 wrap="${rccl_src}/src/rccl_wrap.cc"
 if grep -q 'comm->enableRocshmem && comm->nNodes > 1' "${wrap}" 2>/dev/null; then
@@ -124,7 +128,7 @@ fi
     --amdgpu_targets="${gpu_targets}" \
     --prefix="${rccl_prefix}" \
     --no-device-linker --no_clean \
-    --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR}"
+    --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DGIN_ANVIL_UNIT_TESTS=ON"
 )
 # Workaround: hipify renames core.h->core_tmp.h but gin headers still include ../core.h
 rccl_build="${rccl_src}/build/release"
@@ -136,6 +140,12 @@ if [[ ! -f "${rccl_prefix}/lib/librccl.so" && ! -f "${rccl_prefix}/lib/librccl.s
   ls -la "${rccl_prefix}/lib" 2>/dev/null >&2 || true
   exit 1
 fi
+if [[ ! -x "${rccl_fixtures_bin}" ]]; then
+  echo "ERROR: rccl-UnitTestsFixtures not built at ${rccl_fixtures_bin}" >&2
+  ls -la "$(dirname "${rccl_fixtures_bin}")" 2>/dev/null >&2 || true
+  exit 1
+fi
+echo "    rccl-UnitTestsFixtures: ${rccl_fixtures_bin}"
 
 # Locate the in-tree RCCL CMake package config. rccl-tests' find_package(RCCL)
 # otherwise resolves roc::rccl to the nightly ROCm (its toolchain prepends
@@ -238,6 +248,7 @@ nm -CD "${librccl}" 2>/dev/null | grep -E " U .*${sym}" || echo "  not undefined
 {
   printf 'export RCCL_INSTALL_PREFIX=%q\n' "${rccl_prefix}"
   printf 'export RCCL_TESTS_BIN_DIR=%q\n' "${rccl_tests_build}"
+  printf 'export RCCL_FIXTURES_BIN_DIR=%q\n' "$(dirname "${rccl_fixtures_bin}")"
 } > "${workdir}/.ci-out/rccl.env"
 ) > "${build_out}" 2> "${build_err}" || build_rc=$?
 echo "==> build phase logs: ${build_out} / ${build_err}"

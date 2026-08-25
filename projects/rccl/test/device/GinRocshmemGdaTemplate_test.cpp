@@ -36,7 +36,7 @@
 // --------------------------------------------------------------------------
 // Stub definitions for rocshmem::QueuePair device methods.
 //   put_nbi       : byte-copy laddr -> raddr (observe data landing at remote VA)
-//   atomic_add    : atomic add into the remote signal word (observe signal deliver)
+//   atomic_add   : atomic add into the remote signal word (observe signal deliver)
 //   quiet         : bump a device-global call counter (observe completion sync)
 // Non-RDC build: these must be defined in the same TU as the kernels that
 // (via the inlined template) call them.
@@ -56,16 +56,8 @@ __device__ void QueuePair::put_nbi(void* raddr, uint32_t /*rkey*/, const void* l
 // Matches queue_pair_device.h: atomic_add(void* raddr, uint32_t rkey, int64_t
 // value, ActiveWFInfo&, bool fence). The template's signal path calls this
 // (gin_rocshmem_gda.h:54,101); rkey/fence are unused by the byte-accurate stub.
-// atomic_add_single is the single-thread variant (declared for parity; the
-// template drives the wavefront form, but define both so the TU links either way).
-__device__ void QueuePair::atomic_add(void* raddr, uint32_t /*rkey*/, int64_t value,
-                                      ActiveWFInfo& /*wf_info*/, bool /*fence*/) {
-  if (raddr == nullptr) return;
-  atomicAdd(reinterpret_cast<unsigned long long*>(raddr), static_cast<unsigned long long>(value));
-}
-
-__device__ void QueuePair::atomic_add_single(void* raddr, uint32_t /*rkey*/, int64_t value,
-                                             bool /*fence*/) {
+__device__ void QueuePair::atomic_add(void* raddr, uint32_t /*rkey*/, int64_t value, ActiveWFInfo& /*wf_info*/,
+                                      bool /*fence*/) {
   if (raddr == nullptr) return;
   atomicAdd(reinterpret_cast<unsigned long long*>(raddr), static_cast<unsigned long long>(value));
 }
@@ -329,7 +321,12 @@ TEST_F(GinRocshmemGdaTemplateTest, Put_SignalAndCounter) {
   EXPECT_EQ(ctr[1], 1ULL);
 }
 
-// G7: thread-scope fence branch (required==system && given>required) still puts.
+// G7: weaker-given-scope path (required=system, given=block) still completes the
+// put. NOTE: the template's fence guard is `(required==system && given>required)`;
+// since `system` is the maximum cuda::thread_scope, that branch is never taken
+// (here or anywhere). This guard is a pre-existing convention shared by all GIN
+// backends (anvil_sdma, gdaki, rocshmem_gda) and is tracked for a separate,
+// coordinated fix -- so this case only asserts the data lands, not that a fence ran.
 __global__ void kernelPutScopeFence(GdaHarness* h) {
   ncclGinCtx ginCtx{};
   ginCtx.handle = &h->ctx;
@@ -342,7 +339,7 @@ __global__ void kernelPutScopeFence(GdaHarness* h) {
       false, nullptr, cuda::thread_scope_system, cuda::thread_scope_block);
 }
 
-TEST_F(GinRocshmemGdaTemplateTest, Put_ThreadScopeFence) {
+TEST_F(GinRocshmemGdaTemplateTest, Put_WeakerGivenScopeStillPuts) {
   constexpr int kN = 8;
   std::vector<uint8_t> pat(kN);
   for (int i = 0; i < kN; ++i) pat[static_cast<size_t>(i)] = static_cast<uint8_t>(0x11 * (i + 1));
@@ -414,7 +411,7 @@ __global__ void kernelFlush(GdaHarness* h) {
   ncclGinCtx ginCtx{};
   ginCtx.handle = &h->ctx;
   ginCtx.nRanks = 2;
-  ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, ncclCoopThread{},
+  ncclGinApi_Flush<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, ncclCoopThread{}, false, nullptr,
                                                            cuda::memory_order_seq_cst, nullptr);
 }
 
@@ -431,15 +428,15 @@ TEST_F(GinRocshmemGdaTemplateTest, Flush_QuietsAllPeers) {
 __global__ void kernelGetReset(GdaHarness* h) {
   ncclGinCtx ginCtx{};
   ginCtx.handle = &h->ctx;
-  uint64_t* sig = ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
-  if (sig) sig[0] = 55;
+  ncclGinOffsetPtr sigOff = ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
+  if (sigOff.ptr) sigOff.ptr[0] = 55;
   ncclGinSignalDescriptor desc{};
   desc.type = NCCL_GIN_SIGNAL_TYPE_INDEXED;
   desc.indexedSignal.signalId = 0;
   ncclGinApi_ResetSignal<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, desc);
 
-  uint64_t* ctr = ncclGinApi_GetCounterPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
-  if (ctr) ctr[0] = 77;
+  ncclGinOffsetPtr ctrOff = ncclGinApi_GetCounterPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
+  if (ctrOff.ptr) ctrOff.ptr[0] = 77;
   ncclGinApi_ResetCounter<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
 }
 
@@ -458,8 +455,8 @@ TEST_F(GinRocshmemGdaTemplateTest, GetReset_SignalAndCounter) {
 __global__ void kernelResetSignalNone(GdaHarness* h) {
   ncclGinCtx ginCtx{};
   ginCtx.handle = &h->ctx;
-  uint64_t* sig = ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
-  if (sig) sig[0] = 42;
+  ncclGinOffsetPtr sigOff = ncclGinApi_GetSignalPtr<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, 0);
+  if (sigOff.ptr) sigOff.ptr[0] = 42;
   ncclGinSignalDescriptor desc{};
   desc.type = NCCL_GIN_SIGNAL_TYPE_NONE;
   ncclGinApi_ResetSignal<NCCL_NET_DEVICE_GIN_ROCSHMEM_GDA>::call(ginCtx, desc);
