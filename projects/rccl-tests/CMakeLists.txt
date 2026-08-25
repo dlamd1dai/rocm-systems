@@ -115,7 +115,7 @@ set(CMAKE_CXX_STANDARD   17)   # rocshmem GIN QP device headers require C++17
 set(CMAKE_CXX_EXTENSIONS OFF)  # Without this line, it will add -std=gnu++14 instead, which has some issues.
 set(CPACK_PACKAGING_INSTALL_PREFIX "${ROCM_PATH}" CACHE PATH "Path to install to when packaged.")
 if(ROCM_PATH)
-  #list(APPEND CMAKE_PREFIX_PATH  # Temporary workaround 
+  #list(APPEND CMAKE_PREFIX_PATH  # Temporary workaround
   list(PREPEND CMAKE_PREFIX_PATH  # Add ROCM_PATH to CMake search paths (for finding HIP / HSA
               ${ROCM_PATH}
               ${ROCM_PATH}/hip
@@ -288,6 +288,12 @@ if (ENABLE_ROCSHMEM_GIN)
 endif()
 
 set(ROCM_USE_DEV_COMPONENT OFF)  # This repo doesn't have a dev component
+
+# Build the upstream OS abstraction with RCCL's HIP toolchain.
+add_library(nccl_tests_options INTERFACE)
+target_compile_definitions(nccl_tests_options INTERFACE NCCL_OS_LINUX NCCL_GIN_PROXY_ENABLE=1)
+set(NCCL_OS_LINUX ON)
+add_subdirectory(os)
 
 # Add all of the tests
 add_subdirectory(src)
