@@ -129,7 +129,7 @@ if((run_types[i] == ncclFloat8e4m3 || run_types[i] == ncclFloat8e5m2) && (run_op
   return testSuccess;
 }
 
-struct testEngine ncclTestEngine = {
+NCCL_WEAK struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ ReduceScatterGetBuffSize,
   /* .runTest = */ ReduceScatterRunTest
 };
