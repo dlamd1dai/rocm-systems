@@ -121,7 +121,7 @@ testResult_t AllReduceRunTest(struct threadArgs* args, int root, ncclDataType_t 
   return testSuccess;
 }
 
-struct testEngine ncclTestEngine = {
+NCCL_WEAK struct testEngine ncclTestEngine = {
   .getBuffSize = AllReduceGetBuffSize,
   .runTest = AllReduceRunTest
 };
