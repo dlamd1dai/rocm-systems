@@ -1,6 +1,6 @@
 # GIN-SDMA A2A on MI455: Fabric DDA Adaptation Plan
 
-Branch: `users/dondai/gin-sdma-a2a-mi455-wip`  
+Branch: `users/dondai/gin-sdma-a2a-mi455-wip`
 Last updated: 2026-08-26
 
 ## Summary
@@ -351,6 +351,7 @@ Optional tuning (inherited from DDA):
 ## References
 
 - GIN overview: `projects/rccl/src/gin/README.md`
+- **Docker/build/test harness:** `ddai-artifacts/docs/gin-sdma-a2a-harness.md`
 - DDA fabric init: `projects/rccl/src/algorithms/dda/fabric/fabric_init.cu`
 - DDA LL A2A kernel: `projects/rccl/src/algorithms/dda/alltoall/alltoall_dda_fabric_ll.h`
 - DDA LL128 A2A (mid-size follow-on): `projects/rccl/src/algorithms/dda/alltoall/alltoall_dda_fabric_ll128.h`
