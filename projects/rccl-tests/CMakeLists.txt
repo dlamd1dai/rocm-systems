@@ -15,12 +15,16 @@ endif()
 #==================================================================================================
 project(rccl-tests LANGUAGES CXX)
 
+enable_testing()
+
 # Build options
 #==================================================================================================
 option(USE_MPI                     "Build RCCL-tests with MPI support."           OFF)
 option(ENABLE_DEVICE_API           "Build with NCCL Device API support (GIN)."    OFF)
 option(ENABLE_ROCSHMEM_GIN         "Build with rocshmem GIN backend support."     OFF)
 option(BUILD_LOCAL_GPU_TARGET_ONLY "Build only for GPUs detected on this machine" OFF)
+option(BUILD_RCCL_TESTS_HOST_UNIT_TESTS
+       "Build CPU-only host unit tests under test/ (standalone builds only)"   ON)
 
 if (NOT CMAKE_BUILD_TYPE)
   message(WARNING "CMAKE_BUILD_TYPE is not defined. Setting to Release")
@@ -297,6 +301,15 @@ add_subdirectory(os)
 
 # Add all of the tests
 add_subdirectory(src)
+
+# Host unit tests (GTest) are for standalone/cmake dev builds only. TheRock
+# comm-libs configures rccl-tests as a sub-project; find_package(GTest) there
+# requires super-project BUILD_DEPS wiring we do not have, so skip test/.
+if(BUILD_RCCL_TESTS_HOST_UNIT_TESTS AND NOT DEFINED THEROCK_STAGE_INSTALL_ROOT)
+  add_subdirectory(test)
+elseif(DEFINED THEROCK_STAGE_INSTALL_ROOT)
+  message(STATUS "rccl-tests: skipping host unit tests (TheRock super-project build)")
+endif()
 
 rocm_setup_version(VERSION "2.14.1")
 
