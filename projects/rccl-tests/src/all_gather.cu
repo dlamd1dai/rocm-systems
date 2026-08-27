@@ -422,7 +422,12 @@ testResult_t AllGatherRunTest(struct threadArgs* args, int root, ncclDataType_t 
 NCCL_WEAK struct testEngine ncclTestEngine = {
   /* .getBuffSize = */ AllGatherGetBuffSize,
   /* .runTest = */ AllGatherRunTest,
-#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)
+  /* .initCommConfig = */ nullptr,
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
+  /* .getDevCommRequirements = */ AllGatherGetDevCommRequirements,
+#elif defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
   /* .getDevCommRequirements = */ AllGatherGetDevCommRequirements,
 #endif
 };
