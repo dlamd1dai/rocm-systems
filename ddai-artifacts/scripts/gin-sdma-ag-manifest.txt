@@ -1,7 +1,9 @@
 # GIN-SDMA AllGather files that must be byte-identical across
 # users/dondai/gin-stage3b-sdma-ag and users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip.
 # Checked by gin-sdma-ag-sync-check.bash (run from repo root).
-projects/rccl-tests/src/all_gather.cu
+#
+# Excluded: projects/rccl-tests/src/all_gather.cu — NCCL 2.30.7 wip keeps
+# ncclCommQueryProperties / testEngine layout adaptations; kernel design matches.
 projects/rccl-tests/src/gin_sdma_allgather_policy.h
 projects/rccl-tests/src/gin_sdma_devtime.h
 projects/rccl-tests/test/test_AllGather.py
