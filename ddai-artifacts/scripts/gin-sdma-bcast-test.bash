@@ -17,6 +17,8 @@
 #   BC-C2  GIN hybrid Broadcast (-D 3, NCCL_GIN_TYPE=5, -V sets barrier/signal pool)
 #          Size-adaptive CTA count (like AllGather): ~16 for LSA tier, 4 for GIN/SDMA,
 #          1 for LL; decoupled from -V. Pin with NCCL_GIN_ANVIL_BCAST_CTAS. Root sweep
+#   BC-C2-L  (opt-in, RUN_BC_C2_LARGE=1) GIN hybrid large-message completion sweep
+#          (default 128M..4G, root=0) through ring + scatter+AG tiers at multi-GB sizes.
 #
 # Semantic model (see gin-anvil-sdma-broadcast-design-plan.md §4.4, §4.8):
 #   Small/medium: flat/star fan-out from root; non-roots complete via receiver-side
@@ -27,7 +29,9 @@
 #   back to the flat fan-out for all sizes).
 #
 # Full gate (default): BC-C1 + BC-C2 (both fatal on failure).
-# Skip sections:   RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0
+# Skip sections:   RUN_HOST_BASELINE=0, RUN_GIN_SDMA=0, RUN_BC_C2=0
+# Large GIN sweep (opt-in): RUN_BC_C2_LARGE=1 sweeps BC-C2-L (128M..4G default, root=0).
+#   RUN_BC_C2=0 RUN_HOST_BASELINE=0 RUN_BC_C2_LARGE=1 ./gin-sdma-bcast-test.bash 8 128M
 # All-SDMA (BC-D4): NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 RUN_HOST_BASELINE=0 ./gin-sdma-bcast-test.bash 8 128M
 # Single root:     ROOT=0 ./gin-sdma-bcast-test.bash 8 128M
 # GPU reset first: GPU_RESET_BEFORE_TEST=1
@@ -84,6 +88,14 @@ BC_C2_DEVTIME_CHECK="${BC_C2_DEVTIME_CHECK:-0}"
 BC_RING_MIN="${BC_RING_MIN:-32M}"
 # Fast ring-tier devtime sweep: skip BC-C1 host baseline, default BC_C2_DEVICE_TIMING=1.
 RUN_BC_C2_DEVTIME_ONLY="${RUN_BC_C2_DEVTIME_ONLY:-0}"
+
+# BC-C2-L large-message GIN completion (opt-in). Sweeps from BC_C2_LARGE_MIN to
+# BC_C2_LARGE_MAX (defaults 128M..4G) at a single root to exercise ring + SAG tiers
+# at multi-GB payload without repeating the BC-C2 root=all sweep.
+RUN_BC_C2_LARGE="${RUN_BC_C2_LARGE:-0}"
+BC_C2_LARGE_MIN="${BC_C2_LARGE_MIN:-128M}"
+BC_C2_LARGE_MAX="${BC_C2_LARGE_MAX:-4G}"
+BC_C2_LARGE_ROOT="${BC_C2_LARGE_ROOT:-0}"
 
 # BC-C1 host baseline is size-tuned (8x MI355X, 2026-07-27, out-of-place). The stock tuner
 # cliffs badly at large sizes (128M ~38 GB/s), so BC_C1_MODE=hybrid (default) picks the best
@@ -144,6 +156,10 @@ _format_bytes() {
 }
 HOST_MAX_BYTES_EFFECTIVE="$(_format_bytes "${HOST_MAX_BYTES_EFFECTIVE_INT}")"
 BC_RING_MIN_INT="$(_parse_size_to_bytes "${BC_RING_MIN}")"
+BC_C2_LARGE_MIN_INT="$(_parse_size_to_bytes "${BC_C2_LARGE_MIN}")"
+BC_C2_LARGE_MAX_INT="$(_parse_size_to_bytes "${BC_C2_LARGE_MAX}")"
+BC_C2_LARGE_MIN_FMT="$(_format_bytes "${BC_C2_LARGE_MIN_INT}")"
+BC_C2_LARGE_MAX_FMT="$(_format_bytes "${BC_C2_LARGE_MAX_INT}")"
 
 ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD:-${MAX_BYTES_INT}}"
 HOST_ROCSHMEM_THRESHOLD="${HOST_ROCSHMEM_THRESHOLD:-${HOST_MAX_BYTES_EFFECTIVE_INT}}"
@@ -153,6 +169,7 @@ BROADCAST_PERF="${BROADCAST_PERF:-rccl-tests/broadcast_perf}"
 # host kernels (ONLY_FUNCS includes Broadcast). Set RUN_HOST_BASELINE=0 to skip it.
 RUN_HOST_BASELINE="${RUN_HOST_BASELINE:-1}"
 RUN_GIN_SDMA="${RUN_GIN_SDMA:-1}"
+RUN_BC_C2="${RUN_BC_C2:-1}"
 
 if [[ "${RUN_BC_C2_DEVTIME_ONLY}" == "1" ]]; then
   RUN_HOST_BASELINE=0
@@ -303,6 +320,7 @@ _maybe_gpu_reset_before_gate() {
 }
 
 BC_C1_STATUS="skipped"
+BC_C2_LARGE_STATUS="skipped"
 
 echo "Broadcast gate: NP=${NP} host=${_HOST} root=${ROOT}"
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
@@ -310,14 +328,19 @@ if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
 else
   echo "  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)"
 fi
-if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
+if [[ "${RUN_GIN_SDMA}" != "0" && "${RUN_BC_C2}" != "0" ]]; then
   echo -n "  BC-C2 gin:   ${MIN_BYTES} .. ${MAX_BYTES} (hybrid -D 3, adaptive CTAs, pool=-V ${DEVICE_CTA_COUNT}, LSA<->GIN threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:-${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-256K default}})"
   if [[ "${BC_C2_DEVICE_TIMING}" != "0" ]]; then
     echo -n ", device_timing=${BC_C2_DEVICE_TIMING} (ring tier >= ${BC_RING_MIN})"
   fi
   echo
 else
-  echo "  BC-C2 gin:   skipped (RUN_GIN_SDMA=0)"
+  echo "  BC-C2 gin:   skipped (RUN_GIN_SDMA=0 or RUN_BC_C2=0)"
+fi
+if [[ "${RUN_BC_C2_LARGE}" != "0" && "${RUN_GIN_SDMA}" != "0" ]]; then
+  echo "  BC-C2-L gin: ${BC_C2_LARGE_MIN_FMT} .. ${BC_C2_LARGE_MAX_FMT} (hybrid -D 3, root=${BC_C2_LARGE_ROOT}, large completion)"
+else
+  echo "  BC-C2-L gin: skipped (RUN_BC_C2_LARGE=0)"
 fi
 
 if [[ "${BC_C2_DEVICE_TIMING}" != "0" && "${MAX_BYTES_INT}" -lt "${BC_RING_MIN_INT}" ]]; then
@@ -326,6 +349,10 @@ fi
 
 if [[ "${MAX_BYTES_INT}" -lt $((1024 * 1024)) ]]; then
   echo "WARN: MAX_BYTES=${MAX_BYTES} (<1M) — BC-C2 mostly exercises the LSA/GIN-setup floor; use 128M for full SDMA path"
+fi
+if [[ "${RUN_BC_C2_LARGE}" != "0" && "${BC_C2_LARGE_MAX_INT}" -lt "${BC_C2_LARGE_MIN_INT}" ]]; then
+  echo "error: BC_C2_LARGE_MAX (${BC_C2_LARGE_MAX}) < BC_C2_LARGE_MIN (${BC_C2_LARGE_MIN})" >&2
+  exit 1
 fi
 
 _docker_cleanup_stale
@@ -416,7 +443,7 @@ fi
 # NCCL_GIN_TYPE=5 == NCCL_NET_DEVICE_GIN_ANVIL_SDMA in this (NCCL-2.30.7) tree. The
 # 2.28-era source branch this was ported from had ROCSHMEM_GDA at 5 and ANVIL_SDMA
 # at 6; here ROCSHMEM_GDA is 4 and ANVIL_SDMA is 5, so use 5 (matches AllGather AG-C2).
-if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
+if [[ "${RUN_GIN_SDMA}" != "0" && "${RUN_BC_C2}" != "0" ]]; then
   echo "BC-C2: GIN hybrid Broadcast -D 3, ${MIN_BYTES}..${MAX_BYTES} (pool=-V ${DEVICE_CTA_COUNT}, adaptive CTAs, -r ${ROOT}, scatter+AG>=${SCATTER_AG_MIN:-2M default}${BC_C2_DEVICE_TIMING:+, device_timing=${BC_C2_DEVICE_TIMING}})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
     "${MPI_BASE[@]}" \
@@ -436,4 +463,28 @@ if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
   sleep "${TEST_GAP_SEC:-3}"
 fi
 
-echo "PASS: gin-sdma-bcast-test np=${NP} root=${ROOT} BC-C1=${BC_C1_STATUS} BC-C2=${MIN_BYTES}..${MAX_BYTES}"
+# --- BC-C2-L: large-message GIN hybrid completion (128M..4G default, single root) ---
+if [[ "${RUN_BC_C2_LARGE}" != "0" && "${RUN_GIN_SDMA}" != "0" ]]; then
+  _large_rocs="${BC_C2_LARGE_ROCSHMEM_THRESHOLD:-${BC_C2_LARGE_MAX_INT}}"
+  echo "BC-C2-L: GIN hybrid Broadcast -D 3, ${BC_C2_LARGE_MIN_FMT}..${BC_C2_LARGE_MAX_FMT} (pool=-V ${DEVICE_CTA_COUNT}, root=${BC_C2_LARGE_ROOT}, large completion${BC_C2_DEVICE_TIMING:+, device_timing=${BC_C2_DEVICE_TIMING}})"
+  _run mpirun -n "${NP}" ${MPI_OPT_RCCL} \
+    "${MPI_BASE[@]}" \
+    -x NCCL_GIN_PLUGIN=none \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x NCCL_NET_PLUGIN=none \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_TYPE=5 \
+    -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS:-1}" \
+    -x RCCL_ROCSHMEM_THRESHOLD="${_large_rocs}" \
+    ${NCCL_GIN_ANVIL_SDMA_THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}"} \
+    ${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST="${NCCL_GIN_ANVIL_SDMA_THRESHOLD_BROADCAST}"} \
+    ${SCATTER_AG_MIN:+-x NCCL_GIN_ANVIL_BCAST_SCATTER_AG_MIN_BYTES="${SCATTER_AG_MIN}"} \
+    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+    "${BROADCAST_PERF}" -b "${BC_C2_LARGE_MIN}" -e "${BC_C2_LARGE_MAX}" -f "${FACTOR}" -g 1 -R "${GIN_RANKS}" -V "${DEVICE_CTA_COUNT}" -D 3 -r "${BC_C2_LARGE_ROOT}" \
+    "${BC_C2_DEVTIME_CLI[@]}"
+  BC_C2_LARGE_STATUS="passed"
+  sleep "${TEST_GAP_SEC:-3}"
+fi
+
+echo "PASS: gin-sdma-bcast-test np=${NP} root=${ROOT} BC-C1=${BC_C1_STATUS} BC-C2=${MIN_BYTES}..${MAX_BYTES} BC-C2-L=${BC_C2_LARGE_STATUS}"
