@@ -151,9 +151,7 @@ if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
     # symbols unresolved (--allow-shlib-undefined).  The executable must pull
     # in ALL rocshmem symbols (not just those it references directly) so that
     # -rdynamic exports them for librccl.so to resolve at runtime.
-    target_link_libraries(alltoall_perf PRIVATE
-        -Wl,--whole-archive roc::rocshmem -Wl,--no-whole-archive)
-    target_link_options(alltoall_perf PRIVATE -fgpu-rdc --hip-link -rdynamic)
+    target_link_options(alltoall_perf PRIVATE -fgpu-rdc --hip-link ${_rocshmem_offload_arch_flags} -rdynamic)
 
     # GIN-SDMA hybrid AllGather (all_gather_perf -D 3): same device-RDC link as
     # alltoall_perf so the GinHybridAllGatherKernel resolves the GIN device backend.
@@ -163,7 +161,7 @@ if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
     target_compile_options(all_gather_perf PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
     target_link_libraries(all_gather_perf PRIVATE
         -Wl,--whole-archive roc::rocshmem -Wl,--no-whole-archive)
-    target_link_options(all_gather_perf PRIVATE -fgpu-rdc --hip-link -rdynamic)
+    target_link_options(all_gather_perf PRIVATE -fgpu-rdc --hip-link ${_rocshmem_offload_arch_flags} -rdynamic)
 endif()
 if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem AND RCCL_SOURCE_DIR)
     add_executable(gin_rocshmem_gda_factory_test ${CMAKE_CURRENT_SOURCE_DIR}/gin_rocshmem_gda_factory_test.cu)
