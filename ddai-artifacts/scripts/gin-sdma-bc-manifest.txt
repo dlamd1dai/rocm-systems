@@ -12,6 +12,9 @@
 # matches bcast-nccl.
 # Excluded: ddai-artifacts/scripts/gin-sdma-bcast-test.bash — bc-nccl uses
 # rccl-UnitTestsGinSdmaBroadcastPolicy for POLICY_UT (reconciled docker path).
+# Excluded: projects/rccl/tools/ci/lib/gin-tests.json — matrix differs (NCCL_GIN_TYPE
+# for alltoall d3, fixture env); bcast-d3 entry must match, checked separately.
 projects/rccl-tests/src/gin_sdma_broadcast_policy.h
 projects/rccl/test/gin/gin_sdma_broadcast_policy_test.cpp
+projects/rccl-tests/test/test_Broadcast.py
 ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma-bcast-relink
