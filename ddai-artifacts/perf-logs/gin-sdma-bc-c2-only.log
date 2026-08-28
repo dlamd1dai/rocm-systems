@@ -1,0 +1,43 @@
+Broadcast gate: NP=8 host=smci355-ccs-aus-m03-17 root=0
+  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)
+  BC-C2 gin:   128 .. 128M (hybrid -D 3, adaptive CTAs, pool=-V 32, LSA<->GIN threshold=256K default)
+BC-C2: GIN hybrid Broadcast -D 3, 128..128M (pool=-V 32, adaptive CTAs, -r 0, scatter+AG>=2M default, device_timing=0)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 -x HSA_FORCE_FINE_GRAIN_PCIE=1 rccl-tests/broadcast_perf -b 128 -e 128M -f 2 -g 1 -R 2 -V 32 -D 3 -r 0 ===
+# rccl-tests version 2.18.3-Unknown  rccl-headers=23004 rccl-library=23004
+# Collective test starting: broadcast_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 134217728 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.4-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                              out-of-place                       in-place          
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong  
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)          
+         128            32     float    none       0     8.71    0.01    0.01       0     5.88    0.02    0.02       0
+         256            64     float    none       0     5.84    0.04    0.04       0     9.85    0.03    0.03       0
+         512           128     float    none       0     5.54    0.09    0.09       0     5.40    0.09    0.09       0
+        1024           256     float    none       0     5.33    0.19    0.19       0     5.32    0.19    0.19       0
+        2048           512     float    none       0    10.16    0.20    0.20       0     5.88    0.35    0.35       0
+        4096          1024     float    none       0     7.48    0.55    0.55       0     8.78    0.47    0.47       0
+        8192          2048     float    none       0    11.61    0.71    0.71       0    15.83    0.52    0.52       0
+       16384          4096     float    none       0     9.52    1.72    1.72       0     8.90    1.84    1.84       0
+       32768          8192     float    none       0   197.68    0.17    0.17       0    11.38    2.88    2.88       0
+       65536         16384     float    none       0    12.85    5.10    5.10       0    13.99    4.69    4.69       0
+      131072         32768     float    none       0    14.45    9.07    9.07       0    14.52    9.03    9.03       0
+      262144         65536     float    none       0    18.89   13.88   13.88       0    16.45   15.94   15.94       0
+      524288        131072     float    none       0    46.17   11.35   11.35       0    47.03   11.15   11.15       0
+     1048576        262144     float    none       0    58.39   17.96   17.96       0    57.96   18.09   18.09       0
+     2097152        524288     float    none       0   545.66    3.84    3.84       0    96.09   21.83   21.83       0
+     4194304       1048576     float    none       0  4948.72    0.85    0.85       0   146.14   28.70   28.70       0

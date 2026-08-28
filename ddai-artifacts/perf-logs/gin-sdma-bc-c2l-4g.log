@@ -1,0 +1,41 @@
+Broadcast gate: NP=8 host=smci355-ccs-aus-m03-17 root=all
+  BC-C1 host:  skipped (RUN_HOST_BASELINE=0)
+  BC-C2 gin:   skipped (RUN_GIN_SDMA=0 or RUN_BC_C2=0)
+  BC-C2-L gin: 128M .. 4G (hybrid -D 3, root=0, large completion)
+BC-C2-L: GIN hybrid Broadcast -D 3, 128M..4G (pool=-V 32, root=0, large completion, device_timing=0)
+=== mpirun -n 8 --allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none -x OMPI_ALLOW_RUN_AS_ROOT=1 -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 -x RCCL_ROCSHMEM_ENABLE=0 -x ROCSHMEM_BACKEND=ipc -x ROCSHMEM_DISABLE_MIXED_IPC=1 -x ROCSHMEM_DEBUG_LEVEL=info:noversion -x RCCL_ROCSHMEM_THRESHOLD=134217728 -x NCCL_DEBUG=VERSION -x NCCL_DEBUG_SUBSYS=INIT,NET -x RCCL_ENABLE_INTRANET=1 -x NCCL_DMABUF_ENABLE=1 -x NCCL_MSCCL_ENABLE=0 -x HSA_NO_SCRATCH_RECLAIM=1 -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS=1 -x RCCL_ROCSHMEM_THRESHOLD=4294967296 -x HSA_FORCE_FINE_GRAIN_PCIE=1 rccl-tests/broadcast_perf -b 128M -e 4G -f 2 -g 1 -R 2 -V 32 -D 3 -r 0 ===
+# rccl-tests version 2.19.6-Unknown  rccl-headers=23004 rccl-library=23004
+# Collective test starting: broadcast_perf
+# nThread 1 nGpus 1 minBytes 134217728 maxBytes 4294967296 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     10 on smci355-ccs-aus-m03-17 device  0 [0000:75:00] AMD Instinct MI355X
+#  Rank  1 Group  0 Pid     11 on smci355-ccs-aus-m03-17 device  1 [0000:05:00] AMD Instinct MI355X
+#  Rank  2 Group  0 Pid     12 on smci355-ccs-aus-m03-17 device  2 [0000:65:00] AMD Instinct MI355X
+#  Rank  3 Group  0 Pid     13 on smci355-ccs-aus-m03-17 device  3 [0000:15:00] AMD Instinct MI355X
+#  Rank  4 Group  0 Pid     14 on smci355-ccs-aus-m03-17 device  4 [0000:f5:00] AMD Instinct MI355X
+#  Rank  5 Group  0 Pid     15 on smci355-ccs-aus-m03-17 device  5 [0000:85:00] AMD Instinct MI355X
+#  Rank  6 Group  0 Pid     16 on smci355-ccs-aus-m03-17 device  6 [0000:e5:00] AMD Instinct MI355X
+#  Rank  7 Group  0 Pid     17 on smci355-ccs-aus-m03-17 device  7 [0000:95:00] AMD Instinct MI355X
+RCCL version : 2.30.4-Unknown 
+HIP version  : 7.13.99004-3309c611
+ROCm version : 7.13.0.0-9999-3309c611
+Hostname     : smci355-ccs-aus-m03-17
+Librccl path : /workspace/rccl/lib/librccl.so.1
+#
+#                                                                          out-of-place                           in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)          
+   134217728      33554432     float    none       0   503.86  266.38  266.38       0   495.46  270.90  270.90       0
+   268435456      67108864     float    none       0   859.30  312.39  312.39       0   848.45  316.38  316.38       0
+   536870912     134217728     float    none       0  1571.79  341.57  341.57       0  1560.57  344.02  344.02       0
+  1073741824     268435456     float    none       0  2986.69  359.51  359.51       0  2976.21  360.78  360.78       0
+  2147483648     536870912     float    none       0  5861.23  366.39  366.39       0  5859.97  366.47  366.47       0
+  4294967296    1073741824     float    none       0  11503.2  373.37  373.37       0  11439.5  375.45  375.45       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 337.8 
+#
+# Collective test concluded: broadcast_perf
+#
+
+PASS: gin-sdma-bcast-test np=8 root=all BC-C1=skipped BC-C2=128..128M BC-C2-L=passed
