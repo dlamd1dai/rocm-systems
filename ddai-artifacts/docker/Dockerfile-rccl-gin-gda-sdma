@@ -324,7 +324,7 @@ ARG RCCL_GIN_ALLTOALL_DEVICE_TRACE=0
 RUN mkdir rccl-tests \
     && cd rccl-tests \
     && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM_GIN=ON -DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} $( [ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" = "1" ] && echo '-DCMAKE_CXX_FLAGS=-DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1' ) ${WORKDIR}/rccl/src/projects/rccl-tests \
-    && make -j16 all_gather_perf gin_rocshmem_gda_factory_test \
+    && make -j16 all_gather_perf broadcast_perf gin_rocshmem_gda_factory_test \
     # Build-time gate: the GIN-SDMA host policy unit tests (no GPU needed) must
     # pass for the image to be considered good. GPU functional (label
     # gpu_functional) is exercised post-build by the gin-sdma-*-test.bash gates.

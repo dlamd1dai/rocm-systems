@@ -28,7 +28,7 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 # baselines (broadcast_perf/all_gather_perf/all_reduce_perf -D 0) work across the full size
 # range. Set ONLY_FUNCS="" to build every collective (much slower), or override with a custom
 # pattern.
-# Fast-iteration knob: COLLECTIVE=ag|a2a narrows the generated device-kernel set (ONLY_FUNCS)
+# Fast-iteration knob: COLLECTIVE=ag|a2a|bcast narrows the generated device-kernel set (ONLY_FUNCS)
 # AND the post-build smoke gates to just that collective, so the compile and device link only
 # cover what that collective's tests exercise. AlltoAll* is kept in every preset because the
 # GIN Anvil-SDMA bring-up depends on it. An explicit ONLY_FUNCS (or the individual
@@ -42,11 +42,16 @@ RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS
 COLLECTIVE="${COLLECTIVE:-}"
 case "${COLLECTIVE}" in
   ag)  : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllGather}"
-       : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}" ;;
+       : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}"; : "${RCCL_IMAGE_BC_SMOKE:=0}" ;;
   a2a) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda}"
-       : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}" ;;
+       : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_BC_SMOKE:=0}" ;;
+  bcast) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast}"
+       # Broadcast needs its host baseline (broadcast_perf -D 0) too, so keep
+       # Broadcast in the generated kernel set. The GIN bring-up (A2A) gate still
+       # guards image validity; the Broadcast -D 3 gate runs via gin-sdma-bcast-test.bash.
+       : "${RCCL_IMAGE_GIN_SMOKE:=1}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_BC_SMOKE:=1}" ;;
   "")  ;;
-  *)   echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use ag|a2a); building full set" >&2 ;;
+  *)   echo "WARN: unknown COLLECTIVE='${COLLECTIVE}' (use ag|a2a|bcast); building full set" >&2 ;;
 esac
 ONLY_FUNCS="${ONLY_FUNCS-SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|Broadcast|AllGather|AllReduce|Reduce}"
 
@@ -174,4 +179,41 @@ if [ "${RCCL_IMAGE_AG_SMOKE}" = "1" ]; then
   fi
 else
   echo "NOTE: GIN AllGather smoke assert disabled (RCCL_IMAGE_AG_SMOKE=0)."
+fi
+
+# ---------------------------------------------------------------------------
+# Build hardening: GIN Anvil-SDMA hybrid Broadcast (-D 3) smoke assert.
+# Runs gin-sdma-bcast-test.bash (BC-C1 host baseline + BC-C2 GIN hybrid) so a
+# broken Gin*BroadcastKernel or missing broadcast host kernels is caught at image
+# build time. Shares the same skip conditions as the A2A/AG gates above.
+#   RCCL_IMAGE_BC_SMOKE=0   disable this assert
+#   BC_SMOKE_NP=<n>         GPU/rank count (default = GIN_SMOKE_NP)
+#   BC_SMOKE_SIZE=<bytes>   max message size (default = GIN_SMOKE_SIZE)
+# ---------------------------------------------------------------------------
+RCCL_IMAGE_BC_SMOKE="${RCCL_IMAGE_BC_SMOKE:-0}"
+BC_SMOKE_NP="${BC_SMOKE_NP:-${GIN_SMOKE_NP:-8}}"
+BC_SMOKE_SIZE="${BC_SMOKE_SIZE:-${GIN_SMOKE_SIZE:-1M}}"
+if [ "${RCCL_IMAGE_BC_SMOKE}" = "1" ]; then
+  if [ ! -e /dev/kfd ]; then
+    echo "WARN: Broadcast GIN smoke assert skipped (no /dev/kfd; GPU-less builder). Set RCCL_IMAGE_BC_SMOKE=0 to silence." >&2
+  else
+    echo "=== Build hardening: GIN Anvil-SDMA Broadcast smoke assert (NP=${BC_SMOKE_NP}, -D 3, NCCL_GIN_TYPE=5, -e ${BC_SMOKE_SIZE}) ==="
+    BC_SMOKE_LOG="$(mktemp)"
+    bash "${DEV_ARTI_DIR}/scripts/gin-sdma-bcast-test.bash" "${BC_SMOKE_NP}" "${BC_SMOKE_SIZE}" \
+      > "${BC_SMOKE_LOG}" 2>&1
+    if grep -qE "GIN support is not enabled for this communicator|Failed to initialize any GIN plugin|Test failure|FATAL:" "${BC_SMOKE_LOG}" \
+       || ! grep -q "Out of bounds values : 0 OK" "${BC_SMOKE_LOG}"; then
+      echo "ERROR: GIN Anvil-SDMA Broadcast (-D 3) bring-up FAILED for image '${DOCKER_IMAGE}'." >&2
+      echo "       The Gin*BroadcastKernel did not initialize GIN or failed datacheck." >&2
+      echo "------------------------------ BC smoke log tail ------------------------------" >&2
+      tail -n 40 "${BC_SMOKE_LOG}" >&2
+      echo "-------------------------------------------------------------------------------" >&2
+      rm -f "${BC_SMOKE_LOG}"
+      exit 1
+    fi
+    echo "Broadcast GIN smoke OK: $(grep 'Avg bus bandwidth' "${BC_SMOKE_LOG}" | tail -n1 | sed 's/^# *//')"
+    rm -f "${BC_SMOKE_LOG}"
+  fi
+else
+  echo "NOTE: GIN Broadcast smoke assert disabled (RCCL_IMAGE_BC_SMOKE=0)."
 fi

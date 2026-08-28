@@ -1,0 +1,17 @@
+# GIN-SDMA Broadcast files that must be byte-identical across
+# users/dondai/gin-stage3c-sdma-bcast-nccl-2.30.7-wip and
+# users/dondai/gin-stage3c-sdma-bc-nccl-2.30.7-wip.
+# Checked by gin-sdma-bc-sync-check.bash (run from repo root).
+#
+# The upstream PR branch (users/dondai/gin-stage3c-sdma-bcast) should also match
+# on the two policy entries below; ddai-artifacts/ paths exist only on the NCCL
+# 2.30.7 branches.
+#
+# Excluded: projects/rccl-tests/src/broadcast.cu — bc-nccl keeps devtimeAugmentLine
+# and testEngine layout shared with the AllGather devtime scaffold; kernel design
+# matches bcast-nccl.
+# Excluded: ddai-artifacts/scripts/gin-sdma-bcast-test.bash — bc-nccl uses
+# rccl-UnitTestsGinSdmaBroadcastPolicy for POLICY_UT (reconciled docker path).
+projects/rccl-tests/src/gin_sdma_broadcast_policy.h
+projects/rccl/test/gin/gin_sdma_broadcast_policy_test.cpp
+ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma-bcast-relink
