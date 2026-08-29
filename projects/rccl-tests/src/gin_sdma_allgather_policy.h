@@ -110,6 +110,13 @@ GIN_SDMA_AG_HD inline int allGatherMaxCtas() {
   return (kAllGatherCtasLsa > kAllGatherCtasSdma) ? kAllGatherCtasLsa : kAllGatherCtasSdma;
 }
 
+// Element offset of rank r's contribution within EVERY peer's AllGather recv
+// buffer: rank r's send chunk lands at [r*count, r*count + count). Shared by the
+// production LSA-direct kernel (AllGatherLsaDirect) and the addressing tests.
+GIN_SDMA_AG_HD inline size_t allGatherRecvSliceOffset(int rank, size_t count) {
+  return (size_t)rank * count;
+}
+
 // AllGather algorithm / bus bandwidth (GB/s) given the per-rank element count,
 // element size, elapsed seconds and rank count. algBw counts every rank's
 // contribution; busBw applies the AllGather (nranks-1)/nranks correction.
