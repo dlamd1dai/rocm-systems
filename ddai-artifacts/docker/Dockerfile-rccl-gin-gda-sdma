@@ -46,8 +46,9 @@ RUN set -eu; \
       || { echo "ERROR: ${ROCM_PATH}/bin/hipcc missing after nightly extract"; exit 1; }; \
     echo "ROCm nightly $(cat "${ROCM_PATH}/.info/version" 2>/dev/null || echo unknown) installed"
 
-## install dependencies
-RUN apt-get install -y --no-install-recommends \
+## install dependencies (apt lists were cleared after the minimal bootstrap above)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
     build-essential  \
     git \
     make \
@@ -312,7 +313,7 @@ RUN cd rccl/src/projects/rccl \
  && ROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} \
     ROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem \
     ./install.sh --amdgpu_targets=${GPU_TARGETS} --prefix=${RCCL_INSTALL_PREFIX} --rocshmem-gin --no-device-linker --no_clean \
-      --cmake-options "-DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem" \
+      --cmake-options "-DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DGENERATE_SYM_KERNELS=OFF" \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "--debug")
 
 # Workaround: hipify renames core.h->core_tmp.h but gin headers still include ../core.h
@@ -337,7 +338,7 @@ ARG RCCL_GIN_ALLTOALL_DEVICE_TRACE=0
 RUN mkdir rccl-tests \
     && cd rccl-tests \
     && cmake $([ "${DEBUG_BUILD}" = "1" ] && echo "-DCMAKE_BUILD_TYPE=Debug" || echo "-DCMAKE_BUILD_TYPE=Release") -DUSE_MPI=ON -DENABLE_DEVICE_API=ON -DENABLE_ROCSHMEM_GIN=ON -DBUILD_TESTS=ON -DBUILD_GPU_FUNCTIONAL_TESTS=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem -DRCCL_SOURCE_DIR=${WORKDIR}/rccl/src/projects/rccl -DCMAKE_PREFIX_PATH="${RCCL_INSTALL_PREFIX};${MPI_INSTALL_PREFIX}" -DGPU_TARGETS=${GPU_TARGETS} $( [ "${RCCL_GIN_ALLTOALL_DEVICE_TRACE}" = "1" ] && echo '-DCMAKE_CXX_FLAGS=-DRCCL_GIN_ALLTOALL_DEVICE_TRACE=1' ) ${WORKDIR}/rccl/src/projects/rccl-tests \
-    && make -j16 \
+    && make -j16 alltoall_perf \
     # Build-time gate: the GIN-SDMA host policy unit tests (no GPU needed) must
     # pass for the image to be considered good. GPU functional (label
     # gpu_functional) is exercised post-build by the gin-sdma-*-test.bash gates.
