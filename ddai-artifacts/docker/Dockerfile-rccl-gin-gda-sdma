@@ -26,13 +26,25 @@ RUN mkdir -p ${SRC}
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y sudo wget curl gpg ca-certificates
-RUN mkdir --parents --mode=0755 /etc/apt/keyrings \
- && wget https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | gpg --dearmor | tee /etc/apt/keyrings/amdrocm.gpg > /dev/null \
- && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" > /etc/apt/sources.list.d/rocm.list
-RUN apt-get update \
- && apt-get install -y amdrocm-core7.13-gfx950 amdrocm-core7.13-gfx942 amdrocm-core7.13-gfx1250 amdrocm-core-dev7.13 amdrocm-developer-tools7.13 amdrocm-runtime-dev7.13 \
- && ln -s /opt/rocm/core/.info /opt/rocm/.info
+ && apt-get install -y --no-install-recommends sudo wget curl ca-certificates \
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# TheRock nightly flattened ROCm stack (replaces apt amdrocm-core7.13).
+# Default: gfx125X-dcgpu 10.1.0a20260822 for MI450/MI455 bring-up.
+# Override: --build-arg ROCM_NIGHTLY_VERSION=... --build-arg ROCM_NIGHTLY_FAMILY=gfx950-dcgpu
+ARG ROCM_NIGHTLY_BASE_URL=https://rocm.nightlies.amd.com/tarball-multi-arch
+ARG ROCM_NIGHTLY_VERSION=10.1.0a20260822
+ARG ROCM_NIGHTLY_FAMILY=gfx125X-dcgpu
+ENV ROCM_PATH=/opt/rocm
+RUN set -eu; \
+    tarball="therock-dist-linux-${ROCM_NIGHTLY_FAMILY}-${ROCM_NIGHTLY_VERSION}.tar.gz"; \
+    url="${ROCM_NIGHTLY_BASE_URL}/${tarball}"; \
+    echo "Installing TheRock nightly: ${url} -> ${ROCM_PATH}"; \
+    mkdir -p "${ROCM_PATH}"; \
+    curl -fSL --retry 5 --retry-delay 5 "${url}" | tar -xz -C "${ROCM_PATH}"; \
+    test -x "${ROCM_PATH}/bin/hipcc" \
+      || { echo "ERROR: ${ROCM_PATH}/bin/hipcc missing after nightly extract"; exit 1; }; \
+    echo "ROCm nightly $(cat "${ROCM_PATH}/.info/version" 2>/dev/null || echo unknown) installed"
 
 ## install dependencies
 RUN apt-get install -y --no-install-recommends \
@@ -126,8 +138,6 @@ RUN set -eu; \
 #    && bash ./cmake-3.28.0-linux-x86_64.sh --prefix=/usr --exclude-subdir --skip-license \
 #    && rm cmake-3.28.0-linux-x86_64.sh
 
-## Set ROCm path
-ENV ROCM_PATH=/opt/rocm
 # System OpenMPI from apt.
 # rocSHMEM MPI_ROOT, rccl-tests CMAKE_PREFIX_PATH use these.
 ENV MPI_INSTALL_PREFIX=/usr
@@ -352,8 +362,10 @@ RUN set -eu; \
     echo "BUILD SANITY OK: GIN host plugins present in librccl.so; Anvil SDMA factory linked into alltoall_perf"
 
 ## set environment variables
-ENV PATH="${MPI_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${PATH}"
-ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
+ENV HIP_PLATFORM=amd
+ENV HIP_DEVICE_LIB_PATH="${ROCM_PATH}/lib/llvm/amdgcn/bitcode"
+ENV PATH="${MPI_INSTALL_PREFIX}/bin:${ROCM_PATH}/bin:${ROCM_PATH}/lib/llvm/bin:${PATH}"
+ENV LD_LIBRARY_PATH="${RCCL_INSTALL_PREFIX}/lib:${MPI_INSTALL_PREFIX}/lib:${ROCM_PATH}/lib:${ROCM_PATH}/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
 ENV UCX_WARN_UNUSED_ENV_VARS=n
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1

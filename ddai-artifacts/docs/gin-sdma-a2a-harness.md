@@ -9,7 +9,7 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 
 | Path | Purpose |
 |------|---------|
-| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | Ubuntu 24.04 + ROCm 7.13 image with rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests |
+| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | Ubuntu 24.04 + TheRock nightly ROCm 10.1.0 (`gfx125X-dcgpu`) + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Build wrapper + optional GPU smoke (Test#5) |
 | `ddai-artifacts/scripts/gin-sdma-a2a-test.bash` | Single-node AllToAll perf/compare harness |
 | `extra-rdma-debs/` | Optional newer rdma-core/libmlx5 debs for MLX5 DMA-BUF symbols |
@@ -71,6 +71,9 @@ Select tests with `RCCL_GIN_RUN_TESTS` (comma list), e.g. `1,5` or `5`.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `GPU_TARGETS` | `gfx1250` | Passed to rocSHMEM + RCCL + rccl-tests |
+| `ROCM_NIGHTLY_VERSION` | `10.1.0a20260822` | TheRock nightly tarball date stamp |
+| `ROCM_NIGHTLY_FAMILY` | `gfx125X-dcgpu` (auto from `GPU_TARGETS`) | Tarball family slice; use `gfx950-dcgpu` for MI355 |
+| `ROCM_NIGHTLY_BASE_URL` | `https://rocm.nightlies.amd.com/tarball-multi-arch` | Override for mirror/air-gap |
 | `COLLECTIVE` | `a2a` | `a2a` = AllToAll-only device kernels; `full` = include AR/AG/BC baselines |
 | `ONLY_FUNCS` | (from COLLECTIVE) | Device kernel generation filter |
 | `RCCL_IMAGE_GIN_SMOKE` | `1` | Post-build Test#5 smoke on `/dev/kfd` |
