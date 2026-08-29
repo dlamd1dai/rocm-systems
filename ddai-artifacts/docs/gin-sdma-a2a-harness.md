@@ -92,3 +92,24 @@ HSA_NO_SCRATCH_RECLAIM=1
 ```
 
 See also: [gin-sdma-a2a-mi455-fabric-dda-plan.md](gin-sdma-a2a-mi455-fabric-dda-plan.md)
+
+## Unit tests (`rccl-UnitTestsMPI`)
+
+Fabric LL 1p4g matrix in `GinDeviceMPITests.cpp` (requires `ENABLE_MPI_TESTS` +
+`NCCL_GIN_ANVIL_SDMA_ENABLE` at RCCL build time):
+
+| Test | Description |
+|------|-------------|
+| `GinMPIDeviceTests.Alltoall_FabricLL_1p4g` | Counts `{4, 16, 256, 1024}` fp32 per peer via `ddaAllToAllFabricLL` |
+| `GinMPIDeviceTests.Alltoall_FabricLL_Boundary_1p4g` | Count `2048` per peer → 32 KiB total (at `RCCL_DDA_LL_THRESHOLD`) |
+| `GinMPIDeviceTests.Alltoall_FabricLL_OverBoundaryPut_1p4g` | Count `4096` per peer → gin.put fallback above LL threshold |
+
+```bash
+export NCCL_GIN_TYPE=6 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 RCCL_ENABLE_INTRANET=1
+mpirun -n 4 ./rccl-UnitTestsMPI \
+  --gtest_filter='GinMPIDeviceTests.Alltoall_FabricLL_*'
+```
+
+Tests skip on MI355/MI300 (no `devComm.ginFabricSmallMsgEnabled`) and when env
+prerequisites are missing. Minimum per-peer count is 4 fp32 elements (16 B LL line
+alignment).
