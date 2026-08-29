@@ -53,7 +53,9 @@ case "${COLLECTIVE}" in
   rs)     : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|ReduceScatter}"
           : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=1}" ;;
   rs-min) : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|ReduceScatter * * Sum *}"
-          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=1}" ;;
+          : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=0}"; : "${RCCL_IMAGE_RS_SMOKE:=1}"
+          : "${RCCL_TESTS_MAKE_TARGETS:=reduce_scatter_perf alltoall_perf}"
+          : "${RCCL_TESTS_SKIP_CTEST:=1}" ;;
   ag)     : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda|AllGather}"
           : "${RCCL_IMAGE_GIN_SMOKE:=0}"; : "${RCCL_IMAGE_AG_SMOKE:=1}"; : "${RCCL_IMAGE_RS_SMOKE:=0}" ;;
   a2a)    : "${ONLY_FUNCS:=SendRecv|AlltoAllPivot|AlltoAllGda|AlltoAllvGda}"
@@ -111,6 +113,8 @@ ${DOCKER_CMD} build -f ${DOCKERFILE_PATH} -t ${DOCKER_IMAGE} \
     "${TRACE_BUILD_ARGS[@]}" \
     --build-arg RCCL_CACHE_BUST=$((RCCL_CACHE_BUST++)) \
     --build-arg ROCSHMEM_CACHE_BUST=$((ROCSHMEM_CACHE_BUST++)) \
+    --build-arg RCCL_TESTS_MAKE_TARGETS="${RCCL_TESTS_MAKE_TARGETS:-}" \
+    --build-arg RCCL_TESTS_SKIP_CTEST="${RCCL_TESTS_SKIP_CTEST:-0}" \
     .
 ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
 
