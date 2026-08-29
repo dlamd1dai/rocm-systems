@@ -310,6 +310,7 @@ static ncclResult_t ginAnvilRegMrSymFabric(ginAnvilCollCtx* cctx, void* data, si
   size_t memSize = 0;
   int numSegments = 0;
   ncclResult_t ret = ncclSuccess;
+  uintptr_t* remote_vas_host = nullptr;
 
   NCCLCHECK(ncclCuMemGetAddressRange(reinterpret_cast<CUdeviceptr>(data), size, &memAddr, &memSize, &numSegments));
   if (numSegments != 1) {
@@ -373,7 +374,7 @@ static ncclResult_t ginAnvilRegMrSymFabric(ginAnvilCollCtx* cctx, void* data, si
     goto failFabricRef;
   }
 
-  uintptr_t* remote_vas_host = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
+  remote_vas_host = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
   if (!remote_vas_host) {
     ret = ncclSystemError;
     goto failFabricDevHandle;

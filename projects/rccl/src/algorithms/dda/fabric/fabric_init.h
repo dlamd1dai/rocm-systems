@@ -17,13 +17,7 @@ bool ncclDdaUseFabricPath(struct ncclComm* comm);
 
 // Returns true when the Anvil SDMA GIN plugin should use fabric DDA peer
 // memory for this comm (MI455 single-clique path).
-inline bool ginAnvilUseFabricMem(struct ncclComm* comm) {
-  if (comm == nullptr) return false;
-  if (!ncclDdaUseFabricPath(comm)) return false;
-  if (comm->clique.size != comm->nRanks) return false;
-  if (!ncclCuMemEnable()) return false;
-  return true;
-}
+bool ginAnvilUseFabricMem(struct ncclComm* comm);
 
 ncclResult_t ncclDdaFabricCommInit(struct ncclComm* comm);
 ncclResult_t ncclDdaFabricCommFini(struct ncclComm* comm);
