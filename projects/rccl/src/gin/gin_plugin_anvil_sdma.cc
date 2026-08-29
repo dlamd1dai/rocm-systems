@@ -13,6 +13,7 @@
  */
 
 #include "gin/gin_host_anvil_sdma.h"
+#include "algorithms/dda/fabric/fabric_init.h"
 #include "comm.h"
 #include "dev_runtime.h"
 #include "bootstrap.h"
@@ -253,6 +254,15 @@ static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int 
 
   INFO(NCCL_INIT, "GIN anvil-sdma: standalone SDMA queues (%d ranks, %d ch, spread=%d)", nranks, cctx->numChannels,
        cctx->sdmaChannelStride);
+  if (ginAnvilUseFabricMem(cctx->comm)) {
+    if (cctx->comm->ddaPeerPtrsDev == nullptr || cctx->comm->ddaLLEpochDev == nullptr ||
+        cctx->comm->ddaScratch == nullptr) {
+      WARN("GIN anvil-sdma: fabric small-msg lane requested but DDA fabric resources are missing");
+    } else {
+      INFO(NCCL_INIT, "GIN anvil-sdma: fabric small-msg lane available (nRanks=%d clique=%d)", cctx->comm->nRanks,
+           cctx->comm->clique.size);
+    }
+  }
   *collComm = cctx;
   return ncclSuccess;
 }

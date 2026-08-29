@@ -10,6 +10,11 @@
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 #include "nccl_device.h"
 #include "rccl_vector_types.h"
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
+#include "algorithms/dda/alltoall/alltoall_dda_fabric_ll.h"
+#include "algorithms/dda/device/CollCommon.h"
+#include "nccl_device/gin/anvil_sdma/gin_fabric_a2a.h"
+#endif
 #endif
 
 #if defined(NCCL_OS_LINUX)
@@ -253,8 +258,81 @@ __global__ void NvlAlltoAllKernelOptimized(ncclWindow_t sendwin, size_t sendoffs
 }
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
+using dda::common::kDdaLLMaxBytes;
+using dda::common::kDdaLLA2ASlotStridePkts;
+using dda::common::LLPacket16;
+using gin::fabric::kDdaMaxNranks;
+using gin::fabric::kDdaLLA2APktsPerBlock;
+using gin::fabric::kDdaLLAgMaxBlocksPerPeer;
+
+static size_t AlltoAllGinFabricLLScratchSize(int nRanks) {
+  return (size_t)2 * (size_t)nRanks * kDdaLLA2ASlotStridePkts * sizeof(LLPacket16);
+}
+
+static int AlltoAllGinFabricLLBlocksPerPeer(size_t perChunkBytes) {
+  const size_t nPk = perChunkBytes >> 3;
+  if (nPk <= kDdaLLA2APktsPerBlock) return 1;
+  size_t bpp = (nPk + kDdaLLA2APktsPerBlock - 1) / kDdaLLA2APktsPerBlock;
+  if (bpp > (size_t)kDdaLLAgMaxBlocksPerPeer) bpp = (size_t)kDdaLLAgMaxBlocksPerPeer;
+  return (int)bpp;
+}
+
+static bool AlltoAllGinFabricLLEligibleHost(ncclDevComm* devComm, size_t count, ncclDataType_t type) {
+  if (!devComm || !devComm->ginFabricSmallMsgEnabled) return false;
+  if (devComm->ginFabricPeerScratch == nullptr || devComm->ginFabricLLEpoch == nullptr) return false;
+  if (count == 0) return false;
+  if (devComm->nRanks < 2 || devComm->nRanks > kDdaMaxNranks) return false;
+  if (type != ncclFloat32 && type != ncclFloat16 && type != ncclBfloat16) return false;
+  const size_t perChunkBytes = count * wordSize(type);
+  if (perChunkBytes % 16 != 0) return false;
+  if (perChunkBytes * 2 > kDdaLLMaxBytes) return false;
+  if (AlltoAllGinFabricLLScratchSize(devComm->nRanks) > devComm->ginFabricScratchBytes) return false;
+  if (devComm->ginFabricLLThreshold > 0 &&
+      (size_t)devComm->nRanks * perChunkBytes > devComm->ginFabricLLThreshold) {
+    return false;
+  }
+  return true;
+}
+
+template <typename F>
+static testResult_t AlltoAllLaunchGinKernelWithGrid(F kernel, void* sendbuff, size_t sendoffset, void* recvbuff,
+                                                      size_t recvoffset, size_t count, int root, ncclDevComm* devComm,
+                                                      cudaStream_t stream, dim3 grid, dim3 block) {
+  if (kernel == nullptr) return testNotImplemented;
+  ncclWindow_t sendwin = (ncclWindow_t)sendbuff;
+  ncclWindow_t recvwin = (ncclWindow_t)recvbuff;
+  kernel<<<grid, block, 0, stream>>>(sendwin, sendoffset, recvwin, recvoffset, count, root, *devComm);
+  return testSuccess;
+}
+#endif
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
+  if (gin::fabric::ginAlltoAllFabricLLEligible<T>(devComm, count)) {
+    T* sendPtr = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+    T* recvPtr = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+    const size_t perChunkBytes = count * sizeof(T);
+    switch (devComm.nRanks) {
+    case 4:
+      dda::common::ddaAllToAllFabricLL<T, 4>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+      break;
+    case 8:
+      dda::common::ddaAllToAllFabricLL<T, 8>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+      break;
+    default:
+      dda::common::ddaAllToAllFabricLL<T, 0>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+      break;
+    }
+    return;
+  }
+
   int ginContext = 0;
   unsigned int signalIndex = blockIdx.x;
   ncclGin gin { devComm, ginContext };
@@ -386,9 +464,27 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         return testSuccess;
 #endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
-      case 3:
-        TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
+      case 3: {
+        ncclDevComm* devComm = (ncclDevComm*)comm;
+        auto kernel = SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
+        if (kernel == nullptr && type == ncclBfloat16 && op == ncclSum) {
+          kernel = GinAlltoAllKernel<dda::common::bf16>;
+        }
+#endif
+        if (AlltoAllGinFabricLLEligibleHost(devComm, count, type)) {
+          const size_t perChunkBytes = count * wordSize(type);
+          const int blocksPerPeer = AlltoAllGinFabricLLBlocksPerPeer(perChunkBytes);
+          dim3 block(256);
+          dim3 grid((unsigned)devComm->nRanks, (unsigned)blocksPerPeer);
+          TESTCHECK(AlltoAllLaunchGinKernelWithGrid(kernel, sendbuff, sendoffset, recvbuff, recvoffset, count, root,
+                                                    devComm, stream, grid, block));
+        } else {
+          TESTCHECK(testLaunchDeviceKernel(kernel, sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root,
+                                           comm, stream));
+        }
         return testSuccess;
+      }
       case 4:
         TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(HybridAlltoAllKernel, type, op), sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream));
         return testSuccess;
