@@ -14,6 +14,13 @@
 
 #include "nccl_device.h"
 
+#if NCCL_GIN_ANVIL_SDMA_ENABLE
+#include "algorithms/dda/alltoall/alltoall_dda_fabric_ll.h"
+#include "algorithms/dda/device/CollCommon.h"
+#include "nccl_device/gin/anvil_sdma/gin_fabric_a2a.h"
+#include "rccl_common.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <array>
@@ -174,6 +181,74 @@ constexpr int kGinSingleThreadThreads = 1;
 // An LSA team only becomes non-trivial once a node hosts more than one rank; at
 // one rank per node it has size 1 and any LSA assertion is vacuous.
 constexpr int kMinLsaRanksPerNode = 2;
+
+// Anvil SDMA fabric LL alltoall: MNNVL + cuMem + NCCL_GIN_TYPE=6.
+std::string ginAnvilFabricLLTestSkipReason() {
+  if (auto reason = ginEnvDisabledReason(); !reason.empty()) return reason;
+  if (auto reason = cuMemReason(); !reason.empty()) return reason;
+  if (auto reason = intranetReason(); !reason.empty()) return reason;
+  const char* ginType = std::getenv("NCCL_GIN_TYPE");
+  if (!ginType || std::atoi(ginType) != NCCL_GIN_TYPE_ANVIL_SDMA) {
+    return "Requires NCCL_GIN_TYPE=6 (Anvil SDMA) for fabric LL alltoall";
+  }
+  const char* mnnvl = std::getenv("NCCL_MNNVL_ENABLE");
+  if (!mnnvl || mnnvl[0] == '\0') {
+    return "Requires NCCL_MNNVL_ENABLE=1 for fabric LL alltoall";
+  }
+  errno = 0;
+  if (std::strtoll(mnnvl, nullptr, 0) == 0 && errno == 0) {
+    return "Requires NCCL_MNNVL_ENABLE=1 for fabric LL alltoall";
+  }
+  return "";
+}
+
+#if NCCL_GIN_ANVIL_SDMA_ENABLE
+using dda::common::kDdaLLMaxBytes;
+using dda::common::kDdaLLA2ASlotStridePkts;
+using dda::common::LLPacket16;
+using gin::fabric::kDdaLLA2APktsPerBlock;
+using gin::fabric::kDdaLLAgMaxBlocksPerPeer;
+using gin::fabric::kDdaMaxNranks;
+
+size_t alltoallFabricLLScratchSize(int nRanks) {
+  return (size_t)2 * (size_t)nRanks * kDdaLLA2ASlotStridePkts * sizeof(LLPacket16);
+}
+
+int alltoallFabricLLBlocksPerPeer(size_t perChunkBytes) {
+  const size_t nPk = perChunkBytes >> 3;
+  if (nPk <= kDdaLLA2APktsPerBlock) return 1;
+  size_t bpp = (nPk + kDdaLLA2APktsPerBlock - 1) / kDdaLLA2APktsPerBlock;
+  if (bpp > (size_t)kDdaLLAgMaxBlocksPerPeer) bpp = (size_t)kDdaLLAgMaxBlocksPerPeer;
+  return (int)bpp;
+}
+
+bool alltoallFabricLLEligibleHost(const ncclDevComm& devComm, size_t count) {
+  if (!devComm.ginFabricSmallMsgEnabled) return false;
+  if (devComm.ginFabricPeerScratch == nullptr || devComm.ginFabricLLEpoch == nullptr) return false;
+  if (count == 0) return false;
+  if (devComm.nRanks < 2 || devComm.nRanks > kDdaMaxNranks) return false;
+  const size_t perChunkBytes = count * sizeof(float);
+  if (perChunkBytes % 16 != 0) return false;
+  if (perChunkBytes * 2 > kDdaLLMaxBytes) return false;
+  if (alltoallFabricLLScratchSize(devComm.nRanks) > devComm.ginFabricScratchBytes) return false;
+  if (devComm.ginFabricLLThreshold > 0 &&
+      (size_t)devComm.nRanks * perChunkBytes > devComm.ginFabricLLThreshold) {
+    return false;
+  }
+  return true;
+}
+
+void verifyAlltoallPattern(int rank, int nRanks, size_t count, const std::vector<float>& hostRecv) {
+  for (int src = 0; src < nRanks; src++) {
+    for (size_t i = 0; i < count; i++) {
+      const float expected =
+          static_cast<float>(src * 1000 + rank * 100 + static_cast<int>(i));
+      const float got = hostRecv[static_cast<size_t>(src) * count + i];
+      ASSERT_EQ(expected, got) << "rank=" << rank << " src=" << src << " i=" << i;
+    }
+  }
+}
+#endif
 
 }  // namespace
 
@@ -2572,6 +2647,36 @@ __global__ void alltoallPureKernel(
   gin.flush(ncclCoopCta());
 }
 
+#if NCCL_GIN_ANVIL_SDMA_ENABLE
+// MI455 fabric LL alltoall: comm scratch staging via ddaAllToAllFabricLL (no gin.put).
+template <typename T>
+__global__ void alltoallFabricLLKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
+                                       size_t recvoffset, size_t count, struct ncclDevComm devComm) {
+  if (!gin::fabric::ginAlltoAllFabricLLEligible<T>(devComm, count)) return;
+
+  T* sendPtr = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+  T* recvPtr = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+  const size_t perChunkBytes = count * sizeof(T);
+  switch (devComm.nRanks) {
+  case 4:
+    dda::common::ddaAllToAllFabricLL<T, 4>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  case 8:
+    dda::common::ddaAllToAllFabricLL<T, 8>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  default:
+    dda::common::ddaAllToAllFabricLL<T, 0>(
+        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  }
+}
+#endif
+
 // Single-node 2-8 ranks; count sweep {1, 1024, 1<<16}. Bit-for-bit verifies
 // the deterministic sendbuf[i] = rank*1000 + dst*100 + i pattern landed on
 // the right peer slot. The 1<<16 case (256 KiB / direction / peer) saturates
@@ -2673,6 +2778,253 @@ TEST_F(GinMPIDeviceTests, Alltoall_PureReference) {
     }
   }
 }
+
+#if NCCL_GIN_ANVIL_SDMA_ENABLE
+// 1p4g MI455 fabric LL matrix: small per-peer counts with 16B LL line alignment.
+TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_1p4g) {
+  if (auto reason = ginAnvilFabricLLTestSkipReason(); !reason.empty())
+    GTEST_SKIP() << reason;
+
+  if (!validateTestPrerequisites(/*min_processes=*/4, /*max_processes=*/4))
+    GTEST_SKIP() << "Requires exactly 4 ranks (1 process x 4 GPUs)";
+
+  ASSERT_EQ(ncclSuccess, createTestCommunicator());
+  ncclComm_t comm = getActiveCommunicator();
+  hipStream_t stream = getActiveStream();
+
+  int rank = -1, nRanks = -1;
+  ncclCommUserRank(comm, &rank);
+  ncclCommCount(comm, &nRanks);
+  ASSERT_EQ(nRanks, 4);
+
+  ncclDevCommRequirements reqs = defaultGinReqs();
+  ncclDevComm devComm{};
+  ASSERT_MPI_EQ(ncclSuccess, ncclDevCommCreate(comm, &reqs, &devComm));
+  auto devCommCleanup = makeScopeGuard([&]() {
+    (void)ncclDevCommDestroy(comm, &devComm);
+  });
+
+  if (!devComm.ginFabricSmallMsgEnabled) {
+    GTEST_SKIP() << "Fabric LL small-msg lane not enabled on this communicator "
+                    "(expected MI455 MNNVL single-clique with DDA fabric resources)";
+  }
+
+  // Per-peer fp32 counts; minimum 4 elements (16 B) for LL line alignment.
+  const std::vector<size_t> counts = {4, 16, 256, 1024};
+  constexpr int kFabricLLThreads = 256;
+
+  for (size_t count : counts) {
+    SCOPED_TRACE(::testing::Message() << "count=" << count);
+    ASSERT_TRUE(alltoallFabricLLEligibleHost(devComm, count))
+        << "Host eligibility rejected count=" << count;
+
+    const size_t totalElements = count * static_cast<size_t>(nRanks);
+    const size_t sizeBytes = totalElements * sizeof(float);
+
+    void* dSend = nullptr;
+    void* dRecv = nullptr;
+    ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dSend, sizeBytes));
+    ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dRecv, sizeBytes));
+    auto memCleanup = makeScopeGuard([&]() {
+      if (dSend) (void)ncclMemFree(dSend);
+      if (dRecv) (void)ncclMemFree(dRecv);
+    });
+
+    ncclWindow_t sendWin = nullptr, recvWin = nullptr;
+    ASSERT_MPI_EQ(ncclSuccess,
+        ncclCommWindowRegister(comm, dSend, sizeBytes, &sendWin, NCCL_WIN_COLL_SYMMETRIC));
+    ASSERT_MPI_EQ(ncclSuccess,
+        ncclCommWindowRegister(comm, dRecv, sizeBytes, &recvWin, NCCL_WIN_COLL_SYMMETRIC));
+    auto winCleanup = makeScopeGuard([&]() {
+      if (sendWin) (void)ncclCommWindowDeregister(comm, sendWin);
+      if (recvWin) (void)ncclCommWindowDeregister(comm, recvWin);
+    });
+
+    std::vector<float> hostSend(totalElements, 0.0f);
+    std::vector<float> hostRecv(totalElements, 0.0f);
+    for (int dst = 0; dst < nRanks; dst++) {
+      for (size_t i = 0; i < count; i++) {
+        hostSend[static_cast<size_t>(dst) * count + i] =
+            static_cast<float>(rank * 1000 + dst * 100 + static_cast<int>(i));
+      }
+    }
+    ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dSend, hostSend.data(), sizeBytes, hipMemcpyHostToDevice));
+    ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dRecv, hostRecv.data(), sizeBytes, hipMemcpyHostToDevice));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    const size_t perChunkBytes = count * sizeof(float);
+    const int blocksPerPeer = alltoallFabricLLBlocksPerPeer(perChunkBytes);
+    dim3 block(kFabricLLThreads);
+    dim3 grid((unsigned)nRanks, (unsigned)blocksPerPeer);
+    alltoallFabricLLKernel<float><<<grid, block, 0, stream>>>(
+        sendWin, /*sendoffset=*/0, recvWin, /*recvoffset=*/0, count, devComm);
+    ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    ASSERT_EQ(hipSuccess, hipMemcpy(hostRecv.data(), dRecv, sizeBytes, hipMemcpyDeviceToHost));
+    verifyAlltoallPattern(rank, nRanks, count, hostRecv);
+  }
+}
+
+// Total payload exactly at RCCL_DDA_LL_THRESHOLD (default 32 KiB for 4 ranks).
+TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_Boundary_1p4g) {
+  if (auto reason = ginAnvilFabricLLTestSkipReason(); !reason.empty())
+    GTEST_SKIP() << reason;
+
+  if (!validateTestPrerequisites(/*min_processes=*/4, /*max_processes=*/4))
+    GTEST_SKIP() << "Requires exactly 4 ranks (1 process x 4 GPUs)";
+
+  ASSERT_EQ(ncclSuccess, createTestCommunicator());
+  ncclComm_t comm = getActiveCommunicator();
+  hipStream_t stream = getActiveStream();
+
+  int rank = -1, nRanks = -1;
+  ncclCommUserRank(comm, &rank);
+  ncclCommCount(comm, &nRanks);
+  ASSERT_EQ(nRanks, 4);
+
+  ncclDevCommRequirements reqs = defaultGinReqs();
+  ncclDevComm devComm{};
+  ASSERT_MPI_EQ(ncclSuccess, ncclDevCommCreate(comm, &reqs, &devComm));
+  auto devCommCleanup = makeScopeGuard([&]() {
+    (void)ncclDevCommDestroy(comm, &devComm);
+  });
+
+  if (!devComm.ginFabricSmallMsgEnabled)
+    GTEST_SKIP() << "Fabric LL small-msg lane not enabled on this communicator";
+
+  const size_t count = 2048; // 4 ranks * 2048 * 4 B = 32 KiB total
+  ASSERT_TRUE(alltoallFabricLLEligibleHost(devComm, count));
+
+  const size_t totalElements = count * static_cast<size_t>(nRanks);
+  const size_t sizeBytes = totalElements * sizeof(float);
+
+  void* dSend = nullptr;
+  void* dRecv = nullptr;
+  ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dSend, sizeBytes));
+  ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dRecv, sizeBytes));
+  auto memCleanup = makeScopeGuard([&]() {
+    if (dSend) (void)ncclMemFree(dSend);
+    if (dRecv) (void)ncclMemFree(dRecv);
+  });
+
+  ncclWindow_t sendWin = nullptr, recvWin = nullptr;
+  ASSERT_MPI_EQ(ncclSuccess,
+      ncclCommWindowRegister(comm, dSend, sizeBytes, &sendWin, NCCL_WIN_COLL_SYMMETRIC));
+  ASSERT_MPI_EQ(ncclSuccess,
+      ncclCommWindowRegister(comm, dRecv, sizeBytes, &recvWin, NCCL_WIN_COLL_SYMMETRIC));
+  auto winCleanup = makeScopeGuard([&]() {
+    if (sendWin) (void)ncclCommWindowDeregister(comm, sendWin);
+    if (recvWin) (void)ncclCommWindowDeregister(comm, recvWin);
+  });
+
+  std::vector<float> hostSend(totalElements, 0.0f);
+  std::vector<float> hostRecv(totalElements, 0.0f);
+  for (int dst = 0; dst < nRanks; dst++) {
+    for (size_t i = 0; i < count; i++) {
+      hostSend[static_cast<size_t>(dst) * count + i] =
+          static_cast<float>(rank * 1000 + dst * 100 + static_cast<int>(i));
+    }
+  }
+  ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dSend, hostSend.data(), sizeBytes, hipMemcpyHostToDevice));
+  ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dRecv, hostRecv.data(), sizeBytes, hipMemcpyHostToDevice));
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  const int blocksPerPeer = alltoallFabricLLBlocksPerPeer(count * sizeof(float));
+  dim3 block(256);
+  dim3 grid((unsigned)nRanks, (unsigned)blocksPerPeer);
+  alltoallFabricLLKernel<float><<<grid, block, 0, stream>>>(
+      sendWin, /*sendoffset=*/0, recvWin, /*recvoffset=*/0, count, devComm);
+  ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  ASSERT_EQ(hipSuccess, hipMemcpy(hostRecv.data(), dRecv, sizeBytes, hipMemcpyDeviceToHost));
+  verifyAlltoallPattern(rank, nRanks, count, hostRecv);
+}
+
+// Over the fabric LL threshold: gin.put path should still pass on MI455.
+TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_OverBoundaryPut_1p4g) {
+  if (auto reason = ginAnvilFabricLLTestSkipReason(); !reason.empty())
+    GTEST_SKIP() << reason;
+
+  if (!validateTestPrerequisites(/*min_processes=*/4, /*max_processes=*/4))
+    GTEST_SKIP() << "Requires exactly 4 ranks (1 process x 4 GPUs)";
+
+  ASSERT_EQ(ncclSuccess, createTestCommunicator());
+  ncclComm_t comm = getActiveCommunicator();
+  hipStream_t stream = getActiveStream();
+
+  int rank = -1, nRanks = -1;
+  ncclCommUserRank(comm, &rank);
+  ncclCommCount(comm, &nRanks);
+  ASSERT_EQ(nRanks, 4);
+
+  ncclDevCommRequirements reqs = defaultGinReqs();
+  reqs.railGinBarrierCount = 1;
+  reqs.ginSignalCount = 1;
+  ncclDevComm devComm{};
+  ASSERT_MPI_EQ(ncclSuccess, ncclDevCommCreate(comm, &reqs, &devComm));
+  auto devCommCleanup = makeScopeGuard([&]() {
+    (void)ncclDevCommDestroy(comm, &devComm);
+  });
+
+  if (!devComm.ginFabricSmallMsgEnabled)
+    GTEST_SKIP() << "Fabric path not active; large-message put fallback is MI455-only";
+
+  const size_t count = 4096; // 64 KiB total for 4 ranks; above default 32 KiB LL threshold
+  ASSERT_FALSE(alltoallFabricLLEligibleHost(devComm, count));
+
+  const size_t totalElements = count * static_cast<size_t>(nRanks);
+  const size_t sizeBytes = totalElements * sizeof(float);
+
+  void* dSend = nullptr;
+  void* dRecv = nullptr;
+  ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dSend, sizeBytes));
+  ASSERT_MPI_EQ(ncclSuccess, ncclMemAlloc(&dRecv, sizeBytes));
+  auto memCleanup = makeScopeGuard([&]() {
+    if (dSend) (void)ncclMemFree(dSend);
+    if (dRecv) (void)ncclMemFree(dRecv);
+  });
+
+  ncclWindow_t sendWin = nullptr, recvWin = nullptr;
+  ASSERT_MPI_EQ(ncclSuccess,
+      ncclCommWindowRegister(comm, dSend, sizeBytes, &sendWin, NCCL_WIN_COLL_SYMMETRIC));
+  ASSERT_MPI_EQ(ncclSuccess,
+      ncclCommWindowRegister(comm, dRecv, sizeBytes, &recvWin, NCCL_WIN_COLL_SYMMETRIC));
+  auto winCleanup = makeScopeGuard([&]() {
+    if (sendWin) (void)ncclCommWindowDeregister(comm, sendWin);
+    if (recvWin) (void)ncclCommWindowDeregister(comm, recvWin);
+  });
+
+  std::vector<float> hostSend(totalElements, 0.0f);
+  std::vector<float> hostRecv(totalElements, 0.0f);
+  for (int dst = 0; dst < nRanks; dst++) {
+    for (size_t i = 0; i < count; i++) {
+      hostSend[static_cast<size_t>(dst) * count + i] =
+          static_cast<float>(rank * 1000 + dst * 100 + static_cast<int>(i));
+    }
+  }
+  ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dSend, hostSend.data(), sizeBytes, hipMemcpyHostToDevice));
+  ASSERT_MPI_EQ(hipSuccess, hipMemcpy(dRecv, hostRecv.data(), sizeBytes, hipMemcpyHostToDevice));
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  constexpr int kCTAs = 1;
+  constexpr int kThreadsPerCTA = 512;
+  alltoallPureKernel<<<kCTAs, kThreadsPerCTA, 0, stream>>>(
+      sendWin, /*sendoffset=*/0, recvWin, /*recvoffset=*/0, count, devComm);
+  ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
+
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  ASSERT_EQ(hipSuccess, hipMemcpy(hostRecv.data(), dRecv, sizeBytes, hipMemcpyDeviceToHost));
+  verifyAlltoallPattern(rank, nRanks, count, hostRecv);
+}
+#endif
 
 // Hybrid alltoall: LSA stores for intra-node peers + gin.put for cross-node
 // peers, bracketed by entry/exit barriers. Ported from
