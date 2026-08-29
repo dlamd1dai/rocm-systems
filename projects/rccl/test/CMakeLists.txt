@@ -435,6 +435,32 @@ if(BUILD_TESTS)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test")
     add_test(NAME rccl-UnitTestsGinSdmaReduceScatterPolicy COMMAND rccl-UnitTestsGinSdmaReduceScatterPolicy)
     set_tests_properties(rccl-UnitTestsGinSdmaReduceScatterPolicy PROPERTIES LABELS "unit")
+
+    # GIN-SDMA ReduceScatter ON-GPU correctness test. Validates the size-adaptive
+    # CTA ladder device-vs-host and the direct-LSA read-reduce addressing (the
+    # pointer-arithmetic core of GinReduceScatterKernel) on real hardware,
+    # self-contained (no librccl / GIN comm). Requires a visible GPU at run time
+    # (skips cleanly otherwise), so it carries a "gpu" label alongside "unit".
+    add_executable(rccl-UnitTestsGinSdmaReduceScatterGpu gin/gin_sdma_reducescatter_gpu_test.cpp)
+    target_include_directories(rccl-UnitTestsGinSdmaReduceScatterGpu PRIVATE
+      "${_gin_sdma_rs_hdr_dir}")
+    set(_gin_sdma_rs_gpu_offload "")
+    foreach(_g IN LISTS GPU_TARGETS)
+      if(_g)
+        list(APPEND _gin_sdma_rs_gpu_offload "--offload-arch=${_g}")
+      endif()
+    endforeach()
+    if(_gin_sdma_rs_gpu_offload)
+      target_compile_options(rccl-UnitTestsGinSdmaReduceScatterGpu PRIVATE ${_gin_sdma_rs_gpu_offload})
+      target_link_options(rccl-UnitTestsGinSdmaReduceScatterGpu PRIVATE ${_gin_sdma_rs_gpu_offload})
+    endif()
+    target_link_libraries(rccl-UnitTestsGinSdmaReduceScatterGpu PRIVATE
+      ${GTEST_BOTH_LIBRARIES} hip::host hip::device Threads::Threads)
+    set_target_properties(rccl-UnitTestsGinSdmaReduceScatterGpu PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/test"
+      CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME rccl-UnitTestsGinSdmaReduceScatterGpu COMMAND rccl-UnitTestsGinSdmaReduceScatterGpu)
+    set_tests_properties(rccl-UnitTestsGinSdmaReduceScatterGpu PROPERTIES LABELS "unit;gpu")
   endif()
 
   # rccl-UnitTestsFixturesDebug: Tests that access internal symbols compiled into

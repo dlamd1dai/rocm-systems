@@ -77,6 +77,7 @@ set(COMMON_FILES
   gin_sdma_reducescatter_policy.h
   gin_sdma_reduce.h
   gin_sdma_devtime.h
+  gin_sdma_devtime_host.h
   nccl1_compat.h
   rccl_compat.h
   rccl_float8.h
@@ -137,7 +138,7 @@ add_custom_target(git_version_check
 add_custom_target(hipify DEPENDS ${HIP_COMMON_SOURCES})
 add_library(rccl_common OBJECT ${HIP_COMMON_SOURCES})
 add_dependencies(rccl_common hipify git_version_check)
-target_link_libraries(rccl_common roc::rccl hip::device Threads::Threads dl)
+target_link_libraries(rccl_common roc::rccl hip::device Threads::Threads dl nccl_test_os nccl_tests_options)
 if(USE_MPI)
   target_link_libraries(rccl_common MPI::MPI_CXX)
 endif()

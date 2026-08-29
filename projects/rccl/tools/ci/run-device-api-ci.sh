@@ -8,6 +8,9 @@
 # from the environment (device-api.sbatch exports them) or, when run standalone,
 # from $WORKDIR/.ci-out/{rocm,ompi}.env.
 #
+# After the JSON matrix, runs pytest devtime smoke tests (GIN -D 3 in-kernel
+# device-timing: modes -B 1, -B 2, -B 2 -H 1) for AllToAll and ReduceScatter.
+#
 # Each bench is wrapped in `timeout` so a hung mpirun/driver can't wedge the job;
 # failures are collected and surfaced at the end (exit non-zero iff any failed).
 #
@@ -168,3 +171,69 @@ if [[ ${#FAILED_RUNS[@]} -ne 0 ]]; then
 fi
 
 echo "All device-api benchmark runs succeeded."
+
+# GIN AllToAll / ReduceScatter in-kernel device-timing smoke (wall_clock64 / *TimedKernel).
+# Requires ENABLE_DEVICE_API=ON rccl-tests build (alltoall_perf / reduce_scatter_perf -D 3).
+run_devtime_smoke() {
+  local pytest_dir="${RCCL_TESTS_DIR}/test"
+  # shellcheck source=/dev/null
+  [[ -f "${script_dir}/lib/ensure-python-yaml.sh" ]] && source "${script_dir}/lib/ensure-python-yaml.sh"
+  if ! python3 -c 'import pytest' 2>/dev/null; then
+    echo "==> devtime smoke: pip installing pytest"
+    python3 -m pip install --quiet --disable-pip-version-check pytest
+  fi
+
+  local failed=0
+
+  local a2a_bin="${RCCL_TESTS_DIR}/${PERF_DIR}/alltoall_perf"
+  if [[ -x "${a2a_bin}" && -f "${pytest_dir}/test_AllToAllDevtime.py" ]]; then
+    echo "=== devtime-smoke: pytest test_AllToAllDevtime.py (GIN -D 3) ==="
+    set +e
+    RCCL_TESTS_GIN_SDMA_DEVTIME=1 \
+    RCCL_TESTS_A2A_EXE="${a2a_bin}" \
+    RCCL_TESTS_A2A_NP="${NP}" \
+    RCCL_TESTS_A2A_GIN_TYPE="${RCCL_TESTS_A2A_GIN_TYPE:-2}" \
+    RCCL_TESTS_A2A_TIMEOUT_S="${RCCL_TESTS_A2A_TIMEOUT_S:-300}" \
+      python3 -m pytest "${pytest_dir}/test_AllToAllDevtime.py" -v -p no:cacheprovider
+    local rc=$?
+    set -e
+    if [[ ${rc} -ne 0 ]]; then
+      FAILED_RUNS+=("devtime-smoke:AllToAll (rc=${rc})")
+      failed=1
+    fi
+  else
+    echo "WARN: skip AllToAll devtime smoke (binary or pytest missing)"
+  fi
+
+  local rs_bin="${RCCL_TESTS_DIR}/${PERF_DIR}/reduce_scatter_perf"
+  if [[ -x "${rs_bin}" && -f "${pytest_dir}/test_ReduceScatterDevtime.py" ]]; then
+    echo "=== devtime-smoke: pytest test_ReduceScatterDevtime.py (GIN -D 3) ==="
+    set +e
+    RCCL_TESTS_GIN_SDMA_DEVTIME=1 \
+    RCCL_TESTS_RS_EXE="${rs_bin}" \
+    RCCL_TESTS_RS_NP="${NP}" \
+    RCCL_TESTS_RS_GIN_TYPE="${RCCL_TESTS_RS_GIN_TYPE:-6}" \
+    RCCL_TESTS_RS_TIMEOUT_S="${RCCL_TESTS_RS_TIMEOUT_S:-300}" \
+      python3 -m pytest "${pytest_dir}/test_ReduceScatterDevtime.py" -v -p no:cacheprovider
+    local rc=$?
+    set -e
+    if [[ ${rc} -ne 0 ]]; then
+      FAILED_RUNS+=("devtime-smoke:ReduceScatter (rc=${rc})")
+      failed=1
+    fi
+  else
+    echo "WARN: skip ReduceScatter devtime smoke (binary or pytest missing)"
+  fi
+
+  return ${failed}
+}
+
+run_devtime_smoke
+
+if [[ ${#FAILED_RUNS[@]} -ne 0 ]]; then
+  echo "=== FAILED RUNS (${#FAILED_RUNS[@]}) ==="
+  printf '  %s\n' "${FAILED_RUNS[@]}"
+  exit 1
+fi
+
+echo "All device-api benchmark and devtime smoke runs succeeded."

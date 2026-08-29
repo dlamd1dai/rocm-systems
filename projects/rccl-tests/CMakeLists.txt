@@ -289,6 +289,12 @@ endif()
 
 set(ROCM_USE_DEV_COMPONENT OFF)  # This repo doesn't have a dev component
 
+# Build the upstream OS abstraction with RCCL's HIP toolchain.
+add_library(nccl_tests_options INTERFACE)
+target_compile_definitions(nccl_tests_options INTERFACE NCCL_OS_LINUX NCCL_GIN_PROXY_ENABLE=1)
+set(NCCL_OS_LINUX ON)
+add_subdirectory(os)
+
 # Add all of the tests
 add_subdirectory(src)
 

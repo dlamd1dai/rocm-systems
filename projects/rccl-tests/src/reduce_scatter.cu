@@ -140,28 +140,41 @@ testResult_t ReduceScatterInitData(struct threadArgs* args, ncclDataType_t type,
 
 testResult_t  ReduceScatterGetAlgoProtoChannels(ncclComm_t comm, size_t count, ncclDataType_t type, int* algo, int* proto, int* nchannels) {
   if(rcclTestsGetAlgoInfo == NULL) return testInternalError;
-  NCCLCHECK(rcclTestsGetAlgoInfo(comm, ncclFuncReduceScatter , count, type , 0, 0, 1, algo, proto, nchannels));
+  NCCLCHECK(rcclTestsGetAlgoInfo(comm, ncclFunc_t::ncclFuncReduceScatter , count, type , 0, 0, 1, algo, proto, nchannels));
   return testSuccess;
 }
 
 testResult_t  ReduceScatterGetSymkInfo(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op, int* algo, int* proto, int* nchannels) {
   if(rcclTestsGetSymkInfo == NULL) return testInternalError;
-  NCCLCHECK(rcclTestsGetSymkInfo(comm, ncclFuncReduceScatter , count, type , op, algo, proto, nchannels));
+  NCCLCHECK(rcclTestsGetSymkInfo(comm, ncclFunc_t::ncclFuncReduceScatter , count, type , op, algo, proto, nchannels));
   return testSuccess;
 }
 
-void ReduceScatterGetBw(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks) {
-  gin_sdma_reducescatter::bandwidthGBps(count, typesize, sec, nranks, algBw, busBw);
+testResult_t  ReduceScatterGetCollImplInfo(ncclComm_t comm, size_t count, ncclDataType_t type, ncclRedOp_t op,
+    const void* sendbuff, void* recvbuff, int graphCapturing, int* algo, int* proto, int* nchannels) {
+  if(rcclTestsGetCollImplInfo == NULL) return testInternalError;
+  NCCLCHECK(rcclTestsGetCollImplInfo(comm, ncclFunc_t::ncclFuncReduceScatter, count, type, op, sendbuff, recvbuff, graphCapturing, algo, proto, nchannels));
+  return testSuccess;
+}
+
+void ReduceScatterGetBw(size_t count, size_t typesize, double sec, double* algBw, double* busBw, int nranks) {
+  gin_sdma_reducescatter::bandwidthGBps(count, (int)typesize, sec, nranks, algBw, busBw);
 }
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,29,0)
-testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclCommProperties_t* commProperties) {
-  if (!reqs || !commProperties) return testInternalError;
+testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements* reqs, ncclComm_t comm) {
+  if (!reqs || !comm) return testInternalError;
+
+  ncclCommProperties_t commProperties = NCCL_COMM_PROPERTIES_INITIALIZER;
+  if (ncclCommQueryProperties(comm, &commProperties) != ncclSuccess) {
+    return testNcclError;
+  }
+
   switch(deviceImpl) {
     case 3: { // GinReduceScatterKernel: single-tier LSA read-reduce (no scratch)
-      if (commProperties->ginType == NCCL_GIN_TYPE_NONE) {
+      if (commProperties.ginType == NCCL_GIN_TYPE_NONE) {
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
-        return testInternalError;
+        return testInvalidUsage;
       }
       // Cover both the -V/deviceCtaCount launch and the size-adaptive CTA count the
       // kernel self-selects (reduceScatterCtas, up to reduceScatterMaxCtas()),
@@ -584,26 +597,41 @@ testResult_t ReduceScatterRunColl(void* sendbuff, size_t sendoffset, void* recvb
 }
 
 // Device-side (in-kernel wall_clock64) timing for the GIN-SDMA ReduceScatter (-D 3),
-// via the shared gin_devtime scaffold. Opt-in through NCCL_GIN_ANVIL_DEVICE_TIMING
-// (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING): 1=augment (print an extra #[rs-devtime]
-// line next to the graph numbers), 2=device-time-only (report the in-kernel latency
-// as the out-of-place metric; in-place keeps normal timing). loop/skip via
-// NCCL_GIN_ANVIL_RS_DEVTIME_LOOP/_SKIP (default 10/10).
+// via the shared gin_devtime scaffold. Opt-in via --device_timing: 1=augment
+// (print an extra #[rs-devtime] line next to the graph numbers), 2=device-time-only
+// (report the in-kernel latency as the out-of-place metric; in-place keeps normal
+// timing). loop/skip come from --devtime_loop/--devtime_skip (default 10/10); size-
+// tier overrides via --devtime_loop_mid/_large and --devtime_skip_mid/_large.
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
 testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, double* outDeltaSec) {
-  static const int loop = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_LOOP", 10);
-  static const int skip = gin_devtime::envInt("NCCL_GIN_ANVIL_RS_DEVTIME_SKIP", 10);
+  if (!deviceTimingMode) return testSuccess;
+
+  // Only the GIN hybrid impl (-D 3) provisions the GIN signals/barriers the timed
+  // body relies on. Other device impls would fault or hang on missing GIN state.
+  if (deviceImpl != 3) return testSuccess;
 
   const size_t count = args->nbytes / wordSize(type);   // per-rank output-slice count
-  if (count == 0 || loop < 1) return testSuccess;
+  if (count == 0 || devtimeLoop < 1) return testSuccess;
+
+  const int nRanksGlobalCta = args->nProcs * args->nThreads * args->nGpus;
+  const size_t totalBytesCta = count * wordSize(type) * (size_t)nRanksGlobalCta;
+  int loop = devtimeLoop;
+  int skip = devtimeSkip < 0 ? 0 : devtimeSkip;
+  if (devtimeLoopLarge > 0 && totalBytesCta >= (size_t)64 * 1024 * 1024) {
+    loop = devtimeLoopLarge;
+    if (devtimeSkipLarge >= 0) skip = devtimeSkipLarge;
+    else skip = (skip < 1) ? skip : 1;
+  } else if (devtimeLoopMid > 0 && totalBytesCta >= (size_t)8 * 1024 * 1024) {
+    loop = devtimeLoopMid;
+    if (devtimeSkipMid >= 0) skip = devtimeSkipMid;
+    else skip = (skip < 2) ? skip : 2;
+  }
 
   auto kernel = SPECIALIZE_REDUCE_KERNEL(GinReduceScatterTimedKernel, type, op);
   if (kernel == nullptr) return testSuccess;
 
   // Match the perf path: self-select the size-adaptive CTA count (decoupled from
   // -V) so the device-timed number reflects the launched configuration.
-  const int nRanksGlobalCta = args->nProcs * args->nThreads * args->nGpus;
-  const size_t totalBytesCta = count * wordSize(type) * (size_t)nRanksGlobalCta;
   static const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
   const int gridCtas = gin_sdma_reducescatter::reduceScatterCtas(totalBytesCta, rsCtasEnv);
   static const size_t rsUnrollMin = ReduceScatterUnrollMinBytes();
@@ -620,7 +648,10 @@ testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t typ
       },
       &devUs));
 
-  if (outDeltaSec != nullptr) { *outDeltaSec = devUs * 1.0e-6; return testSuccess; }
+  if (outDeltaSec != nullptr) {
+    *outDeltaSec = (devUs > 0.0) ? devUs * 1.0e-6 : -1.0;
+    return testSuccess;
+  }
 
   if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
     int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
@@ -628,9 +659,9 @@ testResult_t ReduceScatterDeviceTime(struct threadArgs* args, ncclDataType_t typ
     double sec = devUs * 1.0e-6;
     double algBw = (double)totalBytes / 1.0e9 / sec;
     double busBw = algBw * ((double)(nRanksGlobal - 1) / (double)nRanksGlobal);
-    printf("#[rs-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
-           totalBytes, gridCtas, loop, skip, devUs, algBw, busBw);
-    fflush(stdout);
+    snprintf(args->devtimeAugmentLine, sizeof(args->devtimeAugmentLine),
+             "#[rs-devtime] size %12zu B  ctas %2d  loop %2d skip %2d  devtime %10.2f us  algbw %8.2f GB/s  busbw %8.2f GB/s\n",
+             totalBytes, gridCtas, loop, skip, devUs, algBw, busBw);
   }
   return testSuccess;
 }
@@ -648,6 +679,7 @@ struct testColl reduceScatterTest = {
   ReduceScatterRunColl,
   ReduceScatterGetAlgoProtoChannels,
   ReduceScatterGetSymkInfo,
+  ReduceScatterGetCollImplInfo,
   ReduceScatterDeviceTime
 };
 
@@ -704,10 +736,10 @@ testResult_t ReduceScatterRunTest(struct threadArgs* args, int root, ncclDataTyp
   return testSuccess;
 }
 
-struct testEngine ncclTestEngine = {
-  .getBuffSize = ReduceScatterGetBuffSize,
-  .runTest = ReduceScatterRunTest,
+NCCL_WEAK struct testEngine ncclTestEngine = {
+  /* .getBuffSize = */ ReduceScatterGetBuffSize,
+  /* .runTest = */ ReduceScatterRunTest,
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-  .getDevCommRequirements = ReduceScatterGetDevCommRequirements
+  /* .getDevCommRequirements = */ ReduceScatterGetDevCommRequirements,
 #endif
 };
