@@ -1631,8 +1631,14 @@ testResult_t threadInit(struct threadArgs* args) {
 
   TESTCHECK(threadRunTests(args));
 
-  // Cleanup: deregister buffers and destroy communicators
+  // Cleanup: destroy device comms before deregistering windows (RCCL device-API
+  // teardown order: devCommDestroy releases GIN/barrier resources first).
   for (int i=0; i<args->nGpus; i++) {
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+    if (deviceImpl) {
+      NCCLCHECK(ncclDevCommDestroy(args->comms[i], args->devComms+i));
+    }
+#endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
     if (test_ncclVersion >= NCCL_VERSION(2,27,0) && (local_register == SYMMETRIC_REGISTER)) {
@@ -1644,11 +1650,6 @@ testResult_t threadInit(struct threadArgs* args) {
       if (local_register) NCCLCHECK(ncclCommDeregister(args->comms[i], args->sendRegHandles[i]));
       if (local_register) NCCLCHECK(ncclCommDeregister(args->comms[i], args->recvRegHandles[i]));
       if (local_register && test_bias) NCCLCHECK(ncclCommDeregister(args->comms[i], args->biasRegHandles[i]));
-    }
-#endif
-#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-    if (deviceImpl) {
-      NCCLCHECK(ncclDevCommDestroy(args->comms[i], args->devComms+i));
     }
 #endif
     NCCLCHECK(ncclCommDestroy(args->comms[i]));
@@ -2536,6 +2537,11 @@ testResult_t run() {
 
   if (!parallel_init) {
     for(int i=0; i<nGpus*nThreads; ++i) {
+#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
+      if (deviceImpl) {
+        NCCLCHECK(ncclDevCommDestroy(comms[i], devComms.data()+i));
+      }
+#endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,27,0)
       if (test_ncclVersion >= NCCL_VERSION(2,27,0) && (local_register == SYMMETRIC_REGISTER)) {
@@ -2547,11 +2553,6 @@ testResult_t run() {
         if (local_register) NCCLCHECK(ncclCommDeregister(comms[i], sendRegHandles[i]));
         if (local_register) NCCLCHECK(ncclCommDeregister(comms[i], recvRegHandles[i]));
         if (local_register && test_bias) NCCLCHECK(ncclCommDeregister(comms[i], biasRegHandles[i]));
-      }
-#endif
-#if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
-      if (deviceImpl) {
-        NCCLCHECK(ncclDevCommDestroy(comms[i], devComms.data()+i));
       }
 #endif
       NCCLCHECK(ncclCommDestroy(comms[i]));
