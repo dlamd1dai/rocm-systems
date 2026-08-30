@@ -149,9 +149,7 @@ if (ENABLE_DEVICE_API)
         endif()
     endif()
     if (RCCL_SOURCE_DIR)
-        target_include_directories(alltoall_perf PRIVATE
-            ${RCCL_SOURCE_DIR}/src
-            ${RCCL_SOURCE_DIR}/src/include)
+        target_include_directories(alltoall_perf PRIVATE ${RCCL_SOURCE_DIR}/src)
     endif()
 endif()
 if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
