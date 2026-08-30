@@ -13,7 +13,6 @@
 #include "bootstrap.h"
 #include "debug.h"
 #include "dev_runtime.h"
-
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <cstring>
@@ -75,6 +74,15 @@ ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
       if (devs[i] < 0) devs[i] = 0;
     }
   }
+  return ncclSuccess;
+}
+
+ncclResult_t bootstrapBarrier(void* commState, int rank, int nranks, int tag) {
+  (void)commState;
+  (void)rank;
+  (void)nranks;
+  (void)tag;
+  if (GinAnvilPluginStubs::g.bootstrapFail) return ncclInternalError;
   return ncclSuccess;
 }
 
@@ -168,20 +176,24 @@ extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle)
 // into rccl-UnitTestsGinAnvilPlugin without gin_anvil_sdma_oss7_device.cc (compiled
 // as plain C++). Production librccl resolves these from the HIP device TU instead.
 extern "C" int ginAnvilConnWrite(void* remoteAddrsDev, int nRanks, int selfRank,
-                                 unsigned long long stamp) {
+                                 unsigned long long stamp, hipStream_t stream) {
   (void)remoteAddrsDev;
   (void)nRanks;
   (void)selfRank;
   (void)stamp;
+  (void)stream;
   return 0;
 }
 
 extern "C" int ginAnvilConnCheck(void* localSignals, int nRanks, unsigned long long stamp,
-                                 int* missingDev) {
+                                 int* missingDev, hipStream_t stream) {
   (void)localSignals;
   (void)stamp;
+  (void)stream;
   if (missingDev && nRanks > 0) {
-    if (hipMemset(missingDev, 0, sizeof(int) * static_cast<size_t>(nRanks)) != hipSuccess) return -1;
+    const char* injEnv = getenv("NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK");
+    const int fill = (injEnv && atoi(injEnv) >= 0) ? 1 : 0;
+    if (hipMemset(missingDev, fill, sizeof(int) * static_cast<size_t>(nRanks)) != hipSuccess) return -1;
   }
   return 0;
 }
