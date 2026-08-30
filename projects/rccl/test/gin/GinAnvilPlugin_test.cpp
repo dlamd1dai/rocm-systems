@@ -473,6 +473,7 @@ TEST_F(GinAnvilPluginTest, ConnCheck_InjectFailRankAbortsBind) {
   void* devLsa = nullptr;
   ASSERT_EQ(hipMalloc(&devLsa, sizeof(uint64_t) * 2), hipSuccess);
   GinAnvilPluginStubs::SetLsaSelfAddr(devLsa);
+  GinAnvilPluginStubs::SetConnCheckVerifyMissing(true);
 
   ScopedEnv inj("NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK", "0");
   GinAnvilPluginStubs::SetBootstrapNranks(2);
@@ -481,7 +482,7 @@ TEST_F(GinAnvilPluginTest, ConnCheck_InjectFailRankAbortsBind) {
   void* ictx = nullptr;
   initCtx(&ictx);
   void* coll = nullptr;
-  connectColl(ictx, &coll);
+  connectColl(ictx, &coll, 2);
   ncclGinConfig_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx = nullptr;

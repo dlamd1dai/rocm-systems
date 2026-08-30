@@ -27,6 +27,7 @@ struct State {
   bool factoryCreateFail = false;
   bool factoryNullHandles = false;
   bool lsaAddrFail = false;
+  bool connCheckVerifyMissing = false;
   void* lsaSelfAddr = reinterpret_cast<void*>(0x70001000ULL);
 };
 
@@ -49,6 +50,7 @@ void SetFactoryCreateFail(bool fail) { g.factoryCreateFail = fail; }
 void SetFactoryNullHandles(bool nullHandles) { g.factoryNullHandles = nullHandles; }
 void SetLsaAddrFail(bool fail) { g.lsaAddrFail = fail; }
 void SetLsaSelfAddr(void* addr) { g.lsaSelfAddr = addr; }
+void SetConnCheckVerifyMissing(bool missing) { g.connCheckVerifyMissing = missing; }
 
 }  // namespace GinAnvilPluginStubs
 
@@ -71,12 +73,18 @@ ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
   if (size == static_cast<int>(sizeof(int))) {
     int* devs = static_cast<int*>(allData);
     int known = -1;
+    int maxv = 0;
     for (int i = 0; i < GinAnvilPluginStubs::g.bootstrapNranks; ++i) {
       if (devs[i] >= 0) known = devs[i];
+      if (devs[i] > maxv) maxv = devs[i];
     }
     for (int i = 0; i < GinAnvilPluginStubs::g.bootstrapNranks; ++i) {
       if (devs[i] < 0 && known >= 0) devs[i] = known;
       if (devs[i] < 0) devs[i] = 0;
+    }
+    // Conn-check allgather: replicate the max missing count (single-process sim).
+    if (maxv > 0) {
+      for (int i = 0; i < GinAnvilPluginStubs::g.bootstrapNranks; ++i) devs[i] = maxv;
     }
   }
   return ncclSuccess;
@@ -197,7 +205,9 @@ extern "C" int ginAnvilConnCheck(void* localSignals, int nRanks, unsigned long l
   (void)stream;
   if (missingDev && nRanks > 0) {
     const char* injEnv = getenv("NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK");
-    const int fill = (injEnv && atoi(injEnv) >= 0) ? 1 : 0;
+    const bool simulateMissing =
+        GinAnvilPluginStubs::g.connCheckVerifyMissing || (injEnv && atoi(injEnv) >= 0);
+    const int fill = simulateMissing ? 1 : 0;
     if (hipMemset(missingDev, fill, sizeof(int) * static_cast<size_t>(nRanks)) != hipSuccess) return -1;
   }
   return 0;
