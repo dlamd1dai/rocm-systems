@@ -97,12 +97,13 @@ class GinAnvilPluginTest : public ::testing::Test {
     ncclGinAnvilSetInitContext(*ictx, mockComm_.get());
   }
 
-  void connectColl(void* ictx, void** coll) {
+  void connectColl(void* ictx, void** coll, int nranks = 1) {
     void* listen = nullptr;
     char handle[NCCL_NET_HANDLE_MAXSIZE] = {};
     ASSERT_EQ(plugin_.listen(ictx, 0, handle, &listen), ncclSuccess);
-    void* handles[1] = {handle};
-    ASSERT_EQ(plugin_.connect(ictx, handles, 1, 0, listen, coll), ncclSuccess);
+    void* handles[8] = {};
+    for (int i = 0; i < nranks; ++i) handles[i] = handle;
+    ASSERT_EQ(plugin_.connect(ictx, handles, nranks, 0, listen, coll), ncclSuccess);
     ASSERT_EQ(plugin_.closeListen(listen), ncclSuccess);
   }
 };
@@ -448,7 +449,7 @@ TEST_F(GinAnvilPluginTest, ConnCheck_SkippedWhenLsaSizeMismatch) {
   void* ictx = nullptr;
   initCtx(&ictx);
   void* coll = nullptr;
-  connectColl(ictx, &coll);
+  connectColl(ictx, &coll, 2);
   ncclGinConfig_t cfg{};
   cfg.nSignals = 1;
   void* ginCtx = nullptr;

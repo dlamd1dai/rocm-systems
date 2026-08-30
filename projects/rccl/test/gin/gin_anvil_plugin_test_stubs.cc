@@ -70,7 +70,12 @@ ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
   if (GinAnvilPluginStubs::g.bootstrapFail) return ncclInternalError;
   if (size == static_cast<int>(sizeof(int))) {
     int* devs = static_cast<int*>(allData);
+    int known = -1;
     for (int i = 0; i < GinAnvilPluginStubs::g.bootstrapNranks; ++i) {
+      if (devs[i] >= 0) known = devs[i];
+    }
+    for (int i = 0; i < GinAnvilPluginStubs::g.bootstrapNranks; ++i) {
+      if (devs[i] < 0 && known >= 0) devs[i] = known;
       if (devs[i] < 0) devs[i] = 0;
     }
   }
