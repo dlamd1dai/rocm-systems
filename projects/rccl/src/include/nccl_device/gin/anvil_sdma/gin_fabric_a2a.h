@@ -41,7 +41,7 @@ __device__ __forceinline__ bool ginAlltoAllFabricLLEligible(struct ncclDevComm c
   if (count == 0) return false;
   if (devComm.nRanks < 2 || devComm.nRanks > kDdaMaxNranks) return false;
   if (!std::is_same<T, float>::value && !std::is_same<T, half>::value &&
-      !std::is_same<T, dda::common::bf16>::value) {
+      !std::is_same<T, bf16>::value) {
     return false;
   }
 

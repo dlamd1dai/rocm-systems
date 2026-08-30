@@ -309,28 +309,30 @@ static testResult_t AlltoAllLaunchGinKernelWithGrid(F kernel, void* sendbuff, si
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
 template <typename T>
 __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, int root, struct ncclDevComm devComm) {
-  if (gin::fabric::ginAlltoAllFabricLLEligible<T>(devComm, count)) {
-    T* sendPtr = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-    T* recvPtr = (T*)ncclGetLocalPointer(recvwin, recvoffset);
-    const size_t perChunkBytes = count * sizeof(T);
-    switch (devComm.nRanks) {
-    case 4:
-      dda::common::ddaAllToAllFabricLL<T, 4>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-      break;
-    case 8:
-      dda::common::ddaAllToAllFabricLL<T, 8>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-      break;
-    default:
-      dda::common::ddaAllToAllFabricLL<T, 0>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-      break;
+  if constexpr (dda::common::is_supported_type_v<T>) {
+    if (gin::fabric::ginAlltoAllFabricLLEligible<T>(devComm, count)) {
+      T* sendPtr = (T*)ncclGetLocalPointer(sendwin, sendoffset);
+      T* recvPtr = (T*)ncclGetLocalPointer(recvwin, recvoffset);
+      const size_t perChunkBytes = count * sizeof(T);
+      switch (devComm.nRanks) {
+      case 4:
+        dda::common::ddaAllToAllFabricLL<T, 4>(
+          reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+          devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+        break;
+      case 8:
+        dda::common::ddaAllToAllFabricLL<T, 8>(
+          reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+          devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+        break;
+      default:
+        dda::common::ddaAllToAllFabricLL<T, 0>(
+          reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
+          devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+        break;
+      }
+      return;
     }
-    return;
   }
 
   int ginContext = 0;
@@ -469,7 +471,7 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
         auto kernel = SPECIALIZE_KERNEL(GinAlltoAllKernel, type, op);
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
         if (kernel == nullptr && type == ncclBfloat16 && op == ncclSum) {
-          kernel = GinAlltoAllKernel<dda::common::bf16>;
+          kernel = GinAlltoAllKernel<bf16>;
         }
 #endif
         if (AlltoAllGinFabricLLEligibleHost(devComm, count, type)) {
