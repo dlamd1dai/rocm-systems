@@ -31,6 +31,11 @@
 static std::map<void*, int> bufferRegRefcount;
 static std::map<void*, ncclFabricMemHandler*> fabricBufferHandlers;
 static std::map<void*, CUmemGenericAllocationHandle> fabricBufferHandles;
+
+static void ginAnvilCuMemRelease(CUmemGenericAllocationHandle handle) {
+  if (ncclCuMemSkipFree()) return;
+  (void)cuMemRelease(handle);
+}
 static std::map<void*, int> fabricBufferRefcount;
 static std::mutex pluginMutex;
 
@@ -142,7 +147,7 @@ void ncclGinAnvilPluginTestResetHostState(void) {
   }
   fabricBufferHandlers.clear();
   for (auto& entry : fabricBufferHandles) {
-    (void)cuMemRelease(entry.second);
+    ginAnvilCuMemRelease(entry.second);
   }
   fabricBufferHandles.clear();
   fabricBufferRefcount.clear();
@@ -423,7 +428,7 @@ failFabricRef:
         }
         auto handleIt = fabricBufferHandles.find(data);
         if (handleIt != fabricBufferHandles.end()) {
-          (void)cuMemRelease(handleIt->second);
+          ginAnvilCuMemRelease(handleIt->second);
           fabricBufferHandles.erase(handleIt);
         }
         fabricBufferRefcount.erase(it);
@@ -432,7 +437,7 @@ failFabricRef:
   }
 failFabric:
   if (localRetainedHandle) {
-    (void)cuMemRelease(memHandle);
+    ginAnvilCuMemRelease(memHandle);
   }
   return ret;
 }
@@ -529,6 +534,10 @@ static ncclResult_t ginAnvilRegMrSymDmaBuf(void* collComm, void* data, size_t si
 static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
   ginAnvilMemHandle* mh = (ginAnvilMemHandle*)mhandle;
   if (!mh) return ncclSuccess;
+  if (ncclCuMemSkipFree()) {
+    free(mh);
+    return ncclSuccess;
+  }
 
   if (mh->addr) {
     std::lock_guard<std::mutex> lock(pluginMutex);
@@ -544,7 +553,7 @@ static ncclResult_t ginAnvilDeregMrSym(void* collComm, void* mhandle) {
           }
           auto handleIt = fabricBufferHandles.find(mh->addr);
           if (handleIt != fabricBufferHandles.end()) {
-            (void)cuMemRelease(handleIt->second);
+            ginAnvilCuMemRelease(handleIt->second);
             fabricBufferHandles.erase(handleIt);
           }
           fabricBufferRefcount.erase(it);
