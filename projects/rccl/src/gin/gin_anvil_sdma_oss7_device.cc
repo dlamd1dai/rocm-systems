@@ -70,6 +70,29 @@ extern "C" int ginAnvilConnCheck(void* localSignals, int nRanks, unsigned long l
   return (hipDeviceSynchronize() == hipSuccess) ? 0 : -1;
 }
 
+#else  // !__HIPCC__ && !__CUDACC__
+
+// Non-HIP front-end (plain C++): conn-check launchers are device-only. librccl
+// always compiles this TU with hipcc; this path keeps the TU well-formed if it is
+// ever parsed by a host-only compiler and documents the symbol contract.
+extern "C" int ginAnvilConnWrite(void* remoteAddrsDev, int nRanks, int selfRank,
+                                 unsigned long long stamp) {
+  (void)remoteAddrsDev;
+  (void)nRanks;
+  (void)selfRank;
+  (void)stamp;
+  return -1;
+}
+
+extern "C" int ginAnvilConnCheck(void* localSignals, int nRanks, unsigned long long stamp,
+                                 int* missingDev) {
+  (void)localSignals;
+  (void)nRanks;
+  (void)stamp;
+  (void)missingDev;
+  return -1;
+}
+
 #endif  // __HIPCC__ || __CUDACC__
 
 #endif  // ENABLE_ROCSHMEM_GIN

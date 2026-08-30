@@ -163,3 +163,25 @@ extern "C" int gin_anvil_sdma_get_num_channels(gin_anvil_sdma_handle_t handle) {
 extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle) {
   return handle ? reinterpret_cast<GinAnvilPluginStubs::FakeSdmaOpaque*>(handle)->sdmaChannelStride : 0;
 }
+
+// [GIN-CONN-CHECK] Host stubs for gin_plugin_anvil_sdma.cc when this TU is linked
+// into rccl-UnitTestsGinAnvilPlugin without gin_anvil_sdma_oss7_device.cc (compiled
+// as plain C++). Production librccl resolves these from the HIP device TU instead.
+extern "C" int ginAnvilConnWrite(void* remoteAddrsDev, int nRanks, int selfRank,
+                                 unsigned long long stamp) {
+  (void)remoteAddrsDev;
+  (void)nRanks;
+  (void)selfRank;
+  (void)stamp;
+  return 0;
+}
+
+extern "C" int ginAnvilConnCheck(void* localSignals, int nRanks, unsigned long long stamp,
+                                 int* missingDev) {
+  (void)localSignals;
+  (void)stamp;
+  if (missingDev && nRanks > 0) {
+    if (hipMemset(missingDev, 0, sizeof(int) * static_cast<size_t>(nRanks)) != hipSuccess) return -1;
+  }
+  return 0;
+}
