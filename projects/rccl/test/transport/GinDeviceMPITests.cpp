@@ -248,6 +248,34 @@ void verifyAlltoallPattern(int rank, int nRanks, size_t count, const std::vector
     }
   }
 }
+
+template <typename T>
+hipError_t launchAlltoallFabricLL(void* sendPtr, void* recvPtr, size_t count, const ncclDevComm& devComm,
+                                  hipStream_t stream) {
+  const size_t perChunkBytes = count * sizeof(T);
+  const int blocksPerPeer = alltoallFabricLLBlocksPerPeer(perChunkBytes);
+  dim3 block(256);
+  dim3 grid((unsigned)devComm.nRanks, (unsigned)blocksPerPeer);
+  T** peers = reinterpret_cast<T**>(devComm.ginFabricPeerScratch);
+  switch (devComm.nRanks) {
+  case 4:
+    dda::common::ddaAllToAllFabricLL<T, 4><<<grid, block, 0, stream>>>(
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  case 8:
+    dda::common::ddaAllToAllFabricLL<T, 8><<<grid, block, 0, stream>>>(
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  default:
+    dda::common::ddaAllToAllFabricLL<T, 0><<<grid, block, 0, stream>>>(
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm.rank,
+        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
+    break;
+  }
+  return hipGetLastError();
+}
 #endif
 
 }  // namespace
@@ -2647,36 +2675,6 @@ __global__ void alltoallPureKernel(
   gin.flush(ncclCoopCta());
 }
 
-#if NCCL_GIN_ANVIL_SDMA_ENABLE
-// MI455 fabric LL alltoall: comm scratch staging via ddaAllToAllFabricLL (no gin.put).
-template <typename T>
-__global__ void alltoallFabricLLKernel(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin,
-                                       size_t recvoffset, size_t count, struct ncclDevComm devComm) {
-  if (!gin::fabric::ginAlltoAllFabricLLEligible<T>(devComm, count)) return;
-
-  T* sendPtr = (T*)ncclGetLocalPointer(sendwin, sendoffset);
-  T* recvPtr = (T*)ncclGetLocalPointer(recvwin, recvoffset);
-  const size_t perChunkBytes = count * sizeof(T);
-  switch (devComm.nRanks) {
-  case 4:
-    dda::common::ddaAllToAllFabricLL<T, 4>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-    break;
-  case 8:
-    dda::common::ddaAllToAllFabricLL<T, 8>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-    break;
-  default:
-    dda::common::ddaAllToAllFabricLL<T, 0>(
-        reinterpret_cast<T**>(devComm.ginFabricPeerScratch), recvPtr, sendPtr, perChunkBytes, devComm.rank,
-        devComm.nRanks, devComm.ginFabricLLEpoch, devComm.ginFabricLLEpochLen);
-    break;
-  }
-}
-#endif
-
 // Single-node 2-8 ranks; count sweep {1, 1024, 1<<16}. Bit-for-bit verifies
 // the deterministic sendbuf[i] = rank*1000 + dst*100 + i pattern landed on
 // the right peer slot. The 1<<16 case (256 KiB / direction / peer) saturates
@@ -2811,7 +2809,6 @@ TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_1p4g) {
 
   // Per-peer fp32 counts; minimum 4 elements (16 B) for LL line alignment.
   const std::vector<size_t> counts = {4, 16, 256, 1024};
-  constexpr int kFabricLLThreads = 256;
 
   for (size_t count : counts) {
     SCOPED_TRACE(::testing::Message() << "count=" << count);
@@ -2855,10 +2852,8 @@ TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_1p4g) {
 
     const size_t perChunkBytes = count * sizeof(float);
     const int blocksPerPeer = alltoallFabricLLBlocksPerPeer(perChunkBytes);
-    dim3 block(kFabricLLThreads);
-    dim3 grid((unsigned)nRanks, (unsigned)blocksPerPeer);
-    alltoallFabricLLKernel<float><<<grid, block, 0, stream>>>(
-        sendWin, /*sendoffset=*/0, recvWin, /*recvoffset=*/0, count, devComm);
+    (void)blocksPerPeer;
+    ASSERT_MPI_EQ(hipSuccess, launchAlltoallFabricLL<float>(dSend, dRecv, count, devComm, stream));
     ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -2934,10 +2929,8 @@ TEST_F(GinMPIDeviceTests, Alltoall_FabricLL_Boundary_1p4g) {
   MPI_Barrier(MPI_COMM_WORLD);
 
   const int blocksPerPeer = alltoallFabricLLBlocksPerPeer(count * sizeof(float));
-  dim3 block(256);
-  dim3 grid((unsigned)nRanks, (unsigned)blocksPerPeer);
-  alltoallFabricLLKernel<float><<<grid, block, 0, stream>>>(
-      sendWin, /*sendoffset=*/0, recvWin, /*recvoffset=*/0, count, devComm);
+  (void)blocksPerPeer;
+  ASSERT_MPI_EQ(hipSuccess, launchAlltoallFabricLL<float>(dSend, dRecv, count, devComm, stream));
   ASSERT_MPI_EQ(hipSuccess, hipStreamSynchronize(stream));
 
   MPI_Barrier(MPI_COMM_WORLD);
