@@ -531,6 +531,10 @@ static inline ncclResult_t ncclCuMemFreeAddr(void* ptr, struct ncclMemManager* m
     INFO(NCCL_ALLOC, "ncclCuMemFreeAddr: Skipping free (process shutdown) pointer %p", ptr);
     return ncclSuccess;
   }
+  if (ncclCuMemSkipFree()) {
+    INFO(NCCL_ALLOC, "ncclCuMemFreeAddr: Skipping free (NCCL_CUMEM_SKIP_FREE=1) pointer %p", ptr);
+    return ncclSuccess;
+  }
 
   // RCCL: Skip if Suspend already unmapped this VA. The reservation is kept by Suspend and
   // will be released by ncclMemManagerDestroy walking the entry list.
@@ -671,6 +675,10 @@ static inline ncclResult_t ncclCuMemFree(void* ptr, struct ncclMemManager* manag
   // Check if process is shutting down to avoid use-after-free in HIP runtime
   if (rcclShutdownFlag().load(std::memory_order_acquire)) {
     INFO(NCCL_ALLOC, "ncclCuMemFree: Skipping free (process shutdown) pointer %p", ptr);
+    return ncclSuccess;
+  }
+  if (ncclCuMemSkipFree()) {
+    INFO(NCCL_ALLOC, "ncclCuMemFree: Skipping free (NCCL_CUMEM_SKIP_FREE=1) pointer %p", ptr);
     return ncclSuccess;
   }
 

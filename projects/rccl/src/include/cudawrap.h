@@ -16,6 +16,7 @@
 // Is cuMem API usage enabled
 extern int ncclCuMemEnable();
 extern int ncclCuMemHostEnable();
+extern int ncclCuMemSkipFree();
 
 #if CUDART_VERSION >= 11030
 #include <cudaTypedefs.h>

@@ -15,6 +15,7 @@
 // This env var (NCCL_CUMEM_ENABLE) toggles cuMem API usage
 NCCL_PARAM(CuMemEnable, "CUMEM_ENABLE", -2);
 NCCL_PARAM(CuMemHostEnable, "CUMEM_HOST_ENABLE", -1);
+NCCL_PARAM(CuMemSkipFree, "CUMEM_SKIP_FREE", 0);
 // Handle type used for cuMemCreate()
 CUmemAllocationHandleType ncclCuMemHandleType = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
 
@@ -48,6 +49,10 @@ int ncclCuMemEnable() {
   // NCCL_CUMEM_ENABLE=-2 means auto-detect CUMEM support
   int param = ncclParamCuMemEnable();
   return param >= 0 ? param : (param == -2 && ncclCuMemSupported);
+}
+
+int ncclCuMemSkipFree() {
+  return ncclParamCuMemSkipFree() != 0;
 }
 
 static int ncclCumemHostEnable = -1;
