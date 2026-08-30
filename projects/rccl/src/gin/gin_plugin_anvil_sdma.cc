@@ -183,26 +183,31 @@ static ncclResult_t ginAnvilListen(void* ctx, int dev, void* handle, void** list
   return ncclSuccess;
 }
 
-static int ginAnvilEnvInt(const char* name, int defaultVal) {
+static int ginAnvilEnvInt(const char* name, int defaultVal, bool allowZero = false) {
   const char* e = getenv(name);
   if (e && e[0]) {
     int v = atoi(e);
-    return v > 0 ? v : defaultVal;
+    if (allowZero) {
+      if (v >= 0) return v;
+    } else if (v > 0) {
+      return v;
+    }
   }
   return defaultVal;
 }
 
+static uint32_t ginAnvilEnvBool(const char* name, uint32_t defaultVal) {
+  const char* e = getenv(name);
+  if (!e || !e[0]) return defaultVal;
+  if (e[0] == '0' && e[1] == '\0') return 0;
+  return atoi(e) != 0 ? 1u : 0u;
+}
+
 static int ginAnvilSdmaThresholdFromEnv() {
-  // Unlike ginAnvilEnvInt (which treats 0 as "unset" and falls back to the
-  // default), an explicit NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 must propagate as 0 so
-  // the AllGather hybrid kernel (-D 3) can be forced onto the all-SDMA put tier
-  // (chunkBytes <= 0 is never true) for the all-SDMA gate.
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
-  if (e && e[0]) {
-    int v = atoi(e);
-    if (v >= 0) return v;
-  }
-  return (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT;
+  // Explicit NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 is honored (all-SDMA gate for inline
+  // gin.put). Negative/unparseable values fall back to the compiled default.
+  return ginAnvilEnvInt("NCCL_GIN_ANVIL_SDMA_THRESHOLD", (int)NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT,
+                        /*allowZero=*/true);
 }
 
 static int ginAnvilSdmaNumChannels() {
@@ -214,24 +219,15 @@ static int ginAnvilSdmaNumChannels() {
 }
 
 static uint32_t ginAnvilFusedSignalFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL");
-  if (!e || !e[0]) return NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL", NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT);
 }
 
 static uint32_t ginAnvilIpcAgentFenceFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_IPC_AGENT_FENCE");
-  if (!e || !e[0]) return 0;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_IPC_AGENT_FENCE", 0);
 }
 
 static uint32_t ginAnvilIpcSignalPeerFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_SIGNAL_IPC");
-  if (!e || !e[0]) return 0;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_SIGNAL_IPC", 0);
 }
 
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,

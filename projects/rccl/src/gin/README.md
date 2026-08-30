@@ -50,7 +50,8 @@ for the alltoall\_wg offload path.  Does not enable GIN plugins.
 |----------|---------|-------------|
 | `NCCL_GIN_ENABLE` | `1` | Enable/disable GIN (all backends) |
 | `NCCL_GIN_TYPE` | (auto) | Force a specific backend: `5`=GDA, `6`=SDMA |
-| `NCCL_GIN_ANVIL_SDMA_THRESHOLD` | `128` | Minimum message size (bytes) to use SDMA; smaller messages fall back to the IB proxy |
+| `NCCL_GIN_ANVIL_SDMA_THRESHOLD` | `128` | Backend inline `gin.put` SDMA threshold (bytes); smaller messages fall back to the IB proxy |
+| `NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER` | (unset) | Per-collective AllGather LSA↔SDMA crossover (bytes/rank); overrides `NCCL_GIN_ANVIL_SDMA_THRESHOLD` when set. Compiled default is 32 KiB/rank (`kAllGatherSdmaThresholdDefault` in `gin_sdma_allgather_policy.h`). |
 | `NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL` | `0` | Enable fused signal mode for SDMA (experimental) |
 | `NCCL_CUMEM_ENABLE` | `0` | Required: GIN needs `hipMemCreate`-based allocations |
 | `NCCL_DMABUF_ENABLE` | `0` | Recommended: enables dmabuf-based MR registration |
@@ -124,4 +125,3 @@ GIN plugin functions from the executable at runtime.
 | `gin_rocshmem_gda_factory.cc` | QueuePair creation, MR registration, topology discovery |
 | `gin_rocshmem_constmem.hip` | Stub `__constant__` definitions for device bitcode linking |
 | `gin_anvil_ipc_table_host.cc` | IPC table management for SDMA |
-| `gin_anvil_sdma_oss7_device.cc` | SDMA OSS7 device helpers |

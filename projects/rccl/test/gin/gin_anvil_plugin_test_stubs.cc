@@ -186,7 +186,7 @@ extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle)
 }
 
 // [GIN-CONN-CHECK] Host stubs for gin_plugin_anvil_sdma.cc when this TU is linked
-// into rccl-UnitTestsGinAnvilPlugin without gin_anvil_sdma_oss7_device.cc (compiled
+// into rccl-UnitTestsGinAnvilPlugin without the conn-check device TU (compiled
 // as plain C++). Production librccl resolves these from the HIP device TU instead.
 extern "C" int ginAnvilConnWrite(void* remoteAddrsDev, int nRanks, int selfRank,
                                  unsigned long long stamp, hipStream_t stream) {

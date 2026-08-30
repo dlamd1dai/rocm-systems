@@ -275,6 +275,63 @@ TEST_F(GinAnvilPluginTest, CreateContext_EnvAndCounters) {
   plugin_.finalize(ictx);
 }
 
+// G11b: explicit NCCL_GIN_ANVIL_SDMA_THRESHOLD=0 propagates (all-SDMA inline gate).
+TEST_F(GinAnvilPluginTest, CreateContext_ThresholdZero) {
+  ScopedEnv th("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "0");
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
+  ncclGinConfig_t cfg{};
+  void* ginCtx = nullptr;
+  ncclNetDeviceHandle_v11_t* devHandle = nullptr;
+  ASSERT_EQ(plugin_.createContext(coll, &cfg, &ginCtx, &devHandle), ncclSuccess);
+  ncclGinAnvilSdmaGPUContext hostCtx{};
+  ASSERT_EQ(hipMemcpy(&hostCtx, devHandle->handle, sizeof(hostCtx), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(hostCtx.sdmaThreshold, 0u);
+  EXPECT_EQ(plugin_.destroyContext(ginCtx), ncclSuccess);
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
+// G11c: negative threshold falls back to compiled default.
+TEST_F(GinAnvilPluginTest, CreateContext_ThresholdNegative) {
+  ScopedEnv th("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "-1");
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
+  ncclGinConfig_t cfg{};
+  void* ginCtx = nullptr;
+  ncclNetDeviceHandle_v11_t* devHandle = nullptr;
+  ASSERT_EQ(plugin_.createContext(coll, &cfg, &ginCtx, &devHandle), ncclSuccess);
+  ncclGinAnvilSdmaGPUContext hostCtx{};
+  ASSERT_EQ(hipMemcpy(&hostCtx, devHandle->handle, sizeof(hostCtx), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(hostCtx.sdmaThreshold, NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
+  EXPECT_EQ(plugin_.destroyContext(ginCtx), ncclSuccess);
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
+// G11d: unparseable threshold falls back to compiled default.
+TEST_F(GinAnvilPluginTest, CreateContext_ThresholdUnparseable) {
+  ScopedEnv th("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "abc");
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll);
+  ncclGinConfig_t cfg{};
+  void* ginCtx = nullptr;
+  ncclNetDeviceHandle_v11_t* devHandle = nullptr;
+  ASSERT_EQ(plugin_.createContext(coll, &cfg, &ginCtx, &devHandle), ncclSuccess);
+  ncclGinAnvilSdmaGPUContext hostCtx{};
+  ASSERT_EQ(hipMemcpy(&hostCtx, devHandle->handle, sizeof(hostCtx), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(hostCtx.sdmaThreshold, NCCL_GIN_ANVIL_SDMA_THRESHOLD_DEFAULT);
+  EXPECT_EQ(plugin_.destroyContext(ginCtx), ncclSuccess);
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
 // G12: bind resource window signals — invalid args.
 TEST_F(GinAnvilPluginTest, BindSignals_InvalidArgs) {
   EXPECT_EQ(ncclGinAnvilBindResourceWindowSignals(nullptr, reinterpret_cast<void*>(0x100), 0, 1, 1),
