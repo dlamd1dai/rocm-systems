@@ -305,25 +305,29 @@ static testResult_t AlltoAllLaunchFabricLL(void* sendbuff, size_t sendoffset, vo
   dim3 block(256);
   dim3 grid((unsigned)devComm->nRanks, (unsigned)blocksPerPeer);
 
+  // Device-API tests pass ncclWindow_t handles (see common.cu runColl), not raw pointers.
+  void* sendPtr = nullptr;
+  void* recvPtr = nullptr;
+  NCCLCHECK(ncclGetLsaDevicePointer((ncclWindow_t)sendbuff, sendoffset, devComm->lsaRank, &sendPtr));
+  NCCLCHECK(ncclGetLsaDevicePointer((ncclWindow_t)recvbuff, recvoffset, devComm->lsaRank, &recvPtr));
+
   T** peers = reinterpret_cast<T**>(devComm->ginFabricPeerScratch);
-  T* sendPtr = reinterpret_cast<T*>(static_cast<char*>(sendbuff) + sendoffset);
-  T* recvPtr = reinterpret_cast<T*>(static_cast<char*>(recvbuff) + recvoffset);
 
   switch (devComm->nRanks) {
   case 4:
     dda::common::ddaAllToAllFabricLL<T, 4><<<grid, block, 0, stream>>>(
-        peers, recvPtr, sendPtr, perChunkBytes, devComm->rank, devComm->nRanks, devComm->ginFabricLLEpoch,
-        devComm->ginFabricLLEpochLen);
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm->rank,
+        devComm->nRanks, devComm->ginFabricLLEpoch, devComm->ginFabricLLEpochLen);
     break;
   case 8:
     dda::common::ddaAllToAllFabricLL<T, 8><<<grid, block, 0, stream>>>(
-        peers, recvPtr, sendPtr, perChunkBytes, devComm->rank, devComm->nRanks, devComm->ginFabricLLEpoch,
-        devComm->ginFabricLLEpochLen);
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm->rank,
+        devComm->nRanks, devComm->ginFabricLLEpoch, devComm->ginFabricLLEpochLen);
     break;
   default:
     dda::common::ddaAllToAllFabricLL<T, 0><<<grid, block, 0, stream>>>(
-        peers, recvPtr, sendPtr, perChunkBytes, devComm->rank, devComm->nRanks, devComm->ginFabricLLEpoch,
-        devComm->ginFabricLLEpochLen);
+        peers, reinterpret_cast<T*>(recvPtr), reinterpret_cast<T*>(sendPtr), perChunkBytes, devComm->rank,
+        devComm->nRanks, devComm->ginFabricLLEpoch, devComm->ginFabricLLEpochLen);
     break;
   }
   CUDACHECK(cudaGetLastError());
