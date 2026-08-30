@@ -1055,6 +1055,32 @@ NCCL_PARAM(MNNVLUUID, "MNNVL_UUID", -1);
 NCCL_PARAM(MNNVLCliqueId, "MNNVL_CLIQUE_ID", -1);
 NCCL_PARAM(MNNVLCrossClique, "MNNVL_CROSS_CLIQUE", 0);
 
+// True when ranks are sharing a physical GPU via MLOPart/CPX partitioning. On AMD,
+// fillInfo() tags function-0 GPUs with mloPart=0 for topo encoding even when each
+// rank owns a distinct GPU (e.g. gfx1250 MI455); do not treat that alone as a split.
+static bool ncclCommHasActiveMloPartSplit(struct ncclComm* comm) {
+  const int nranks = comm->nRanks;
+  struct ncclPeerInfo* peers = comm->peerInfo;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  for (int i = 0; i < nranks; i++) {
+    if (peers[i].mloPart > 0) return true;
+  }
+  for (int i = 0; i < nranks; i++) {
+    for (int j = i + 1; j < nranks; j++) {
+      if (peers[i].hostHash != peers[j].hostHash) continue;
+      if (peers[i].nvmlDev != peers[j].nvmlDev) continue;
+      if (peers[i].mloPart != NCCL_TOPO_UNDEF && peers[j].mloPart != NCCL_TOPO_UNDEF) return true;
+    }
+  }
+  return false;
+#else
+  for (int i = 0; i < nranks; i++) {
+    if (peers[i].mloPart != NCCL_TOPO_UNDEF) return true;
+  }
+  return false;
+#endif
+}
+
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
   cudaDeviceProp prop;
   info->rank = comm->rank;
@@ -1506,7 +1532,6 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     }
     if (comm->peerInfo[i].hostHash != comm->peerInfo[rank].hostHash) nNodes++;
     if (!comm->peerInfo[i].cuMemSupport) comm->cuMemSupport = 0;
-    if (comm->peerInfo[i].mloPart != -1) comm->hasMloPart = true;
     for (int j = 0; j < i; j++) {
       // NVML device is agnostic to MloPart being used. With MloPart, each partition has a different GPU UUID.
       comm->hasMultiRankNvml = (comm->peerInfo[i].hostHash == comm->peerInfo[j].hostHash) &&
@@ -1523,6 +1548,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     globalRmaPluginSupport &= comm->peerInfo[i].rmaPluginAvailable;
     globalCuMemGdrSupport &= comm->peerInfo[i].cuMemGdrSupport;
   }
+  comm->hasMloPart = ncclCommHasActiveMloPartSplit(comm);
 
   // AllGather1 - end
   timers[TIMER_INIT_ALLGATHER] = clockNano() - timers[TIMER_INIT_ALLGATHER];

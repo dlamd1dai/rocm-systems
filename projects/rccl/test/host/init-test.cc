@@ -1938,6 +1938,31 @@ TEST_F(InitMicrotest, InitTransportsRank_NoPeerWithMloPart_LeavesHasMloPartUnset
   EXPECT_FALSE(c.get()->hasMloPart);
 }
 
+// AMD fillInfo tags function-0 GPUs with mloPart=0 for topo encoding; distinct GPUs
+// (different nvmlDev) must not block globalGinSupport via hasMloPart (MI455/gfx1250).
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+TEST_F(InitMicrotest, InitTransportsRank_AmdFnZeroMloPartDistinctGpus_LeavesHasMloPartUnset) {
+  TransportsRankComm c(/*nRanks=*/4, /*rank=*/0);
+  std::vector<PeerSpec> specs(4);
+  for (int i = 0; i < 4; ++i) specs[i].mloPart = 0;
+  InstallPeerInfoAllGather(c, specs);
+  EXPECT_EQ(ncclRemoteError, initTransportsRank(c.get(), nullptr, c.timers()));
+  EXPECT_FALSE(c.get()->hasMloPart);
+}
+#endif
+
+TEST_F(InitMicrotest, InitTransportsRank_SameGpuMloPartSplit_SetsHasMloPart) {
+  TransportsRankComm c(/*nRanks=*/4, /*rank=*/0);
+  std::vector<PeerSpec> specs(4);
+  specs[1].mloPart = 0;
+  specs[1].nvmlDev = 7;
+  specs[2].mloPart = 1;
+  specs[2].nvmlDev = 7;
+  InstallPeerInfoAllGather(c, specs);
+  EXPECT_EQ(ncclRemoteError, initTransportsRank(c.get(), nullptr, c.timers()));
+  EXPECT_TRUE(c.get()->hasMloPart);
+}
+
 // NOT ASSERTABLE FROM THIS RUNG, deliberately: the four `global*Support` accumulators at :1491-1494 are
 // function-locals first read at :2347-2363, ~700 lines past the terminator. They execute (so they count
 // as covered) but nothing here can observe them, and deleting any of the four leaves the suite green.
