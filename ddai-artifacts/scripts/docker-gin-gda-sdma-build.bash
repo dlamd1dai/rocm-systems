@@ -16,6 +16,9 @@ export DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-sdma-a2a-mi455}"
 TARGET_GPU_ARCH="${GPU_TARGETS:-gfx1250}"
 USE_LOCAL_SRC=1
 ROCSHMEM_USE_SDMA=1
+# CentOS Stream 9 default (MI455 SUT rdma-core 61 / bng_re ABI). Ubuntu: BASE_OS=ubuntu BASE_IMAGE=ubuntu:24.04
+BASE_OS="${BASE_OS:-centos}"
+BASE_IMAGE="${BASE_IMAGE:-quay.io/centos/centos:stream9}"
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
 ROCM_NIGHTLY_VERSION="${ROCM_NIGHTLY_VERSION:-10.1.0a20260822}"
 ROCM_NIGHTLY_BASE_URL="${ROCM_NIGHTLY_BASE_URL:-https://rocm.nightlies.amd.com/tarball-multi-arch}"
@@ -59,6 +62,8 @@ DOCKER_NET_OPT=()
 ${DOCKER_CMD} build -f ${DOCKERFILE_PATH} -t ${DOCKER_IMAGE} \
     "${DOCKER_NET_OPT[@]}" \
     ${DOCKER_CACHE_OPT} \
+    --build-arg BASE_OS=${BASE_OS} \
+    --build-arg BASE_IMAGE=${BASE_IMAGE} \
     --build-arg GPU_TARGETS=${TARGET_GPU_ARCH} \
     --build-arg ROCM_NIGHTLY_VERSION=${ROCM_NIGHTLY_VERSION} \
     --build-arg ROCM_NIGHTLY_FAMILY=${ROCM_NIGHTLY_FAMILY} \

@@ -323,8 +323,9 @@ fi
 _rccl_test5_mlx5_ok() {
   [[ -n "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR:-}}" ]] && return 0
   ${DOCKER_CMD} run --rm --init ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
-    'f=/lib/x86_64-linux-gnu/libmlx5.so.1; test -e "$f" || f=/usr/lib/x86_64-linux-gnu/libmlx5.so.1; \
-     rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr' \
+    'for f in /usr/lib64/libmlx5.so.1 /lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so.1; do \
+       test -e "$f" || continue; rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr && exit 0; \
+     done; exit 1' \
     >/dev/null 2>&1
 }
 

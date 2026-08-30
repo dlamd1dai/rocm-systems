@@ -9,10 +9,10 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 
 | Path | Purpose |
 |------|---------|
-| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | Ubuntu 24.04 + TheRock nightly ROCm 10.1.0 (`gfx125X-dcgpu`) + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests |
+| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | **CentOS Stream 9** (default) + TheRock nightly ROCm 10.1.0 + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests. Ubuntu: `BASE_OS=ubuntu BASE_IMAGE=ubuntu:24.04` |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Build wrapper + optional GPU smoke (Test#5) |
 | `ddai-artifacts/scripts/gin-sdma-a2a-test.bash` | Single-node AllToAll perf/compare harness |
-| `extra-rdma-debs/` | Optional newer rdma-core/libmlx5 debs for MLX5 DMA-BUF symbols |
+| `extra-rdma-debs/` | Optional rdma-core / libbng_re / libmlx5 `.rpm` (CentOS) or `.deb` (Ubuntu) |
 | `ddai-artifacts/c/ddai-rocshmem-hoststub.c` | Host stub for unit tests when rocSHMEM host lib is not linked |
 
 ## Reconciliation notes (vs stage3b branch)
@@ -79,6 +79,9 @@ Select tests with `RCCL_GIN_RUN_TESTS` (comma list), e.g. `1,5` or `5`.
 | `RCCL_IMAGE_GIN_SMOKE` | `1` | Post-build Test#5 smoke on `/dev/kfd` |
 | `GIN_SMOKE_NP` | `4` | Ranks for build smoke |
 | `DOCKER_BUILD_NETWORK` | unset | Set to `host` if docker bridge is disabled |
+| `BASE_OS` | `centos` | `centos` (default) or `ubuntu` for legacy Ubuntu 24.04 base |
+| `BASE_IMAGE` | `quay.io/centos/centos:stream9` | Override base image (e.g. `ubuntu:24.04`) |
+| `RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS` | `0` | Set `1` to fail build unless `mlx5dv_reg_dmabuf_mr` exists in image |
 
 ## MI455 env checklist
 
