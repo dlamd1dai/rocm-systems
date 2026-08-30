@@ -421,6 +421,8 @@ if(BUILD_TESTS)
     )
 
     target_include_directories(rccl-UnitTestsGinAnvilPlugin PRIVATE
+      ${CMAKE_SOURCE_DIR}/src/include
+      ${CMAKE_SOURCE_DIR}/src/include/nccl_device
       ${PROJECT_BINARY_DIR}/hipify/src/include
       ${PROJECT_BINARY_DIR}/hipify/src/include/nccl_device
       ${CMAKE_CURRENT_SOURCE_DIR}/gin
