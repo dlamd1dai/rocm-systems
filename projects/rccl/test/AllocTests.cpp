@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include <alloc.h>
+#include <archinfo.h>
 #include <gtest/gtest.h>
 #include <rccl/rccl.h>
 #include <unordered_map>
@@ -17,6 +18,57 @@ template ncclResult_t ncclCudaMemcpy<float>(float*, float*, size_t);
 
 namespace RcclUnitTesting
 {
+#if ROCM_VERSION >= 70000
+// ---------------------------------------------------------------------------
+// gfx950 cuMem-VMM skip-free workaround (rcclSkipCuMemFree / NCCL_CUMEM_SKIP_FREE)
+// ---------------------------------------------------------------------------
+
+TEST(Alloc, rcclSkipCuMemFreeEnvForceOn)
+{
+    RUN_ISOLATED_TEST(
+        "rcclSkipCuMemFreeEnvForceOn",
+        []()
+        {
+            setenv("NCCL_CUMEM_SKIP_FREE", "1", 1);
+            ASSERT_EQ(hipSetDevice(0), hipSuccess);
+            EXPECT_TRUE(rcclSkipCuMemFree());
+        }
+    );
+}
+
+TEST(Alloc, rcclSkipCuMemFreeEnvForceOff)
+{
+    RUN_ISOLATED_TEST(
+        "rcclSkipCuMemFreeEnvForceOff",
+        []()
+        {
+            setenv("NCCL_CUMEM_SKIP_FREE", "0", 1);
+            ASSERT_EQ(hipSetDevice(0), hipSuccess);
+            EXPECT_FALSE(rcclSkipCuMemFree());
+        }
+    );
+}
+
+TEST(Alloc, rcclSkipCuMemFreeAutoGfx950)
+{
+    RUN_ISOLATED_TEST(
+        "rcclSkipCuMemFreeAutoGfx950",
+        []()
+        {
+            unsetenv("NCCL_CUMEM_SKIP_FREE");
+            ASSERT_EQ(hipSetDevice(0), hipSuccess);
+            char gcnArchName[256] = {};
+            ASSERT_EQ(GetGcnArchName(0, gcnArchName), 0);
+            if(!IsArchMatch(gcnArchName, "gfx950"))
+            {
+                GTEST_SKIP() << "Auto skip-free applies only on gfx950 (got " << gcnArchName << ")";
+            }
+            EXPECT_TRUE(rcclSkipCuMemFree());
+        }
+    );
+}
+#endif // ROCM_VERSION >= 70000
+
 TEST(Alloc, ncclIbMallocDebugNonZero)
 {
     void*  ptr  = nullptr;

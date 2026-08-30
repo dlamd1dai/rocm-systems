@@ -14,6 +14,7 @@
 #include "graph/topo.h"
 #include "shmutils.h"
 #include "p2p.h"
+#include "alloc.h"
 #include "transport.h"
 #include "mem_manager.h"
 #include <assert.h>
@@ -427,12 +428,17 @@ static ncclResult_t p2pMap(struct ncclComm* comm, struct ncclProxyConnector* pro
         // for intra-process ranks, we should map memHandle of the peers to increase refcount.
         // Otherwise, if peers abort and free the buffer, the rank can suffer invalid access.
         NCCLCHECK(ncclCuMemAllocAddr(devMem, &p2pBuff->ipcDesc.memHandle, p2pBuff->size));
-        CUCHECK(cuMemRelease(p2pBuff->ipcDesc.memHandle));
+        CUmemGenericAllocationHandle trackHandle = p2pBuff->ipcDesc.memHandle;
+        // When peer unmap is skipped (gfx950), retain the import handle until
+        // ncclCuMemFreeAddr drops the mapping's physical ref via cuMemRelease.
+        if (!rcclSkipCuMemFree()) {
+          CUCHECK(cuMemRelease(p2pBuff->ipcDesc.memHandle));
+          trackHandle = 0;
+        }
         *ipcPtr = *devMem;
 
         // Track as imported peer memory for dynamic memory management.
-        // Pass handle=0 since we already released the reference above; suspend shouldn't release again.
-        NCCLCHECK(ncclMemTrackImportFromPeer(comm->memManager, *devMem, p2pBuff->size, 0, ncclCuMemHandleType,
+        NCCLCHECK(ncclMemTrackImportFromPeer(comm->memManager, *devMem, p2pBuff->size, trackHandle, ncclCuMemHandleType,
                                              ncclMemOffload, peerInfo->rank, peerInfo->cudaDev, p2pBuff->directPtr));
 #endif
       } else {

@@ -22,6 +22,7 @@ struct ncclComm;
 #include <string.h>
 #include <unordered_map>
 #include "rccl_vars.h"
+#include "archinfo.h"
 #include <atomic>
 #include <mutex>
 
@@ -69,11 +70,9 @@ inline bool rcclSkipCuMemFree() {
   static const bool skip = [](){
     const char* e = getenv("NCCL_CUMEM_SKIP_FREE");
     if (e) return atoi(e) != 0;
-    hipDeviceProp_t prop;
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess) return false;
-    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return false;
-    return strstr(prop.gcnArchName, "gfx950") != nullptr;
+    char gcnArchName[256] = {};
+    if (GetGcnArchName(0, gcnArchName) != 0) return false;
+    return IsArchMatch(gcnArchName, "gfx950");
   }();
   return skip;
 }
@@ -548,9 +547,31 @@ fail:
 
 static inline ncclResult_t ncclCuMemFreeAddr(void* ptr, struct ncclMemManager* manager, int numSegments = 1) {
   if (ptr == NULL) return ncclSuccess;
-  // Check if process is shutting down to avoid use-after-free in HIP runtime
-  if (rcclShutdownFlag().load(std::memory_order_acquire) || rcclSkipCuMemFree()) {
-    INFO(NCCL_ALLOC, "ncclCuMemFreeAddr: Skipping free (%s) pointer %p", rcclSkipCuMemFree() ? "NCCL_CUMEM_SKIP_FREE" : "process shutdown", ptr);
+  // Check if process is shutting down to avoid use-after-free in HIP runtime.
+  const bool shuttingDown = rcclShutdownFlag().load(std::memory_order_acquire);
+  const bool skipPeerUnmap = !shuttingDown && rcclSkipCuMemFree();
+  if (shuttingDown || skipPeerUnmap) {
+    if (skipPeerUnmap) {
+      INFO(NCCL_ALLOC, "ncclCuMemFreeAddr: Skipping free (NCCL_CUMEM_SKIP_FREE) pointer %p", ptr);
+      // Drop the mapping's hold on physical memory without unmap (gfx950 workaround).
+      // Also untrack so repeated register/deregister cycles do not leak manager entries.
+      size_t totalSize = 0;
+      for (int segment = 0; segment < numSegments; segment++) {
+        CUmemGenericAllocationHandle handle;
+        if (cuMemRetainAllocationHandle(&handle, (void*)((char*)ptr + totalSize)) == CUDA_SUCCESS) {
+          (void)cuMemRelease(handle);
+        }
+        CUdeviceptr base = nullptr;
+        size_t segmentSize = 0;
+        if (cuMemGetAddressRange(&base, &segmentSize, (CUdeviceptr)((char*)ptr + totalSize)) != CUDA_SUCCESS) break;
+        totalSize += segmentSize;
+      }
+      if (manager != nullptr && totalSize > 0 && !ncclMemEntryAlreadyReleased(manager, ptr)) {
+        NCCLCHECK(ncclMemUntrack(manager, ptr, totalSize));
+      }
+    } else {
+      INFO(NCCL_ALLOC, "ncclCuMemFreeAddr: Skipping free (process shutdown) pointer %p", ptr);
+    }
     return ncclSuccess;
   }
 

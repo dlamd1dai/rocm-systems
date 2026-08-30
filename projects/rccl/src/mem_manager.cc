@@ -297,6 +297,12 @@ ncclResult_t ncclMemUntrack(struct ncclMemManager* manager, void* ptr, size_t si
           INFO(NCCL_ALLOC, "MemManager: Untrack size mismatch ptr=%p tracked=%zu passed=%zu", ptr, entrySize, size);
         }
 
+        // Release retained import handle when untracking peer imports (gfx950 skip-unmap path).
+        if (entry->isImportedFromPeer && entry->handle != 0) {
+          (void)cuMemRelease(entry->handle);
+          entry->handle = 0;
+        }
+
         free(entry);
         break;
       }
