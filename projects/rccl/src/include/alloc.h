@@ -58,13 +58,12 @@ inline void rcclRegisterShutdownHandler() {
 
 // RCCL workaround (gfx950): hipMemUnmap on cuMem VMM *peer* allocations can
 // deadlock in the HSA busy-wait during ncclCommDestroy teardown. To avoid the
-// hang we skip ONLY the peer-aperture teardown in ncclCuMemFreeAddr (the
-// cuMemUnmap + cuMemAddressFree of the peer-mapped VA range), leaking just that
-// VA aperture (the OS reclaims it at process exit). The owner's physical handle
-// (ncclCuMemFree -> cuMemRelease) and ordinary buffers (ncclCudaFree -> cudaFree)
-// still free normally, so long-lived processes do not grow memory on every
-// ncclCommDestroy. Auto-enabled on gfx950; override with NCCL_CUMEM_SKIP_FREE=0
-// (force off) or =1 (force on).
+// hang we skip peer-aperture teardown in ncclCuMemFreeAddr (the
+// cuMemUnmap + cuMemAddressFree of the peer-mapped VA range), owner-buffer
+// unmap in ncclCuMemFree after symmetric window deregister, and LSA slice
+// unmap in symMemoryDestroy — leaking just those VA apertures (the OS reclaims
+// at process exit). The owner's physical handle refs are still dropped via
+// cuMemRelease so repeated register/deregister cycles do not leak handles.
 inline bool rcclSkipCuMemFree() {
   static const bool skip = [](){
     const char* e = getenv("NCCL_CUMEM_SKIP_FREE");
@@ -706,12 +705,9 @@ fail:
 
 static inline ncclResult_t ncclCuMemFree(void* ptr, struct ncclMemManager* manager, int numSegments = 1) {
   if (ptr == NULL) return ncclSuccess;
-  // Check if process is shutting down to avoid use-after-free in HIP runtime.
-  // NOTE: the gfx950 rcclSkipCuMemFree() workaround is intentionally NOT applied
-  // here -- this releases the owner's physical handle (cuMemRelease), which does
-  // not hit the peer-unmap deadlock; skipping it would leak physical memory. The
-  // skip is confined to the peer aperture unmap in ncclCuMemFreeAddr.
-  if (rcclShutdownFlag().load(std::memory_order_acquire)) {
+  const bool shuttingDown = rcclShutdownFlag().load(std::memory_order_acquire);
+  const bool skipOwnerUnmap = !shuttingDown && rcclSkipCuMemFree();
+  if (shuttingDown) {
     INFO(NCCL_ALLOC, "ncclCuMemFree: Skipping free (process shutdown) pointer %p", ptr);
     return ncclSuccess;
   }
@@ -720,6 +716,27 @@ static inline ncclResult_t ncclCuMemFree(void* ptr, struct ncclMemManager* manag
   // and other untracked pointers must still be freed here.
   if (ncclMemEntryAlreadyReleased(manager, ptr)) {
     INFO(NCCL_ALLOC, "ncclCuMemFree: %p already released by Suspend", ptr);
+    return ncclSuccess;
+  }
+
+  // gfx950: owner unmap + addressFree after symmetric window deregister can
+  // SIGSEGV in hipMemRelease; drop handle refs and untrack without unmapping.
+  if (skipOwnerUnmap) {
+    INFO(NCCL_ALLOC, "ncclCuMemFree: Skipping owner unmap (NCCL_CUMEM_SKIP_FREE) pointer %p", ptr);
+    size_t totalSize = 0;
+    for (int segment = 0; segment < numSegments; segment++) {
+      CUmemGenericAllocationHandle handle;
+      if (cuMemRetainAllocationHandle(&handle, (void*)((char*)ptr + totalSize)) == CUDA_SUCCESS) {
+        (void)cuMemRelease(handle);
+      }
+      CUdeviceptr base = nullptr;
+      size_t segmentSize = 0;
+      if (cuMemGetAddressRange(&base, &segmentSize, (CUdeviceptr)((char*)ptr + totalSize)) != CUDA_SUCCESS) break;
+      totalSize += segmentSize;
+    }
+    if (manager != nullptr && totalSize > 0) {
+      NCCLCHECK(ncclMemUntrack(manager, ptr, totalSize));
+    }
     return ncclSuccess;
   }
 
