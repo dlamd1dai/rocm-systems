@@ -22,7 +22,9 @@ JIRA required workflow: research → tests → end-user RCCL docs → run tests 
 
 **Coverage target:** Standard on fence branches in `gin_barrier__funcs.h` / `barrier__funcs.h` (Put vs not, Get vs not, all-ctx vs single-ctx, `useWorldForFence` true/false).
 
-**Merge bar:** Put + Get visibility **PASS** on proxy (multi-node) and on SDMA at the layouts that GPU allows (MI300/350/355: single-node; MI450: single-node **and** multi-node if hardware is available). AllContexts must not trap. Hybrid world-fence: proxy 2×2 always; SDMA 2×2 **only on MI450**.
+**Merge bar (this PR):** Put + Get **PASS** on **Job A** (proxy, multi-node) and **Job B** (SDMA, single-node on MI300/MI350/MI355). AllContexts must not trap on those jobs. Hybrid world-fence: **proxy 2×2 only**.
+
+**Out of merge bar:** **Job C** (SDMA multi-node on MI450). Hardware is generally unavailable. Land a GPU-family **SKIP** (not FAIL) for multi-node SDMA on MI300/350/355, note the MI450 gap in the PR, and do not block 1966 on Job C.
 
 ---
 
@@ -102,8 +104,8 @@ Write the test plan in the PR body (RCCL feature-unit-testing practice: do not c
 - Hardware:
   - **Proxy:** ≥2 nodes, IB, `NCCL_CUMEM_ENABLE=1`, `NCCL_DMABUF_ENABLE=1`.
   - **SDMA MI300 / MI350 / MI355:** **one node**, ≥2 (prefer 4–8) GPUs, `--rocshmem-gin`. Single-node GIN needs `RCCL_ENABLE_INTRANET=1`. Payload **>** `NCCL_GIN_ANVIL_SDMA_THRESHOLD`.
-  - **SDMA MI450:** same single-node job, **plus** multi-node (≥2 nodes) when that platform is available. Tests must SKIP (not FAIL) multi-node SDMA on MI300/350/355.
-- Acceptance: Put + Get PASS on proxy multi-node and on SDMA for every **supported** layout of the GPU under test. AllContexts does not trap. Hybrid world-fence PASS on proxy 2×2; on SDMA 2×2 only if the GPU is MI450.
+  - **SDMA MI450 / Job C:** **Deferred.** We do not have MI450 for this PR in the normal case. Do not wait on Job C to merge. Tests must SKIP (not FAIL) multi-node SDMA on MI300/350/355 so a future MI450 run can enable Job C without rewriting tests.
+- Acceptance: Put + Get PASS on Job A + Job B. AllContexts does not trap. Hybrid world-fence PASS on proxy 2×2. Job C is not required to close 1966.
 
 ---
 
@@ -114,7 +116,7 @@ SDMA node support is **not** “always single-node.” It depends on the GPU:
 | GPU | SDMA collectives | Notes |
 |---|---|---|
 | MI300, MI350, MI355 | **Single-node only** | Intra-node Anvil SDMA + LSA/IPC. Multi-node SDMA is unsupported — SKIP, do not schedule as a failure. |
-| MI450 | **Single-node and multi-node** | Cross-node SDMA Put/Get and `useWorldForFence` are in scope when MI450 hardware is available. |
+| MI450 | **Single-node and multi-node** | Multi-node SDMA **not in this PR’s merge bar** (no MI450 allocation). Keep SKIP gates so Job C can run later without a test rewrite. |
 
 Proxy is multi-node on every GPU (IB host-proxy, not SDMA).
 
@@ -159,6 +161,8 @@ On **proxy 2×2** (any GPU) and **SDMA 2×2 on MI450 only**, add a fourth kernel
 
 If MI450 is not available for this PR, Job C is deferred: land the skip gate, document it in the PR, and run Job A + B as the merge bar.
 
+**Locked:** Job C is **out of merge bar**. Do not hold the spike or drain work for an MI450 node. If one appears later, run Job C as extra coverage, not as a 1966 blocker.
+
 Record per backend: pass / stale data / hang / trap. Ranking drives Phase 2 vs Phase 3 order. SDMA Get + AllContexts are still expected red until FlushAsync/Wait/Get exist.
 
 ---
@@ -172,7 +176,7 @@ Implement real Anvil ops instead of `__builtin_trap()`:
 
 Also verify **Put+signal ordering** (`fenceBeforeSignal` / quiet). Put-fence does **not** flush; it relies on the barrier **signal** not overtaking in-flight puts. If SDMA signals without quieting the queue, Put-fence is a data race even when Flush is correct.
 
-On **MI450**, Get/FlushAsync/Wait must complete for **cross-node** peers, not only intra-node IPC. A drain that only quiets local SDMA queues will pass Job B and fail Job C.
+On **MI450**, Get/FlushAsync/Wait must complete for **cross-node** peers, not only intra-node IPC. That is future Job C; **this PR’s drain fix is signed off on single-node SDMA (Job B)**. Prefer implementations that are not intra-node-only (so Job C can pass later) but do not block merge on untested cross-node SDMA.
 
 ---
 
@@ -225,7 +229,7 @@ Do not treat `docs/contrib/GIN/...` as user docs unless already published.
 |---|---|
 | `GinMPIDeviceTests.Barrier*` + `BarrierFence_*` with `NCCL_GIN_TYPE=2`, ≥2 nodes | Proxy contract |
 | `NCCL_GIN_TYPE=6`, **1 node** (MI300/350/355/450), payload above threshold, `RCCL_ENABLE_INTRANET=1` | SDMA intra-node contract |
-| `NCCL_GIN_TYPE=6`, **≥2 nodes**, MI450 only | SDMA cross-node contract; SKIP on MI300/350/355 |
+| `NCCL_GIN_TYPE=6`, **≥2 nodes**, MI450 only | **Not required to close 1966.** SKIP on MI300/350/355; run later if MI450 appears. |
 | Timeout MPI with Put/Get | Composition |
 | `run-gin-ci.sh` proxy AlltoAll + `NCCL_GIN_TYPE=6` AlltoAll | No regression on `None` kernels |
 | Optional: `NCCL_GIN_NCONTEXTS>1` AllContexts | Multi-QP drain |
@@ -237,12 +241,11 @@ JIRA comment: backends, node layout, pass/fail, drain-fix summary.
 ## Sequencing
 
 ```text
-Day 1–2   Spike: proxy multi-node + SDMA single-node (MI300/350/355)
-          + SDMA multi-node on MI450 if that allocation exists
-Day 2–N   SDMA Get + FlushAsync/Wait (+ Put/signal quiet if spike shows stale Put)
-          in parallel with writing tests against the intended contract
-Then      Tests green on supported layouts → docs → CI gin jobs → close 1966
-          MI450 multi-node: run if available, else SKIP gate + PR note
+Day 1–2   Spike: Job A (proxy multi-node) + Job B (SDMA single-node on MI300/350/355)
+          Job C deferred (no MI450)
+Day 2–N   SDMA Get + FlushAsync/Wait for the intra-node path
+          tests with MI450 multi-node SKIP gate
+Then      A+B green → docs → CI gin jobs → close 1966
 ```
 
 Do not wait on a full coverage campaign before the spike. If Put is a no-op on AMD flush, more tests will all fail the same way.
@@ -280,4 +283,4 @@ Do not wait on a full coverage campaign before the spike. If Put is a no-op on A
 
 The 2.30.7 change is **memory visibility**, not “barriers exist.” Arrival tests cannot catch a regression that turns Put into None. AllContexts and hybrid world-fence exist **only** to make Put/Get true across QPs and rails.
 
-First concrete execution step: spike as **Job A** (proxy, multi-node) + **Job B** (SDMA, single-node on MI300/350/355). Add **Job C** (SDMA, multi-node) when an MI450 allocation is available.
+First concrete execution step: spike **Job A** (proxy, multi-node) + **Job B** (SDMA, single-node on MI300/350/355). Do not wait for MI450 / Job C.
