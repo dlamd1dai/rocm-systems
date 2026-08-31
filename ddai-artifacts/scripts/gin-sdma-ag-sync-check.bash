@@ -61,6 +61,42 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
   fi
 done < "${MANIFEST}"
 
+# all_gather.cu cannot be in the manifest: the NCCL 2.30.7 wip branch carries its
+# own version-guarded ncclTestEngine / devComm-requirements layout, so the file is
+# never byte-identical. The AllGather kernel lives in that file, which made the
+# design itself unverifiable here -- a per-CTA signal-slot regression that
+# deadlocked every grid wider than one CTA sat on one branch and not the other
+# while this check reported all-clear. Compare the kernel region on its own so
+# design drift fails even when the surrounding file legitimately differs.
+AG_KERNEL_FILE="projects/rccl-tests/src/all_gather.cu"
+AG_KERNEL_BEGIN="__device__ void ginAllGatherBody"
+
+extract_ag_kernel() {  # $1 = git ref
+  git show "${1}:${AG_KERNEL_FILE}" 2>/dev/null \
+    | awk -v begin="${AG_KERNEL_BEGIN}" '
+        index($0, begin) { inside = 1 }
+        inside           { print }
+        inside && /^\}/  { exit }
+      '
+}
+
+echo
+body_a="$(extract_ag_kernel "${REF_A}")"
+body_b="$(extract_ag_kernel "${REF_B}")"
+
+if [[ -z "${body_a}" || -z "${body_b}" ]]; then
+  # A rename or refactor must fail loudly rather than silently pass.
+  [[ -z "${body_a}" ]] && echo "MISSING kernel region on ${REF_A}: '${AG_KERNEL_BEGIN}' in ${AG_KERNEL_FILE}"
+  [[ -z "${body_b}" ]] && echo "MISSING kernel region on ${REF_B}: '${AG_KERNEL_BEGIN}' in ${AG_KERNEL_FILE}"
+  fail=1
+elif [[ "$(printf '%s' "${body_a}" | sha256sum)" != "$(printf '%s' "${body_b}" | sha256sum)" ]]; then
+  echo "DIFF: ${AG_KERNEL_FILE} :: ginAllGatherBody (kernel design drift)"
+  diff <(printf '%s\n' "${body_a}") <(printf '%s\n' "${body_b}") | sed 's/^/      /' || true
+  fail=1
+else
+  echo "OK:   ${AG_KERNEL_FILE} :: ginAllGatherBody (kernel design)"
+fi
+
 echo
 if [[ "${fail}" -ne 0 ]]; then
   echo "FAIL: manifest files differ between ${REF_A} and ${REF_B}" >&2

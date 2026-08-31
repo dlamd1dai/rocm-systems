@@ -3,7 +3,9 @@
 # Checked by gin-sdma-ag-sync-check.bash (run from repo root).
 #
 # Excluded: projects/rccl-tests/src/all_gather.cu — NCCL 2.30.7 wip keeps
-# ncclCommQueryProperties / testEngine layout adaptations; kernel design matches.
+# ncclCommQueryProperties / testEngine layout adaptations, so the file is never
+# byte-identical. Its ginAllGatherBody kernel region is compared separately by
+# gin-sdma-ag-sync-check.bash, so a design change there still fails the check.
 projects/rccl-tests/src/gin_sdma_allgather_policy.h
 projects/rccl-tests/src/gin_sdma_devtime.h
 projects/rccl-tests/test/test_AllGather.py
