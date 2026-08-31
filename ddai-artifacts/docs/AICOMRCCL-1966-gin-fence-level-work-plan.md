@@ -14,17 +14,62 @@ JIRA required workflow: research → tests → end-user RCCL docs → run tests 
 | Question | Decision |
 |---|---|
 | Release backends | **Proxy** (`NCCL_GIN_TYPE=2`) **and Anvil SDMA** (`NCCL_GIN_TYPE=6`). GDA is out of scope. |
-| Topology | **Split by backend and GPU.** Proxy is always multi-node. SDMA is **single-node on MI300 / MI350 / MI355**; **multi-node on MI450**. |
-| `gin.get` | **Required.** Get-fence tests are not optional. |
-| AllContexts + `useWorldForFence` | **In this ticket.** AllContexts on both backends. `useWorldForFence` on SDMA only where SDMA is multi-node (**MI450** 2×2); on MI300/MI350/MI355 use **proxy 2×2**. |
-| Drain / flush bugs | **Fix on this ticket** (no child enablement JIRA). |
+| Work order | **Three stages** (do not skip ahead): (1) single-node everything, (2) multi-node **proxy only** on MI300/MI350/MI355, (3) multi-node **proxy and SDMA** on MI450. |
+| `gin.get` | **Required in Stage 1** on both backends (single-node). |
+| AllContexts + `useWorldForFence` | AllContexts in **Stage 1**. `useWorldForFence` is **Stage 2** (proxy 2×2 on MI300/350/355) and **Stage 3** (SDMA 2×2 on MI450). |
+| Drain / flush bugs | **Fix on this ticket**, but Stage 1 only needs intra-node drain. Cross-node proxy drain is Stage 2; cross-node SDMA drain is Stage 3. |
 | Examples | **Leave as-is** (no example or README edits). Docs only in userguide + how-to. |
+| MI450 | Generally **no allocation**. Stage 3 is last; skip-gate only until hardware exists. |
 
-**Coverage target:** Standard on fence branches in `gin_barrier__funcs.h` / `barrier__funcs.h` (Put vs not, Get vs not, all-ctx vs single-ctx, `useWorldForFence` true/false).
+**Coverage target:** Standard on fence branches, accumulated across stages (Stage 1 does not need `useWorldForFence` true).
 
-**Merge bar (this PR):** Put + Get **PASS** on **Job A** (proxy, multi-node) and **Job B** (SDMA, single-node on MI300/MI350/MI355). AllContexts must not trap on those jobs. Hybrid world-fence: **proxy 2×2 only**.
+---
 
-**Out of merge bar:** **Job C** (SDMA multi-node on MI450). Hardware is generally unavailable. Land a GPU-family **SKIP** (not FAIL) for multi-node SDMA on MI300/350/355, note the MI450 gap in the PR, and do not block 1966 on Job C.
+## Work stages (execution order)
+
+Do **not** start Stage 2 until Stage 1 Put/Get/AllContexts pass on **one node** for **both** proxy and SDMA. Do **not** start Stage 3 until Stage 2 proxy multi-node is green on MI300/350/355.
+
+### Stage 1 — Single-node, all backends (NOW)
+
+**GPUs:** MI300 / MI350 / MI355 (MI450 single-node is nice-to-have, not required).  
+**Layout:** 1 node × ≥2 GPUs. `RCCL_ENABLE_INTRANET=1`. SDMA payload above threshold.
+
+**In scope**
+- Spike + tests: Put, self-put, Get, default `Put|Get`, AllContexts Put/Get
+- SDMA `ncclGinApi_Get` / `FlushAsync` / `Wait` so Get and AllContexts do not trap
+- Docs for fence-level choice (can land with Stage 1)
+- Existing Relaxed arrival tests still pass
+
+**Out of scope**
+- `useWorldForFence` / hybrid Put from a non-rail peer (world == LSA on one node)
+- Cross-node proxy or SDMA
+
+**Stage 1 merge bar:** visibility tests PASS with `NCCL_GIN_TYPE=2` and `=6` on one node. AllContexts does not trap.
+
+### Stage 2 — Multi-node proxy only (MI300 / MI350 / MI355)
+
+**After Stage 1 is green.** Same GPUs, ≥2 nodes, `NCCL_GIN_TYPE=2` only.
+
+**In scope**
+- Cross-node Put/Get drain over IB
+- Proxy 2×2 `useWorldForFence` / hybrid Put from a non-rail peer
+- Timeout + fence on the network path
+
+**Out of scope**
+- Multi-node SDMA on these GPUs — **SKIP** (unsupported). Do not treat that SKIP as a Stage 2 failure.
+
+### Stage 3 — Multi-node proxy and SDMA (MI450)
+
+**Last.** Needs MI450; **deferred** (no allocation for the most part).
+
+**In scope when hardware exists**
+- Repeat Stage 2 proxy on MI450
+- Multi-node SDMA Put/Get, AllContexts, `useWorldForFence` 2×2
+- Cross-node SDMA drain (not only local queue quiet)
+
+Until then: GPU-family SKIP for multi-node SDMA on MI300/350/355; do not block Stage 1 or 2.
+
+---
 
 ---
 
@@ -98,14 +143,13 @@ Do not paper over SDMA by routing AllContexts flush only through proxy.
 
 ## Phase 0 — PR test plan
 
-Write the test plan in the PR body (RCCL feature-unit-testing practice: do not commit `TEST_PLAN.md`).
+Write the test plan in the PR body (RCCL feature-unit-testing practice: do not commit `TEST_PLAN.md`). State the **three stages** and that only Stage 1 is the current bar.
 
 - Feature: bitmask fence on `ncclGinBarrierSession` / `ncclGinBarrier` / hybrid `ncclBarrierSession`.
-- Hardware:
-  - **Proxy:** ≥2 nodes, IB, `NCCL_CUMEM_ENABLE=1`, `NCCL_DMABUF_ENABLE=1`.
-  - **SDMA MI300 / MI350 / MI355:** **one node**, ≥2 (prefer 4–8) GPUs, `--rocshmem-gin`. Single-node GIN needs `RCCL_ENABLE_INTRANET=1`. Payload **>** `NCCL_GIN_ANVIL_SDMA_THRESHOLD`.
-  - **SDMA MI450 / Job C:** **Deferred.** We do not have MI450 for this PR in the normal case. Do not wait on Job C to merge. Tests must SKIP (not FAIL) multi-node SDMA on MI300/350/355 so a future MI450 run can enable Job C without rewriting tests.
-- Acceptance: Put + Get PASS on Job A + Job B. AllContexts does not trap. Hybrid world-fence PASS on proxy 2×2. Job C is not required to close 1966.
+- **Stage 1 hardware:** 1 node × ≥2 GPUs, MI300/350/355, `RCCL_ENABLE_INTRANET=1`, `NCCL_CUMEM_ENABLE=1`, `NCCL_DMABUF_ENABLE=1`. Run **both** `NCCL_GIN_TYPE=2` and `=6` (SDMA payload above threshold; `--rocshmem-gin` for SDMA).
+- **Stage 2 hardware (later):** ≥2 nodes, same GPUs, **proxy only**.
+- **Stage 3 hardware (last):** MI450 multi-node, proxy **and** SDMA. SKIP-gate now; no allocation required.
+- **Stage 1 acceptance:** Put + Get + AllContexts PASS on single-node proxy and SDMA. Do not require hybrid world-fence.
 
 ---
 
@@ -118,102 +162,95 @@ SDMA node support is **not** “always single-node.” It depends on the GPU:
 | MI300, MI350, MI355 | **Single-node only** | Intra-node Anvil SDMA + LSA/IPC. Multi-node SDMA is unsupported — SKIP, do not schedule as a failure. |
 | MI450 | **Single-node and multi-node** | Multi-node SDMA **not in this PR’s merge bar** (no MI450 allocation). Keep SKIP gates so Job C can run later without a test rewrite. |
 
-Proxy is multi-node on every GPU (IB host-proxy, not SDMA).
-
-| Backend + GPU | Layout | What it can prove |
-|---|---|---|
-| Proxy any GPU | 2 nodes × 1 GPU | Cross-node Put/Get drain over IB |
-| Proxy any GPU | 2 nodes × 2 GPUs | `useWorldForFence`; hybrid Put from a non-rail peer |
-| SDMA MI300/350/355 | 1 node × ≥2 GPUs | Intra-node Put/Get, AllContexts, self-put, threshold mix. World == LSA. |
-| SDMA MI450 | 1 node × ≥2 GPUs | Same intra-node contract as above |
-| SDMA MI450 | 2 nodes × 1 GPU | Cross-node SDMA Put/Get drain |
-| SDMA MI450 | 2 nodes × 2 GPUs | SDMA `useWorldForFence` / hybrid Put from a non-rail peer |
+| Backend + GPU | Layout | Stage | What it can prove |
+|---|---|---|---|
+| Proxy MI300/350/355 | 1 node × ≥2 GPUs | **1** | Intra-node Put/Get, AllContexts (intranet) |
+| SDMA MI300/350/355 | 1 node × ≥2 GPUs | **1** | Same; SDMA drain |
+| Proxy MI300/350/355 | 2 nodes × 1 GPU | **2** | Cross-node Put/Get over IB |
+| Proxy MI300/350/355 | 2 nodes × 2 GPUs | **2** | `useWorldForFence`; hybrid Put from a non-rail peer |
+| Proxy MI450 | 1 node / multi-node | **1** then **3** | Same as proxy above when hardware exists |
+| SDMA MI450 | 1 node × ≥2 GPUs | **1** | Same intra-node as MI300 SDMA |
+| SDMA MI450 | 2 nodes × 1 or 2×2 | **3** | Cross-node SDMA Put/Get and world-fence |
 
 Gate tests by **backend + GPU family + node count**, not a single `crossNodeReason()` for all SDMA. Suggested helper: skip multi-node SDMA unless the device is MI450 (detect via HIP arch / `hipGetDeviceProperties`). Single-node GIN still needs `intranetReason()`.
 
 ---
 
-## Phase 1 — Spike (first)
+## Spike (Stage 1 only — do this first)
 
-Same kernels, **separate jobs** (do not mix backends or unsupported SDMA topologies):
+**One node**, both backends. Do **not** allocate multi-node until Stage 1 is green.
 
 ```text
-# Job A — proxy, multi-node (any GPU; 2×1 then 2×2 for hybrid)
-NCCL_GIN_TYPE=2 NCCL_CUMEM_ENABLE=1 NCCL_DMABUF_ENABLE=1 NCCL_IB_MERGE_NICS=0
+# Single-node proxy (intranet)
+NCCL_GIN_TYPE=2 NCCL_CUMEM_ENABLE=1 NCCL_DMABUF_ENABLE=1 RCCL_ENABLE_INTRANET=1
 
-# Job B — SDMA, single node (MI300 / MI350 / MI355 / MI450; ≥2 GPUs)
+# Single-node SDMA
 NCCL_GIN_TYPE=6 NCCL_GIN_ANVIL_SDMA_THRESHOLD=128 NCCL_CUMEM_ENABLE=1 \
 NCCL_DMABUF_ENABLE=1 RCCL_ENABLE_INTRANET=1
 # Optional: NCCL_P2P_DISABLE=1 to keep traffic on GIN/SDMA rather than XGMI P2P.
-
-# Job C — SDMA, multi-node (MI450 only; skip on MI300/350/355)
-NCCL_GIN_TYPE=6 NCCL_GIN_ANVIL_SDMA_THRESHOLD=128 NCCL_CUMEM_ENABLE=1 \
-NCCL_DMABUF_ENABLE=1
 ```
 
-Kernels:
+Kernels (both backends):
 
 1. **Put visibility:** inbound `put` (no `waitSignal`), then `sync(..., Put)`, peer reads window.
 2. **Get visibility:** `gin.get`, then `sync(..., Get)`, local dest read (no extra `flush`).
 3. **AllContexts Put:** `put` on context 1, session on `ncclGinAllContexts`, `Put`.
 
-On **proxy 2×2** (any GPU) and **SDMA 2×2 on MI450 only**, add a fourth kernel: hybrid `ncclBarrierSession` + `Put` from a **non-rail** peer.
+No hybrid world-fence kernel in Stage 1.
 
-If MI450 is not available for this PR, Job C is deferred: land the skip gate, document it in the PR, and run Job A + B as the merge bar.
+Record per backend: pass / stale / hang / trap. SDMA Get + AllContexts are expected red until intra-node Get/FlushAsync/Wait exist.
 
-**Locked:** Job C is **out of merge bar**. Do not hold the spike or drain work for an MI450 node. If one appears later, run Job C as extra coverage, not as a 1966 blocker.
+**Stage 2 spike (later):** same kernels on ≥2 nodes, proxy only, MI300/350/355; plus hybrid Put from a non-rail peer on 2×2.
 
-Record per backend: pass / stale data / hang / trap. Ranking drives Phase 2 vs Phase 3 order. SDMA Get + AllContexts are still expected red until FlushAsync/Wait/Get exist.
+**Stage 3 spike (last):** same on MI450 multi-node for proxy and SDMA. SKIP-gate in tests from Stage 1 so this does not FAIL on MI300/350/355.
 
 ---
 
-## Phase 2 — SDMA drain (same ticket)
+## SDMA drain (Stage 1)
 
-Implement real Anvil ops instead of `__builtin_trap()`:
+Implement real Anvil ops instead of `__builtin_trap()` so **single-node** Get and AllContexts work:
 
 1. **`ncclGinApi_Get`** — SDMA/IPC copy in the reverse direction of Put (local dest, remote src). Must quiet or mark dirty so a later Flush sees it.
 2. **`ncclGinApi_FlushAsync` + `Wait`** — per-peer quiet of dirty SDMA channels (Flush already loops peers; FlushAsync should quiet **one** peer). AllContexts fence depends on this.
 
-Also verify **Put+signal ordering** (`fenceBeforeSignal` / quiet). Put-fence does **not** flush; it relies on the barrier **signal** not overtaking in-flight puts. If SDMA signals without quieting the queue, Put-fence is a data race even when Flush is correct.
+Also verify **Put+signal ordering** (`fenceBeforeSignal` / quiet). Put-fence does **not** flush; it relies on the barrier **signal** not overtaking in-flight puts.
 
-On **MI450**, Get/FlushAsync/Wait must complete for **cross-node** peers, not only intra-node IPC. That is future Job C; **this PR’s drain fix is signed off on single-node SDMA (Job B)**. Prefer implementations that are not intra-node-only (so Job C can pass later) but do not block merge on untested cross-node SDMA.
+Prefer drain that can later serve cross-node MI450 (Stage 3), but **Stage 1 sign-off is intra-node only**.
 
 ---
 
-## Phase 3 — Tests
+## Tests (land by stage)
 
-Follow `GinMPIDeviceTests`: MPI + GIN skip reasons, `EXPECT_` before barriers, broadcast SKIP, timeouts on waits. **One commit per test.** Keep old `Relaxed` arrival tests (`Relaxed` now means `None`).
+Follow `GinMPIDeviceTests`: MPI + GIN skip reasons, `EXPECT_` before barriers, broadcast SKIP, timeouts on waits. **One commit per test.** Keep old `Relaxed` arrival tests.
 
-Run matrix **proxy (multi-node) × SDMA (single-node on all Anvil GPUs) × SDMA (multi-node on MI450 only)**. Gate by GPU family: multi-node SDMA SKIP on MI300/350/355; `intranetReason()` on single-node. Skip a backend only if GIN cannot activate; never skip Get on a backend that compiled GIN.
+Write Stage 1 tests against the contract even while SDMA still traps. Gate Stage 2/3 layouts so they SKIP until those stages run — do not FAIL Stage 1 CI on missing multi-node.
 
-Write tests against the **contract** even while SDMA still traps; they are the regression net for the drain fix. Do not merge tests that only pass on proxy if SDMA is a release backend for this ticket.
-
-### Must-have
+### Stage 1 (single-node, proxy + SDMA)
 
 | Test | Layout | Asserts |
 |---|---|---|
-| `BarrierFence_Put_MakesInboundPutVisible` | Proxy: multi-node. SDMA: 1 node all Anvil GPUs; multi-node **MI450 only** | Data visible with no `waitSignal` |
-| `BarrierFence_Put_IncludesSelfPut` | Same | Self-put visible (`nPeerSigs = nRanks`) |
-| `BarrierFence_Get_MakesLocalGetVisible` | Same | Local dest valid after Get fence, no extra flush |
-| `BarrierFence_DefaultIsPutAndGet` | Same | `sync(coop, order)` with omitted fence |
-| `BarrierFence_AllContexts_Put` | Same | Put on ctx 1, AllContexts session |
-| `BarrierFence_AllContexts_Get` | Same | Get on non-zero ctx + AllContexts (forces FlushAsync/Wait) |
-| `BarrierSession_Hybrid_PutUsesWorldWhenNotRailed` | Proxy 2×2 any GPU; SDMA 2×2 **MI450 only** | Inbound put from **non-rail** peer visible; world handle selected |
+| `BarrierFence_Put_MakesInboundPutVisible` | 1 node, TYPE=2 and TYPE=6 | Data visible with no `waitSignal` |
+| `BarrierFence_Put_IncludesSelfPut` | Same | Self-put visible |
+| `BarrierFence_Get_MakesLocalGetVisible` | Same | Local dest valid after Get fence |
+| `BarrierFence_DefaultIsPutAndGet` | Same | Omitted fence argument |
+| `BarrierFence_AllContexts_Put` | Same | Put on ctx 1, AllContexts |
+| `BarrierFence_AllContexts_Get` | Same | Get on non-zero ctx + AllContexts |
 
-### Should-have
+Should-have in Stage 1: `Relaxed == None`; SDMA payload above and below threshold; four-rank Put **on one node**.
 
-- Compile-time `Relaxed == None`.
-- Timeout `sync(..., Put/Get, timeoutCycles)` so timeout is not Relaxed-only (`GinNcclTimeoutMPITests.cpp`).
-- Four-rank Put (peer rotation).
-- Payload **> threshold** and **< threshold** on SDMA.
+### Stage 2 (later — proxy multi-node, MI300/350/355)
 
-**Do not assert** “None leaves data invisible” (that is a race, not a guarantee).
+Same visibility tests with `crossNodeReason()` and `NCCL_GIN_TYPE=2`. Add `BarrierSession_Hybrid_PutUsesWorldWhenNotRailed` (2×2). Timeout + fence on IB. Multi-node SDMA: SKIP.
 
-Pattern: copy LSA visibility (`dErr` after barrier), not “kernel returned.”
+### Stage 3 (last — MI450 multi-node proxy + SDMA)
+
+Enable the Stage 2 tests for SDMA as well (GPU-family gate). Hybrid world-fence on SDMA 2×2.
+
+**Do not assert** “None leaves data invisible.” Copy LSA visibility (`dErr` after barrier), not “kernel returned.”
 
 ---
 
-## Phase 4 — Documentation (examples frozen)
+## Documentation (examples frozen; can land with Stage 1)
 
 - `projects/rccl/docs/userguide/source/api/device_gin.rst`: AllContexts constructors on the session; choosing None vs Put vs Get vs default; timeout + fence.
 - `projects/rccl/docs/userguide/source/usage/deviceapi.rst`: one sentence that the AlltoAll sample uses `None` **because** it already `waitSignal`s + `flush`es.
@@ -223,29 +260,28 @@ Do not treat `docs/contrib/GIN/...` as user docs unless already published.
 
 ---
 
-## Phase 5 — Hardware sign-off and JIRA close
+## Hardware sign-off
 
-| Run | Why |
-|---|---|
-| `GinMPIDeviceTests.Barrier*` + `BarrierFence_*` with `NCCL_GIN_TYPE=2`, ≥2 nodes | Proxy contract |
-| `NCCL_GIN_TYPE=6`, **1 node** (MI300/350/355/450), payload above threshold, `RCCL_ENABLE_INTRANET=1` | SDMA intra-node contract |
-| `NCCL_GIN_TYPE=6`, **≥2 nodes**, MI450 only | **Not required to close 1966.** SKIP on MI300/350/355; run later if MI450 appears. |
-| Timeout MPI with Put/Get | Composition |
-| `run-gin-ci.sh` proxy AlltoAll + `NCCL_GIN_TYPE=6` AlltoAll | No regression on `None` kernels |
-| Optional: `NCCL_GIN_NCONTEXTS>1` AllContexts | Multi-QP drain |
+| Stage | Run | Required to proceed |
+|---|---|---|
+| **1** | `BarrierFence_*` TYPE=2 and TYPE=6, **1 node**, intranet, MI300/350/355 | **Yes — current bar** |
+| **1** | `run-gin-ci.sh` proxy + SDMA AlltoAll on one node | Yes, no `None`-kernel regression |
+| **2** | Same tests TYPE=2, ≥2 nodes; hybrid 2×2 | After Stage 1 |
+| **3** | TYPE=2 and TYPE=6, ≥2 nodes, MI450 | Last; skip-gate until hardware |
 
-JIRA comment: backends, node layout, pass/fail, drain-fix summary.
+JIRA comments per stage: backends, node layout, pass/fail, drain-fix summary.
 
 ---
 
 ## Sequencing
 
 ```text
-Day 1–2   Spike: Job A (proxy multi-node) + Job B (SDMA single-node on MI300/350/355)
-          Job C deferred (no MI450)
-Day 2–N   SDMA Get + FlushAsync/Wait for the intra-node path
-          tests with MI450 multi-node SKIP gate
-Then      A+B green → docs → CI gin jobs → close 1966
+NOW     Stage 1 spike: single-node proxy + single-node SDMA (MI300/350/355)
+        Stage 1 drain: SDMA Get + FlushAsync/Wait
+        Stage 1 tests + skip gates for Stage 2/3 layouts
+        Docs can land here
+NEXT    Stage 2: multi-node proxy only on MI300/350/355 (incl. useWorldForFence)
+LAST    Stage 3: multi-node proxy + SDMA on MI450 (when allocation exists)
 ```
 
 Do not wait on a full coverage campaign before the spike. If Put is a no-op on AMD flush, more tests will all fail the same way.
@@ -254,8 +290,9 @@ Do not wait on a full coverage campaign before the spike. If Put is a no-op on A
 
 ## Risks
 
-- AllContexts on SDMA **must not** keep trapping; merge blocker.
-- Do not treat a passing **MI300/MI350/MI355** SDMA hybrid barrier as `useWorldForFence` coverage; those GPUs are single-node so world == LSA. MI450 multi-node SDMA is the SDMA world-fence sign-off.
+- AllContexts on SDMA **must not** keep trapping; **Stage 1** merge blocker.
+- Do not run or require multi-node (Stage 2/3) until Stage 1 is green.
+- Do not treat a passing **single-node** hybrid barrier as `useWorldForFence` coverage (world == LSA). That is Stage 2 (proxy 2×2) / Stage 3 (MI450 SDMA).
 - Hybrid Put on proxy 2×2 with **railed** contexts (`ginContextsRailed`) takes the rail path, not world. Tests should **observe** `useWorldForFence` (or equivalent handle/team) so a railed machine does not give a false pass.
 - SDMA fused-signal (`NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL`) is experimental; default **off** for fence tests unless an explicit fused-signal case is added later.
 - Default `Put\|Get` is a behavior change vs old `Relaxed` defaults. Callers who omit the argument now pay drain cost. Docs + default test must make that explicit. Examples stay on `None`/`Relaxed` by design.
@@ -281,6 +318,6 @@ Do not wait on a full coverage campaign before the spike. If Put is a no-op on A
 
 ## Why this shape
 
-The 2.30.7 change is **memory visibility**, not “barriers exist.” Arrival tests cannot catch a regression that turns Put into None. AllContexts and hybrid world-fence exist **only** to make Put/Get true across QPs and rails.
+AllContexts in Stage 1 proves multi-QP drain on one node. Hybrid world-fence waits for Stage 2 (proxy) and Stage 3 (SDMA on MI450).
 
-First concrete execution step: spike **Job A** (proxy, multi-node) + **Job B** (SDMA, single-node on MI300/350/355). Do not wait for MI450 / Job C.
+**Right now:** Stage 1 spike — **one node**, `NCCL_GIN_TYPE=2` and `=6`, MI300/350/355. No multi-node jobs until that is green.
