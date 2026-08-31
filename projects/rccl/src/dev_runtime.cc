@@ -26,6 +26,7 @@
 #include "gin/gin_host_anvil_sdma.h"
 #endif
 #include "argcheck.h"
+#include "alloc.h"
 #include <mutex>
 
 NCCL_PARAM(WinStride, "WIN_STRIDE", -1);
@@ -280,8 +281,17 @@ ncclResult_t ncclDevrFinalize(struct ncclComm* comm) {
       // so this is now expected to succeed. Surface failures instead of
       // masking with CUCHECKIGNORE — a regression in the drain path should
       // not be silently swallowed (AICOMRCCL-835).
-      CUdeviceptr flatAddr = reinterpret_cast<CUdeviceptr>(devr->lsaFlatBase);
-      CUCHECKGOTO(cuMemAddressFree(flatAddr, devr->lsaSize * devr->bigSize), fatalRet, cleanup);
+      //
+      // Except under rcclSkipCuMemFree(): that gfx950 workaround deliberately
+      // leaves the per-rank slices mapped, so freeing the flat VA here faults.
+      // Leak the aperture instead; the OS reclaims it at process exit.
+      if (rcclSkipCuMemFree()) {
+        INFO(NCCL_ALLOC, "ncclDevrFinalize: Skipping lsaFlatBase address free (NCCL_CUMEM_SKIP_FREE)");
+        devr->lsaFlatBase = nullptr;
+      } else {
+        CUdeviceptr flatAddr = reinterpret_cast<CUdeviceptr>(devr->lsaFlatBase);
+        CUCHECKGOTO(cuMemAddressFree(flatAddr, devr->lsaSize * devr->bigSize), fatalRet, cleanup);
+      }
     }
     ncclSpaceDestruct(&devr->bigSpace);
   }
@@ -816,6 +826,10 @@ static void symMemoryDestroy(struct ncclComm* comm, struct ncclDevrMemory* mem) 
     for (struct ncclDevrTeam* t = devr->teamHead; t != nullptr; t = t->next) {
       symUnbindTeamMemory(comm, t, mem);
     }
+    // gfx950: cuMemUnmap of LSA flat slices can hang or fault during symmetric
+    // window teardown; skip peer-aperture unmap when NCCL_CUMEM_SKIP_FREE is
+    // active (auto on gfx950) and release handle refs below instead.
+    const bool skipLsaUnmap = rcclSkipCuMemFree();
     for (int r = 0; r < devr->lsaSize; r++) {
       uintptr_t base = reinterpret_cast<uintptr_t>(devr->lsaFlatBase);
       uintptr_t addr = base + r * devr->bigSize + mem->bigOffset;
@@ -823,7 +837,9 @@ static void symMemoryDestroy(struct ncclComm* comm, struct ncclDevrMemory* mem) 
         CUdeviceptr tmpBase;
         size_t tmpBaseSize;
         CUCHECKIGNORE(cuMemGetAddressRange(&tmpBase, &tmpBaseSize, reinterpret_cast<CUdeviceptr>(addr)));
-        CUCHECKIGNORE(cuMemUnmap(reinterpret_cast<CUdeviceptr>(addr), tmpBaseSize));
+        if (!skipLsaUnmap) {
+          CUCHECKIGNORE(cuMemUnmap(reinterpret_cast<CUdeviceptr>(addr), tmpBaseSize));
+        }
         addr = addr + tmpBaseSize;
       }
     }
