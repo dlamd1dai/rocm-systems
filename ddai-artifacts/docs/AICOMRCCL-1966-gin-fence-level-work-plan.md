@@ -172,7 +172,7 @@ Implement real Anvil ops instead of `__builtin_trap()`:
 
 Also verify **Put+signal ordering** (`fenceBeforeSignal` / quiet). Put-fence does **not** flush; it relies on the barrier **signal** not overtaking in-flight puts. If SDMA signals without quieting the queue, Put-fence is a data race even when Flush is correct.
 
-Proxy: only touch if spike shows Get/Flush do not actually drain.
+On **MI450**, Get/FlushAsync/Wait must complete for **cross-node** peers, not only intra-node IPC. A drain that only quiets local SDMA queues will pass Job B and fail Job C.
 
 ---
 
