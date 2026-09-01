@@ -307,9 +307,15 @@ RUN sed -i 's/^__device__ cluster_group this_cluster() {/__device__ inline clust
  && grep -q '^__device__ inline cluster_group this_cluster() {' \
       /opt/rocm/include/hip/amd_detail/amd_hip_cooperative_groups.h
 
+# GENERATE_SYM_KERNELS=OFF: the symmetric ReduceScatter_RailA2A_LsaLD kernels call GIN
+# through rocSHMEM's IB path, but this image builds rocSHMEM SDMA/GDA-only, so
+# QueuePair::put_nbi and ::atomic_add are undefined at the -fgpu-rdc device link.  The GIN
+# collectives under test use their own kernels in rccl-tests and do not need symmetric
+# kernels; set to ON only with a rocSHMEM build that provides the IB device backend.
+ARG GENERATE_SYM_KERNELS=OFF
 RUN cd rccl/src/projects/rccl \
  && ./install.sh --amdgpu_targets=${GPU_TARGETS} --prefix=${RCCL_INSTALL_PREFIX} --no-device-linker --no_clean \
-      --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem" \
+      --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DGENERATE_SYM_KERNELS=${GENERATE_SYM_KERNELS} -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem" \
       $([ "${DEBUG_BUILD}" = "1" ] && echo "--debug")
 
 # Workaround: hipify renames core.h->core_tmp.h but gin headers still include ../core.h
