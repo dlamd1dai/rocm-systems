@@ -297,6 +297,16 @@ RUN cd rccl/src/projects/rccl \
  && sed -i \
        's/if (comm->enableRocshmem && comm->nNodes > 1 && (comm->nRanks\/comm->nNodes == 8) && comm->rocshmemThreshold <= 1048576)/if (comm->enableRocshmem)/' \
        src/rccl_wrap.cc
+
+# ROCm 7.13.0-2 declares this_cluster() as a non-inline __device__ function, so every
+# translation unit including the header emits a definition. ENABLE_ROCSHMEM_GIN forces
+# -fgpu-rdc, and the offload linker then rejects librccl (enqueue.cc and the generated
+# ce_reduce kernels both include it) with a duplicate symbol.
+RUN sed -i 's/^__device__ cluster_group this_cluster() {/__device__ inline cluster_group this_cluster() {/' \
+      /opt/rocm/include/hip/amd_detail/amd_hip_cooperative_groups.h \
+ && grep -q '^__device__ inline cluster_group this_cluster() {' \
+      /opt/rocm/include/hip/amd_detail/amd_hip_cooperative_groups.h
+
 RUN cd rccl/src/projects/rccl \
  && ./install.sh --amdgpu_targets=${GPU_TARGETS} --prefix=${RCCL_INSTALL_PREFIX} --no-device-linker --no_clean \
       --cmake-options "-DENABLE_ROCSHMEM_GIN=ON -DROCSHMEM_INSTALL_DIR=${ROCSHMEM_INSTALL_DIR} -DROCSHMEM_SOURCE_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem -DROCSHMEM_BUILD_DIR=${WORKDIR}/rocshmem/src/projects/rocshmem/build/include/rocshmem" \
