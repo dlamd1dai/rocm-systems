@@ -327,8 +327,8 @@ testResult_t AllGatherDeviceTime(struct threadArgs* args, ncclDataType_t type, n
   if (count == 0 || devtimeLoop < 1) return testSuccess;
 
   const size_t chunkBytes = gin_sdma_allgather::chunkBytes(count, (size_t)wordSize(type));
-  int loop = devtimeLoop;
-  int skip = devtimeSkip < 0 ? 0 : devtimeSkip;
+  int loop = 0;
+  int skip = 0;
   gin_devtime::resolveLoopSkip(chunkBytes, loop, skip);
 
   auto kernel = SPECIALIZE_KERNEL(GinHybridAllGatherTimedKernel, type, op);
@@ -357,7 +357,7 @@ testResult_t AllGatherDeviceTime(struct threadArgs* args, ncclDataType_t type, n
 
   if (args->proc == 0 && args->thread == 0 && devUs > 0.0) {
     int nRanksGlobal = args->nProcs * args->nThreads * args->nGpus;
-    const size_t totalBytes = gin_sdma_allgather::chunkBytes(count, (size_t)wordSize(type)) * (size_t)nRanksGlobal;
+    const size_t totalBytes = chunkBytes * (size_t)nRanksGlobal;
     double sec = devUs * 1.0e-6;
     double algBw = 0.0, busBw = 0.0;
     gin_sdma_allgather::bandwidthGBps(count, (size_t)wordSize(type), sec, nRanksGlobal, &algBw, &busBw);
