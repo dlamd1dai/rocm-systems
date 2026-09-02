@@ -1,7 +1,7 @@
 #! /usr/bin/env bash
 # Single-node GIN-SDMA AllGather perf harness (docker, non-Ruby).
 # Companion to gin-sdma-a2a-test.bash for the GIN Anvil-SDMA hybrid AllGather
-# (all_gather_perf -D 3, NCCL_GIN_TYPE=5): LSA-direct peer stores for per-rank
+# (all_gather_perf -D 3, NCCL_GIN_TYPE=6): LSA-direct peer stores for per-rank
 # chunks <= AG_THRESHOLD, all-peers GIN puts (SDMA copy engines) above it.
 # Usage: ./gin-sdma-ag-test.bash [NP] [MAX_BYTES]
 # Tests: #0 host baseline (-D 0), #3 GIN Anvil-SDMA (-D 3). Select via RUN_TESTS.
@@ -356,7 +356,7 @@ if _run_test 0; then
 fi
 
 # --- Test#3: GIN Anvil-SDMA hybrid AllGather (all_gather_perf -D 3) ---
-# GinHybridAllGatherKernel (NCCL_GIN_TYPE=5): per-rank chunk <= AG_THRESHOLD uses
+# GinHybridAllGatherKernel (NCCL_GIN_TYPE=6): per-rank chunk <= AG_THRESHOLD uses
 # a direct LSA all-peers store (xGMI); above it uses one-round all-peers
 # gin.put (Anvil-SDMA copy engines). The kernel SELF-SELECTS a size-adaptive CTA
 # count decoupled from -V: ~16 CTAs for the LSA-direct tier
@@ -396,14 +396,14 @@ if _run_test 3; then
       -x ROCSHMEM_SDMA_ENABLED=0 \
       -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
       -x NCCL_GIN_ENABLE=1 \
-      -x NCCL_GIN_TYPE=5 \
+      -x NCCL_GIN_TYPE=6 \
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
       "${TEST3_MPI_EXTRA[@]}" \
       rccl-tests/all_gather_perf -b "${MIN_BYTES}" -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -d "${AG_DTYPE}" \
       -A 1 -w "${AG_WARMUP}" -n "${AG_ITERS}" 2>&1 | tee "$1"
     return "${PIPESTATUS[0]}"
   }
-  echo "=== Test#3: AllGather, ${NP} gpus, GIN Anvil-SDMA -D 3 hybrid (LSA<=${AG_THRESHOLD}B/rank, SDMA above; adaptive CTAs, NCCL_GIN_TYPE=5, ${MIN_BYTES}..${MAX_BYTES}) ==="
+  echo "=== Test#3: AllGather, ${NP} gpus, GIN Anvil-SDMA -D 3 hybrid (LSA<=${AG_THRESHOLD}B/rank, SDMA above; adaptive CTAs, NCCL_GIN_TYPE=6, ${MIN_BYTES}..${MAX_BYTES}) ==="
   _ag_log="$(mktemp)"
   _ag_rc=1
   for _try in $(seq 1 "${GIN_CONN_RETRIES}"); do
