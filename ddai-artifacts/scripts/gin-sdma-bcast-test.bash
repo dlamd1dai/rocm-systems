@@ -295,6 +295,18 @@ _run() {
   fi
 }
 
+# True when $1 is an executable in the same context _run would exec it in, so a
+# relative path resolves against the same working directory _run would use.
+_run_has() {
+  if [[ -n "${_SRC_CID}" ]]; then
+    ${DOCKER_CMD} exec "${_SRC_CID}" sh -c 'test -x "$1"' _ "$1" >/dev/null 2>&1
+  elif [[ "${USE_DOCKER}" == "1" ]]; then
+    ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" sh -c 'test -x "$1"' _ "$1" >/dev/null 2>&1
+  else
+    [[ -x "$1" ]]
+  fi
+}
+
 # Append broadcast_perf CLI flags for in-kernel device timing when BC_C2_DEVICE_TIMING != 0.
 BC_C2_DEVTIME_CLI=()
 _build_bc_c2_devtime_cli() {
@@ -425,15 +437,22 @@ _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
 _src_mount_setup
 
-# --- UT: GIN-SDMA Broadcast policy host unit test (no GPU); hard preflight gate ---
+# --- UT: GIN-SDMA Broadcast policy host unit test (no GPU); preflight gate ---
 # Validates the tier-selection / threshold / chunk logic in gin_sdma_broadcast_policy.h
 # that broadcast.cu relies on. Fast, GPU-free; set RUN_POLICY_UT=0 to skip.
 # Default path matches the RCCL install.sh build tree in the GIN docker image
 # (/workspace/rccl/src/projects/rccl/build/release/test/...). Override POLICY_UT
 # for bare-metal runs (e.g. rccl/build/release/test/rccl-UnitTestsGinSdmaBroadcastPolicy).
+# Images built without the RCCL test tree (rccl-gin-gda-sdma-713 among them) do not
+# carry the binary at all. Missing binary warns and skips; a binary that runs and
+# fails is still fatal, so the gate keeps its teeth wherever the UT does exist.
 POLICY_UT="${POLICY_UT:-rccl/src/projects/rccl/build/release/test/rccl-UnitTestsGinSdmaBroadcastPolicy}"
 if [[ "${RUN_POLICY_UT:-1}" != "0" ]]; then
-  _run "${POLICY_UT}" || { echo "FATAL: GIN-SDMA Broadcast policy unit test failed (${POLICY_UT})"; exit 1; }
+  if _run_has "${POLICY_UT}"; then
+    _run "${POLICY_UT}" || { echo "FATAL: GIN-SDMA Broadcast policy unit test failed (${POLICY_UT})"; exit 1; }
+  else
+    echo "WARN: GIN-SDMA Broadcast policy unit test skipped (${POLICY_UT} not found; image lacks the RCCL test build). Build it or set POLICY_UT=<path>; RUN_POLICY_UT=0 silences this."
+  fi
 fi
 
 # --- BC-C1: host-initiated ncclBroadcast (-D 0, no GIN); runs first (hard gate) ---
