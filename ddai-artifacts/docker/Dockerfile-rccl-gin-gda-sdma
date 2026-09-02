@@ -74,7 +74,7 @@ RUN apt-get install -y --no-install-recommends \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Newest rdma-core / libmlx5 from distro updates (base pocket can lag). RCCL GIN Anvil SDMA
-# (NCCL_GIN_TYPE=6) dlopens MLX5_1.25 symbols (mlx5dv_reg_dmabuf_mr, mlx5dv_get_data_direct_sysfs_path).
+# (NCCL_GIN_TYPE=5) dlopens MLX5_1.25 symbols (mlx5dv_reg_dmabuf_mr, mlx5dv_get_data_direct_sysfs_path).
 RUN . /etc/os-release \
  && apt-get update \
  && ( apt-get install -y --no-install-recommends \
