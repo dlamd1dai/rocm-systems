@@ -57,6 +57,19 @@ HOST_MAX_BYTES="${HOST_MAX_BYTES:-${MAX_BYTES}}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-gda-sdma-713}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 USE_DOCKER="${USE_DOCKER:-1}"
+# SRC_MOUNT=<worktree> rebuilds broadcast_perf from that checkout before testing,
+# instead of trusting the binary baked into ${DOCKER_IMAGE}. Without it the gate
+# silently measures whatever source the image was built from, which can be weeks
+# stale -- every run below execs a binary out of the image and nothing ever
+# recompiles. Point it at a git worktree of the branch under test:
+#   SRC_MOUNT=/tmp/bc-wt ./gin-sdma-bcast-test.bash 8 128M
+# The rebuild happens once in a persistent container that every _run then execs
+# into (a fresh `docker run --rm` per invocation would throw the build away).
+# Note the build target must be broadcast_perf, not hipify: hipify only covers
+# the shared common.* sources, so building it leaves src/hipify/broadcast.cu.cpp
+# on the image's original copy and the rebuild appears to succeed while changing
+# nothing.
+SRC_MOUNT="${SRC_MOUNT:-}"
 HOST_RANKS="${HOST_RANKS:-0}"     # -R register mode for host path (0 = none)
 GIN_RANKS="${GIN_RANKS:-2}"       # -R register mode for GIN path (2 = symmetric, REQUIRED for -D 3)
 # BC-C2 runs the -D 3 hybrid with a size-adaptive CTA grid (decoupled from -V, like
@@ -225,9 +238,57 @@ MPI_BASE_HOST=(
   -x NCCL_GIN_TYPE=0
 )
 
+# Container id for SRC_MOUNT mode; empty means the stateless `docker run` path.
+_SRC_CID=""
+
+_src_mount_cleanup() {
+  [[ -n "${_SRC_CID}" ]] && ${DOCKER_CMD} rm -f "${_SRC_CID}" >/dev/null 2>&1
+  return 0
+}
+
+# Bring up the persistent container and rebuild broadcast_perf from SRC_MOUNT.
+# Only the files that actually differ are copied, so the incremental build stays
+# short instead of retouching every mtime in the tree.
+_src_mount_setup() {
+  [[ -z "${SRC_MOUNT}" || "${USE_DOCKER}" != "1" ]] && return 0
+  if [[ ! -d "${SRC_MOUNT}/projects/rccl-tests/src" ]]; then
+    echo "FATAL: SRC_MOUNT='${SRC_MOUNT}' is not a rocm-systems checkout" >&2
+    exit 1
+  fi
+  echo "=== SRC_MOUNT: rebuilding broadcast_perf from ${SRC_MOUNT} ==="
+  echo "    source HEAD: $(git -C "${SRC_MOUNT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  trap _src_mount_cleanup EXIT
+  # ${DOCKER_GPU} already carries --rm, so the container disappears when removed.
+  _SRC_CID="$(${DOCKER_CMD} run -d ${DOCKER_GPU} -v "${SRC_MOUNT}":/src:ro \
+                --entrypoint sleep "${DOCKER_IMAGE}" infinity)" || {
+    echo "FATAL: could not start SRC_MOUNT container" >&2; exit 1; }
+
+  ${DOCKER_CMD} exec "${_SRC_CID}" bash -c '
+    set -e
+    dst=/workspace/rccl/src/projects/rccl-tests/src
+    changed=0
+    for f in /src/projects/rccl-tests/src/*; do
+      b=$(basename "$f")
+      [ -f "$f" ] || continue
+      if ! cmp -s "$f" "$dst/$b"; then cp "$f" "$dst/$b"; echo "  updated $b"; changed=1; fi
+    done
+    [ "$changed" = 0 ] && echo "  (image source already matches SRC_MOUNT)"
+    # broadcast_perf, NOT hipify -- see the SRC_MOUNT note at the top of this script.
+    cmake --build /workspace/rccl-tests --target broadcast_perf -j "$(nproc)" 2>&1 \
+      | grep -E "Hipifying|Built target broadcast_perf|error:" || true
+  ' || { echo "FATAL: SRC_MOUNT rebuild failed" >&2; exit 1; }
+
+  # Fail loudly rather than silently measure the pre-existing binary.
+  ${DOCKER_CMD} exec "${_SRC_CID}" test -x /workspace/"${BROADCAST_PERF}" || {
+    echo "FATAL: ${BROADCAST_PERF} missing after SRC_MOUNT rebuild" >&2; exit 1; }
+  echo "=== SRC_MOUNT: rebuild complete ==="
+}
+
 _run() {
   echo "=== $* ==="
-  if [[ "${USE_DOCKER}" == "1" ]]; then
+  if [[ -n "${_SRC_CID}" ]]; then
+    ${DOCKER_CMD} exec "${_SRC_CID}" "$@"
+  elif [[ "${USE_DOCKER}" == "1" ]]; then
     ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" "$@"
   else
     "$@"
@@ -323,6 +384,11 @@ BC_C1_STATUS="skipped"
 BC_C2_LARGE_STATUS="skipped"
 
 echo "Broadcast gate: NP=${NP} host=${_HOST} root=${ROOT}"
+if [[ -n "${SRC_MOUNT}" ]]; then
+  echo "  source:      ${SRC_MOUNT} (rebuilt into ${DOCKER_IMAGE})"
+elif [[ "${USE_DOCKER}" == "1" ]]; then
+  echo "  source:      baked into ${DOCKER_IMAGE} -- NOT rebuilt; set SRC_MOUNT=<worktree> to test working-tree code"
+fi
 if [[ "${RUN_HOST_BASELINE}" != "0" ]]; then
   echo "  BC-C1 host:  ${MIN_BYTES} .. ${HOST_MAX_BYTES_EFFECTIVE} (mode=${BC_C1_MODE}: default<=$(_format_bytes "${BC_C1_SPLIT1}") | Ring/LL128 | Ring/Simple>$(_format_bytes "${BC_C1_SPLIT2}"), ${BC_C1_NCHANNELS}ch)"
 else
@@ -357,6 +423,7 @@ fi
 
 _docker_cleanup_stale
 _maybe_gpu_reset_before_gate
+_src_mount_setup
 
 # --- UT: GIN-SDMA Broadcast policy host unit test (no GPU); hard preflight gate ---
 # Validates the tier-selection / threshold / chunk logic in gin_sdma_broadcast_policy.h
