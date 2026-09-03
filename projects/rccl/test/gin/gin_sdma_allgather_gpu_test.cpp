@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -19,19 +19,24 @@
 //
 // The addressing kernel below is the pointer-arithmetic core of AllGatherLsaDirect
 // with the GIN window peer pointers replaced by plain device buffers, so it needs
-// neither librccl nor a GIN communicator and runs on any single GPU. The full
-// GIN put/signal path and end-to-end datacheck are covered separately by
-// all_gather_perf -D 3 in gin-sdma-ag-test.bash.
+// neither librccl nor a GIN communicator and runs on any single GPU. Crucially it
+// derives the per-rank recv-slice offset from the SAME shared helper the production
+// kernel uses (gin_sdma_allgather::allGatherRecvSliceOffset), so a wrong slice
+// formula now breaks this test rather than only being self-consistent. What it does
+// NOT cover is the GIN window resolution itself (ncclGetLsaPointer / recvoffset),
+// which needs a live communicator; the full GIN put/signal path and end-to-end
+// datacheck are covered separately by all_gather_perf -D 3 in gin-sdma-ag-test.bash.
 //
 // Requires a visible GPU at run time; skips cleanly (GTEST_SKIP) otherwise, so it
 // carries a "gpu" label alongside "unit".
 
 #include <gtest/gtest.h>
-#include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+
+#include <hip/hip_runtime.h>
 
 #include "gin_sdma_allgather_policy.h"
 
@@ -62,6 +67,12 @@ __global__ void tierKernel(const uint64_t* chunk, const uint64_t* thr, uint8_t* 
 
 TEST(AllGatherGpu, TierPredicateMatchesHost) {
   if (!gpuAvailable()) GTEST_SKIP() << "no visible GPU";
+
+  // Absolute semantics at the compiled default crossover (not just host/device parity).
+  EXPECT_TRUE(gin_sdma_allgather::chunkUsesLsaTier(
+      32768, gin_sdma_allgather::kAllGatherSdmaThresholdDefault));
+  EXPECT_FALSE(gin_sdma_allgather::chunkUsesLsaTier(
+      32769, gin_sdma_allgather::kAllGatherSdmaThresholdDefault));
 
   std::vector<uint64_t> chunk, thr;
   const uint64_t thresholds[] = {0, 128, 2097152, 16777216};
@@ -118,8 +129,9 @@ __global__ void agLsaDirectSimKernel(const T* send, T* recv, int nRanks, size_t 
   for (size_t w = tid; w < total; w += nthreads) {
     const int r = (int)(w / count);
     const size_t i = w % count;
-    const size_t dstOff = (size_t)r * count;
-    const T value = send[r * count + i];
+    // Shared with production AllGatherLsaDirect: rank r's slice within each peer.
+    const size_t dstOff = gin_sdma_allgather::allGatherRecvSliceOffset(r, count);
+    const T value = send[dstOff + i];
     for (int lp = 0; lp < nRanks; ++lp) {
       T* dst = recv + (size_t)lp * total + dstOff;
       dst[i] = value;
@@ -133,9 +145,10 @@ void runGatherAddressingCase(int nRanks, size_t count) {
   const size_t recvElts = (size_t)nRanks * perPeer;
 
   std::vector<T> send((size_t)nRanks * count);
-  for (int r = 0; r < nRanks; ++r)
+  for (int r = 0; r < nRanks; ++r) {
     for (size_t i = 0; i < count; ++i)
       send[r * count + i] = (T)((r * 1315423911u + (uint32_t)i) & 0x7f);  // fits int8..double
+  }
 
   T *dSend = nullptr, *dRecv = nullptr;
   HIP_OK(hipMalloc(&dSend, send.size() * sizeof(T)));

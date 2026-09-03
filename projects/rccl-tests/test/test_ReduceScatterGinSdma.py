@@ -41,7 +41,7 @@
 #   RCCL_TESTS_RS_XENV           extra "-x K=V" env the backend needs
 #   RCCL_TESTS_RS_EXE            path to reduce_scatter_perf
 #   RCCL_TESTS_RS_CTAS           device CTA pool (-V) (default: 8)
-#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 6, matches gin-tests.json)
+#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 5, Anvil-SDMA on NCCL 2.30.7)
 #   RCCL_TESTS_RS_TIMEOUT_S      per-run hang timeout seconds (default: 900)
 #   RCCL_TESTS_RS_CONN_RETRIES   connectivity-gate re-launches (default: 5)
 
@@ -76,7 +76,7 @@ if RS_NP <= 0:
 
 RS_LAUNCHER = os.environ.get("RCCL_TESTS_MPI_LAUNCHER", "mpirun")
 RS_CTAS = os.environ.get("RCCL_TESTS_RS_CTAS", "8")
-RS_GIN_TYPE = os.environ.get("RCCL_TESTS_RS_GIN_TYPE", "6")
+RS_GIN_TYPE = os.environ.get("RCCL_TESTS_RS_GIN_TYPE", "5")
 RS_TIMEOUT_S = int(os.environ.get("RCCL_TESTS_RS_TIMEOUT_S", "900"))
 RS_CONN_RETRIES = int(os.environ.get("RCCL_TESTS_RS_CONN_RETRIES", "5"))
 RS_MPI_OPTS = shlex.split(os.environ.get("RCCL_TESTS_MPI_OPTS", ""))

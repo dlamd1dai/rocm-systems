@@ -1,5 +1,5 @@
 /*************************************************************************
- * Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
  * See LICENSE.txt for license information
  ************************************************************************/
@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 
 #define GIN_SDMA_HOST_ONLY 1
@@ -89,10 +90,16 @@ TEST(AllGatherPolicyThreshold, GlobalUsedWhenNoPerCollective) {
   EXPECT_EQ(pickSdmaThreshold(false, 0, true, 65536, kAllGatherSdmaThresholdDefault), 65536u);
 }
 
+TEST(AllGatherPolicyThreshold, DefaultCrossoverAt32KiB) {
+  EXPECT_TRUE(chunkUsesLsaTier(32768, kAllGatherSdmaThresholdDefault));
+  EXPECT_FALSE(chunkUsesLsaTier(32769, kAllGatherSdmaThresholdDefault));
+}
+
 TEST(AllGatherPolicyThreshold, CompiledDefaultWhenNothingSet) {
+  // Behavioral: with nothing set, resolution returns the compiled default (rather
+  // than mirroring the constant's value, which only trips on a deliberate renumber).
   EXPECT_EQ(pickSdmaThreshold(false, 0, false, 0, kAllGatherSdmaThresholdDefault),
             kAllGatherSdmaThresholdDefault);
-  EXPECT_EQ(kAllGatherSdmaThresholdDefault, 32768u);  // tuned MI355X crossover
 }
 
 TEST(AllGatherPolicyThreshold, ExplicitZeroIsHonored) {
@@ -107,6 +114,69 @@ TEST(AllGatherPolicyThreshold, LargeValueDoesNotWrap) {
   const unsigned long long big = 4ull * 1024 * 1024 * 1024;  // 4 GiB
   EXPECT_EQ(pickSdmaThreshold(true, big, false, 0, kAllGatherSdmaThresholdDefault),
             (size_t)big);
+}
+
+// ---- allGatherCtas: size-adaptive ladder, clamped to the launched pool --------
+// The launched grid must never exceed the barrier/lsaBarrier/signal pool the kernel
+// indexes by blockIdx.x. allGatherPoolCtas() == that pool (max(-V, ladder peak));
+// each allGatherCtas() result is a grid that must fit inside it.
+
+TEST(AllGatherPolicyCtas, LsaTierUsesLsaCtaCount) {
+  const int pool = allGatherPoolCtas(16);  // pool covers the ladder peak
+  // chunk <= threshold -> LSA-direct tier -> kAllGatherCtasLsa.
+  EXPECT_EQ(allGatherCtas(0, 32768, kAllGatherCtasUnset, pool), kAllGatherCtasLsa);
+  EXPECT_EQ(allGatherCtas(32768, 32768, kAllGatherCtasUnset, pool), kAllGatherCtasLsa);  // boundary
+  EXPECT_EQ(allGatherCtas(1024, 32768, kAllGatherCtasUnset, pool), kAllGatherCtasLsa);
+}
+
+TEST(AllGatherPolicyCtas, SdmaTierUsesSdmaCtaCount) {
+  const int pool = allGatherPoolCtas(16);
+  // chunk > threshold -> GIN-put/SDMA tier -> kAllGatherCtasSdma (few CTAs).
+  EXPECT_EQ(allGatherCtas(32769, 32768, kAllGatherCtasUnset, pool), kAllGatherCtasSdma);
+  EXPECT_EQ(allGatherCtas(64ull * 1024 * 1024, 32768, kAllGatherCtasUnset, pool), kAllGatherCtasSdma);
+}
+
+TEST(AllGatherPolicyCtas, TracksThresholdOverride) {
+  const int pool = allGatherPoolCtas(16);
+  // The ladder keys off the SAME predicate as the kernel, so a moved crossover
+  // moves the CTA choice: at threshold 0 (all-SDMA) any non-empty chunk is SDMA;
+  // at a huge threshold (all-LSA) even a large chunk is LSA.
+  EXPECT_EQ(allGatherCtas(1, 0, kAllGatherCtasUnset, pool), kAllGatherCtasSdma);
+  EXPECT_EQ(allGatherCtas(64ull * 1024 * 1024, 1ull << 40, kAllGatherCtasUnset, pool), kAllGatherCtasLsa);
+}
+
+TEST(AllGatherPolicyCtas, EnvPinHonoredWithinPool) {
+  const int pool = allGatherPoolCtas(/*deviceCtaCount=*/64);  // 64 slots
+  // A set env value pins a fixed count for both tiers, as long as it fits the pool.
+  EXPECT_EQ(allGatherCtas(1024, 32768, 8, pool), 8);            // LSA size, pinned 8
+  EXPECT_EQ(allGatherCtas(64ull << 20, 32768, 8, pool), 8);     // SDMA size, pinned 8
+  // An env of 0 is "not pinned" -> fall back to the size-adaptive ladder.
+  EXPECT_EQ(allGatherCtas(1024, 32768, 0, pool), kAllGatherCtasLsa);
+}
+
+TEST(AllGatherPolicyCtas, EnvPinClampedToPool) {
+  // A pin larger than the pool is clamped to the pool (not the old fixed 128), so
+  // -V governs the real ceiling and the pin can never index past the pool.
+  EXPECT_EQ(allGatherCtas(1024, 32768, /*pin=*/1000, allGatherPoolCtas(16)), 16);
+  EXPECT_EQ(allGatherCtas(1024, 32768, /*pin=*/1000, allGatherPoolCtas(64)), 64);
+}
+
+TEST(AllGatherPolicyCtas, GridNeverExceedsPool) {
+  // Regression for the OOB the env pin used to allow: for ANY chunk, tier, -V, and
+  // env pin (including absurd ones), the launched grid stays within [1, pool].
+  const size_t chunks[] = {0, 1024, 32768, 32769, 64ull << 20};
+  const int deviceVs[] = {1, 4, 16, 32, 128};
+  const size_t pins[]  = {kAllGatherCtasUnset, 0, 1, 8, 200, 100000};
+  for (int v : deviceVs) {
+    const int pool = allGatherPoolCtas(v);
+    for (size_t c : chunks) {
+      for (size_t pin : pins) {
+        const int g = allGatherCtas(c, 32768, pin, pool);
+        EXPECT_GE(g, 1);
+        EXPECT_LE(g, pool) << "chunk=" << c << " V=" << v << " pin=" << pin;
+      }
+    }
+  }
 }
 
 // ---- bandwidthGBps: algBw counts all ranks, busBw applies (n-1)/n ------------
@@ -128,6 +198,43 @@ TEST(AllGatherPolicyBandwidth, NullPointersAreSafe) {
   double alg = -1.0;
   bandwidthGBps(1000, 4, 0.5, 4, &alg, nullptr);
   EXPECT_GT(alg, 0.0);
+}
+
+// ---- host env resolution (resolveSdmaThresholdFromEnv, parseAllGatherCtasEnv) --
+
+TEST(AllGatherPolicyEnv, ResolveThresholdFromEnv) {
+  unsetenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER");
+  unsetenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
+  EXPECT_EQ(resolveSdmaThresholdFromEnv(), kAllGatherSdmaThresholdDefault);
+
+  setenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD", "4096", 1);
+  unsetenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER");
+  EXPECT_EQ(resolveSdmaThresholdFromEnv(), 4096u);
+
+  setenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER", "8192", 1);
+  EXPECT_EQ(resolveSdmaThresholdFromEnv(), 8192u);
+
+  unsetenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD");
+  unsetenv("NCCL_GIN_ANVIL_SDMA_THRESHOLD_ALLGATHER");
+}
+
+TEST(AllGatherPolicyEnv, ParseAllGatherCtasEnv) {
+  unsetenv("NCCL_GIN_ANVIL_SDMA_ALLGATHER_CTAS");
+  unsetenv("NCCL_GIN_ANVIL_AG_CTAS");
+  EXPECT_EQ(parseAllGatherCtasEnv(), kAllGatherCtasUnset);
+
+  setenv("NCCL_GIN_ANVIL_SDMA_ALLGATHER_CTAS", "8", 1);
+  EXPECT_EQ(parseAllGatherCtasEnv(), 8u);
+
+  unsetenv("NCCL_GIN_ANVIL_SDMA_ALLGATHER_CTAS");
+  setenv("NCCL_GIN_ANVIL_AG_CTAS", "4", 1);
+  EXPECT_EQ(parseAllGatherCtasEnv(), 4u);
+
+  unsetenv("NCCL_GIN_ANVIL_AG_CTAS");
+
+  setenv("NCCL_GIN_ANVIL_SDMA_ALLGATHER_CTAS", "8foo", 1);
+  EXPECT_EQ(parseAllGatherCtasEnv(), kAllGatherCtasUnset);
+  unsetenv("NCCL_GIN_ANVIL_SDMA_ALLGATHER_CTAS");
 }
 
 }  // namespace

@@ -11,14 +11,13 @@
 // CTA stamps start_time[blockIdx.x] at i==skip and end_time[blockIdx.x] after the
 // final iteration -- and (2) a thin "*DeviceTime" hook that calls gin_devtime::measure
 // with a lambda that launches that kernel. measure() owns everything mechanical and
-// identical across collectives: query the wall-clock rate once, allocate the per-CTA
-// start/end stamp buffers, run the launch, reduce the grid busy window
+// identical across collectives: sample each GPU's wall-clock rate, allocate the
+// per-CTA start/end stamp buffers, run the launch, reduce the grid busy window
 // (min(start)..max(end) over CTAs) and the slowest rank (MPI MAX), and return the
 // per-iteration device latency in microseconds. This is the pure device-function
 // execution time -- it excludes host launch, stream/graph, and teardown overhead.
 //
-// The reported span is driven by BenchTime (see common.cu) via
-// NCCL_GIN_ANVIL_DEVICE_TIMING (legacy NCCL_GIN_ANVIL_A2A_DEVICE_TIMING):
+// The reported span is driven by BenchTime (see common.cu) via --device_timing:
 // 1=augment (each hook prints its own extra "#[*-devtime]" line next to the graph
 // numbers), 2=device-time-only (the hook returns per-iteration seconds via
 // outDeltaSec and BenchTime reports it AS the out-of-place metric).
@@ -27,25 +26,34 @@
 
 #include <vector>
 #include "common.h"
+#include "gin_sdma_devtime_host.h"
 
 namespace gin_devtime {
 
-// Parse a positive int env var, else the default.
-static inline int envInt(const char* name, int def) {
-  const char* e = getenv(name);
-  return (e && *e) ? atoi(e) : def;
+// Shared skip/loop tier selection for gin_devtime hooks (per-peer/per-rank bytes).
+static inline void resolveLoopSkip(size_t perPeerBytes, int& loop, int& skip) {
+  loop = devtimeLoop;
+  skip = devtimeSkip < 0 ? 0 : devtimeSkip;
+  if (devtimeLoopLarge > 0 && perPeerBytes >= (size_t)64 * 1024 * 1024) {
+    loop = devtimeLoopLarge;
+    if (devtimeSkipLarge >= 0) skip = devtimeSkipLarge;
+    else skip = (skip < 1) ? skip : 1;
+  } else if (devtimeLoopMid > 0 && perPeerBytes >= (size_t)8 * 1024 * 1024) {
+    loop = devtimeLoopMid;
+    if (devtimeSkipMid >= 0) skip = devtimeSkipMid;
+    else skip = (skip < 2) ? skip : 2;
+  }
 }
 
-// GPU fixed-frequency wall-clock rate (kHz), queried once for the current device.
-static inline int wallClockRateKhz() {
-  static int khz = 0;
-  if (khz == 0) {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) return 1;
-    if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || khz <= 0)
-      khz = 1;
-  }
-  return khz;
+// GPU fixed-frequency wall-clock rate (kHz) for a specific device ordinal. Sampled
+// per-GPU (rather than once from the current device) so each GPU's cycle delta is
+// converted with its own rate on mixed-clock nodes.
+static inline bool wallClockRateKhz(int dev, int* outKhz) {
+  int khz = 0;
+  if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || khz <= 0)
+    return false;
+  *outKhz = khz;
+  return true;
 }
 
 // Run the device-timing measurement. `launch` is a callable
@@ -63,7 +71,6 @@ template <typename LaunchFn>
 static inline testResult_t measure(struct threadArgs* args, int gridCtas, int loop,
                                    LaunchFn&& launch, double* outUs) {
   if (gridCtas < 1) gridCtas = 1;
-  const int rate = wallClockRateKhz();
   double localMaxUs = 0.0;
 
   std::vector<long long*> d_start(args->nGpus, nullptr);
@@ -71,37 +78,56 @@ static inline testResult_t measure(struct threadArgs* args, int gridCtas, int lo
 
   Barrier(args);
 
-  // Pass 1: allocate stamps and launch the timed kernel on EVERY local GPU before
-  // synchronizing any of them. The collective bodies do an all-ranks device barrier
-  // and each local GPU is its own rank under -g N, so all local GPUs must be
-  // in-flight concurrently -- synchronizing GPU i before launching GPU i+1 would
-  // block GPU 0 at the barrier waiting for GPUs that were never launched (deadlock).
-  // This mirrors the launch-then-complete split in startColl()/completeColl().
+  // Pass 1: allocate stamp buffers on every local GPU, then launch the timed
+  // kernel on every local GPU, before synchronizing any of them. Malloc-first
+  // keeps the error path safe: if GPU i's hipMalloc fails, no kernel is in
+  // flight yet. Launch-all-then-sync avoids the -g N>1 device-barrier deadlock
+  // (GPU 0 would spin waiting for GPUs never launched). Mirrors startColl()/
+  // completeColl().
   for (int i = 0; i < args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
-    CUDACHECK(cudaMalloc(&d_start[i], (size_t)gridCtas * sizeof(long long)));
-    CUDACHECK(cudaMalloc(&d_end[i], (size_t)gridCtas * sizeof(long long)));
+    CUDACHECK(hipSetDevice(args->gpus[i]));
+    CUDACHECK(hipMalloc(&d_start[i], (size_t)gridCtas * sizeof(long long)));
+    CUDACHECK(hipMalloc(&d_end[i], (size_t)gridCtas * sizeof(long long)));
+  }
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(hipSetDevice(args->gpus[i]));
     launch(i, d_start[i], d_end[i]);
   }
 
   // Pass 2: synchronize each GPU, copy stamps back, reduce the grid busy window.
   for (int i = 0; i < args->nGpus; i++) {
-    CUDACHECK(cudaSetDevice(args->gpus[i]));
-    CUDACHECK(cudaStreamSynchronize(args->streams[i]));
+    CUDACHECK(hipSetDevice(args->gpus[i]));
+    TESTCHECK(testStreamSynchronize(1, &args->streams[i], &args->comms[i]));
+
+    // Sample THIS GPU's wall-clock rate to convert its own cycle delta; on a
+    // mixed-clock node a single reference rate would skew the non-reference GPUs.
+    int rate = 0;
+    if (!wallClockRateKhz(args->gpus[i], &rate)) {
+      CUDACHECK(hipFree(d_start[i]));
+      CUDACHECK(hipFree(d_end[i]));
+      d_start[i] = d_end[i] = nullptr;
+      for (int j = i + 1; j < args->nGpus; j++) {
+        if (d_start[j]) CUDACHECK(hipFree(d_start[j]));
+        if (d_end[j]) CUDACHECK(hipFree(d_end[j]));
+        d_start[j] = d_end[j] = nullptr;
+      }
+      if (args->proc == 0 && args->thread == 0) {
+        fprintf(stderr, "ERROR: hipDeviceAttributeWallClockRate query failed for GPU %d\n",
+                args->gpus[i]);
+      }
+      return testInternalError;
+    }
 
     std::vector<long long> h_start(gridCtas), h_end(gridCtas);
-    CUDACHECK(cudaMemcpy(h_start.data(), d_start[i], (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaMemcpy(h_end.data(), d_end[i], (size_t)gridCtas * sizeof(long long), cudaMemcpyDeviceToHost));
-    CUDACHECK(cudaFree(d_start[i]));
-    CUDACHECK(cudaFree(d_end[i]));
+    CUDACHECK(hipMemcpy(h_start.data(), d_start[i], (size_t)gridCtas * sizeof(long long), hipMemcpyDeviceToHost));
+    CUDACHECK(hipMemcpy(h_end.data(), d_end[i], (size_t)gridCtas * sizeof(long long), hipMemcpyDeviceToHost));
+    CUDACHECK(hipFree(d_start[i]));
+    CUDACHECK(hipFree(d_end[i]));
 
-    long long mn = h_start[0], mx = h_end[0];
-    for (int c = 1; c < gridCtas; c++) {
-      if (h_start[c] < mn) mn = h_start[c];
-      if (h_end[c] > mx) mx = h_end[c];
-    }
-    double totalUs = (double)(mx - mn) / (double)rate * 1.0e3;  // cycles/kHz -> ms -> us
-    double perIterUs = (loop > 0) ? totalUs / (double)loop : totalUs;
+    const long long mn = rccl_tests_devtime::reduceMinStart(h_start.data(), gridCtas);
+    const long long mx = rccl_tests_devtime::reduceMaxEnd(h_end.data(), gridCtas);
+    const double perIterUs =
+        rccl_tests_devtime::gridBusyWindowPerIterUs(mn, mx, rate, loop);
     if (perIterUs > localMaxUs) localMaxUs = perIterUs;
   }
   Barrier(args);

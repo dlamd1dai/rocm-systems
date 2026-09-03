@@ -38,7 +38,7 @@
 #   RCCL_TESTS_RS_EXE            path to reduce_scatter_perf
 #   RCCL_TESTS_RS_TIMEOUT_S      per-run timeout seconds (default: 300)
 #   RCCL_TESTS_RS_CTAS           -V grid CTAs (default: 8)
-#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 6)
+#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 5, Anvil-SDMA on NCCL 2.30.7)
 
 import os
 import re
@@ -80,7 +80,7 @@ NP = int(os.environ.get("RCCL_TESTS_RS_NP", "0")) or _detect_ngpus()
 LAUNCHER = os.environ.get("RCCL_TESTS_MPI_LAUNCHER", "mpirun")
 CTAS = os.environ.get("RCCL_TESTS_RS_CTAS", "8")
 TIMEOUT_S = int(os.environ.get("RCCL_TESTS_RS_TIMEOUT_S", "300"))
-GIN_TYPE = os.environ.get("RCCL_TESTS_RS_GIN_TYPE", "6")
+GIN_TYPE = os.environ.get("RCCL_TESTS_RS_GIN_TYPE", "5")
 MPI_OPTS = shlex.split(os.environ.get("RCCL_TESTS_MPI_OPTS", ""))
 XENV = shlex.split(os.environ.get("RCCL_TESTS_RS_XENV", ""))
 

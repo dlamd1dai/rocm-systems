@@ -8,11 +8,10 @@
 # from the environment (device-api.sbatch exports them) or, when run standalone,
 # from $WORKDIR/.ci-out/{rocm,ompi}.env.
 #
-# After the JSON matrix, runs pytest devtime smoke tests (GIN -D 3 in-kernel
-# device-timing: modes -B 1, -B 2, -B 2 -H 1) for AllToAll and ReduceScatter.
-#
 # Each bench is wrapped in `timeout` so a hung mpirun/driver can't wedge the job;
 # failures are collected and surfaced at the end (exit non-zero iff any failed).
+# After the JSON matrix, runs pytest devtime smoke tests (GIN -D 3 in-kernel
+# device-timing: modes -B 1, -B 2, -B 2 -H 1) for AllToAll and ReduceScatter.
 #
 # Test matrix lives in lib/device-api-tests.json; RCCL_CI_DEBUG=1 adds its
 # debug_env to every run.
@@ -172,8 +171,8 @@ fi
 
 echo "All device-api benchmark runs succeeded."
 
-# GIN AllToAll / ReduceScatter in-kernel device-timing smoke (wall_clock64 / *TimedKernel).
-# Requires ENABLE_DEVICE_API=ON rccl-tests build (alltoall_perf / reduce_scatter_perf -D 3).
+# GIN AllToAll in-kernel device-timing smoke (wall_clock64 / *TimedKernel).
+# Requires ENABLE_DEVICE_API=ON rccl-tests build (alltoall_perf with -B flags).
 run_devtime_smoke() {
   local pytest_dir="${RCCL_TESTS_DIR}/test"
   # shellcheck source=/dev/null
@@ -212,10 +211,10 @@ run_devtime_smoke() {
     RCCL_TESTS_GIN_SDMA_DEVTIME=1 \
     RCCL_TESTS_RS_EXE="${rs_bin}" \
     RCCL_TESTS_RS_NP="${NP}" \
-    RCCL_TESTS_RS_GIN_TYPE="${RCCL_TESTS_RS_GIN_TYPE:-6}" \
+    RCCL_TESTS_RS_GIN_TYPE="${RCCL_TESTS_RS_GIN_TYPE:-5}" \
     RCCL_TESTS_RS_TIMEOUT_S="${RCCL_TESTS_RS_TIMEOUT_S:-300}" \
       python3 -m pytest "${pytest_dir}/test_ReduceScatterDevtime.py" -v -p no:cacheprovider
-    local rc=$?
+    rc=$?
     set -e
     if [[ ${rc} -ne 0 ]]; then
       FAILED_RUNS+=("devtime-smoke:ReduceScatter (rc=${rc})")
