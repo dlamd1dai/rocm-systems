@@ -75,6 +75,7 @@ Select tests with `RCCL_GIN_RUN_TESTS` (comma list), e.g. `1,5` or `5`.
 | `ROCM_NIGHTLY_FAMILY` | `gfx125X-dcgpu` (auto from `GPU_TARGETS`) | Tarball family slice; use `gfx950-dcgpu` for MI355 |
 | `ROCM_NIGHTLY_BASE_URL` | `https://nightly.repo.amd.com/rocm/core/tarball` | Override for mirror/air-gap |
 | `RCCL_IMAGE_INFO` | `1` | Print OS + ROCm version from image before tests; set `0` to skip |
+| `RCCL_VERBS_PREFLIGHT` | `1` | Detect an RDMA provider with unresolved deps; withholds verbs devices and forces `NCCL_IB_DISABLE=1`. Set `0` to skip |
 | `COLLECTIVE` | `a2a` | `a2a` = AllToAll-only device kernels; `full` = include AR/AG/BC baselines |
 | `ONLY_FUNCS` | (from COLLECTIVE) | Device kernel generation filter |
 | `RCCL_IMAGE_GIN_SMOKE` | `1` | Post-build Test#5 smoke on `/dev/kfd` |

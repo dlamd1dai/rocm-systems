@@ -43,7 +43,57 @@ else
   D_MEMLOCK=()
 fi
 
-DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd --device /dev/infiniband --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
+# A SUT can enable a kernel RDMA driver whose userspace provider has unresolved
+# dependencies (seen on MI455: libbng_re-rdmav59.so needs libxdp.so.1, which is
+# not installed). rdma-core then faults inside ibv_get_device_list and every
+# rank dies in ncclCommInitRank; NCCL_IB_DISABLE alone does not help, because
+# RCCL still enumerates verbs devices. Intra-node GIN paths do not need verbs,
+# so withhold the uverbs devices entirely when the provider cannot load.
+_rccl_broken_verbs_provider() {
+  local drv name so
+  shopt -s nullglob
+  for drv in /etc/libibverbs.d/*.driver; do
+    name=$(awk '$1 == "driver" { print $2; exit }' "${drv}" 2>/dev/null)
+    [[ -n "${name}" ]] || continue
+    for so in /usr/lib64/lib"${name}"-rdmav*.so /usr/lib64/libibverbs/lib"${name}"-rdmav*.so; do
+      if ldd "${so}" 2>/dev/null | grep -q "not found"; then
+        shopt -u nullglob
+        printf '%s' "${so}"
+        return 0
+      fi
+    done
+  done
+  shopt -u nullglob
+  return 1
+}
+
+RCCL_VERBS_PREFLIGHT="${RCCL_VERBS_PREFLIGHT:-1}"
+RCCL_VERBS_BROKEN=0
+if [[ "${RCCL_VERBS_PREFLIGHT}" != 0 && -d /dev/infiniband ]]; then
+  _rccl_bad_provider=$(_rccl_broken_verbs_provider) || _rccl_bad_provider=""
+  if [[ -n "${_rccl_bad_provider}" ]]; then
+    RCCL_VERBS_BROKEN=1
+    echo "WARN: RDMA provider ${_rccl_bad_provider} has unresolved dependencies:"
+    ldd "${_rccl_bad_provider}" 2>/dev/null | grep "not found" | sed 's/^/        /'
+    echo "      ibv_get_device_list() faults in this state, so verbs devices are"
+    echo "      withheld from the container and NCCL_IB_DISABLE=1 is forced."
+    echo "      Install the missing package on the host to test verbs paths,"
+    echo "      or set RCCL_VERBS_PREFLIGHT=0 to skip this check."
+    : "${DOCKER_UVERBS:=0}"
+    : "${NCCL_IB_DISABLE:=1}"
+    export NCCL_IB_DISABLE
+  fi
+  unset _rccl_bad_provider
+fi
+
+if [[ "${RCCL_VERBS_BROKEN}" == 1 ]]; then
+  D_INFINIBAND=""
+else
+  D_INFINIBAND="--device /dev/infiniband"
+fi
+
+DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd ${D_INFINIBAND} --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
+[[ "${RCCL_VERBS_BROKEN}" == 1 ]] && DOCKER_GPU_COMMON+=" -e NCCL_IB_DISABLE=1"
 
 GDA_UVERBS_ADDED=0
 _rccl_uverbs_seen=""
