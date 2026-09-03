@@ -20,13 +20,40 @@ ROCSHMEM_USE_SDMA=1
 BASE_OS="${BASE_OS:-centos}"
 BASE_IMAGE="${BASE_IMAGE:-quay.io/centos/centos:stream9}"
 RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS="${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS:-0}"
-ROCM_NIGHTLY_VERSION="${ROCM_NIGHTLY_VERSION:-10.1.0a20260822}"
-ROCM_NIGHTLY_BASE_URL="${ROCM_NIGHTLY_BASE_URL:-https://rocm.nightlies.amd.com/tarball-multi-arch}"
+ROCM_NIGHTLY_BASE_URL="${ROCM_NIGHTLY_BASE_URL:-https://nightly.repo.amd.com/rocm/core/tarball}"
 case "${TARGET_GPU_ARCH}" in
   gfx1250|gfx125*) ROCM_NIGHTLY_FAMILY="${ROCM_NIGHTLY_FAMILY:-gfx125X-dcgpu}" ;;
   gfx950*)        ROCM_NIGHTLY_FAMILY="${ROCM_NIGHTLY_FAMILY:-gfx950-dcgpu}" ;;
   *)              ROCM_NIGHTLY_FAMILY="${ROCM_NIGHTLY_FAMILY:-gfx125X-dcgpu}" ;;
 esac
+ROCM_NIGHTLY_VERSION="${ROCM_NIGHTLY_VERSION:-latest}"
+
+# Resolve ROCM_NIGHTLY_VERSION=latest from the tarball index (newest mtime for family).
+if [[ "${ROCM_NIGHTLY_VERSION}" == "latest" ]]; then
+  _rccl_tarball=$(
+    curl -fsSL "${ROCM_NIGHTLY_BASE_URL}/" \
+      | grep -oE "\"name\": \"therock-dist-linux-${ROCM_NIGHTLY_FAMILY}-[0-9]+\\.[0-9]+\\.[0-9]+a[0-9]+\\.tar\\.gz\", \"mtime\": [0-9.]+" \
+      | sort -t' ' -k4 -g \
+      | tail -1 \
+      | sed 's/.*"name": "\([^"]*\)".*/\1/'
+  )
+  if [[ -z "${_rccl_tarball}" ]]; then
+    echo "ERROR: no therock-dist-linux-${ROCM_NIGHTLY_FAMILY}-* tarball at ${ROCM_NIGHTLY_BASE_URL}/" >&2
+    exit 1
+  fi
+  ROCM_NIGHTLY_VERSION=$(
+    echo "${_rccl_tarball}" | sed -nE 's/.*-([0-9]+\.[0-9]+\.[0-9]+a[0-9]+)\.tar\.gz/\1/p'
+  )
+  if [[ -z "${ROCM_NIGHTLY_VERSION}" ]]; then
+    echo "ERROR: could not parse version from tarball name '${_rccl_tarball}'" >&2
+    exit 1
+  fi
+  echo "Resolved ROCM_NIGHTLY_VERSION=latest -> ${ROCM_NIGHTLY_VERSION} (${_rccl_tarball})"
+  unset _rccl_tarball
+fi
+
+echo "ROCm nightly: ${ROCM_NIGHTLY_BASE_URL}/therock-dist-linux-${ROCM_NIGHTLY_FAMILY}-${ROCM_NIGHTLY_VERSION}.tar.gz"
+echo "Base OS: ${BASE_OS} (${BASE_IMAGE})"
 
 # COLLECTIVE=a2a narrows ONLY_FUNCS to AllToAll* + SendRecv and enables the A2A smoke gate.
 COLLECTIVE="${COLLECTIVE:-a2a}"

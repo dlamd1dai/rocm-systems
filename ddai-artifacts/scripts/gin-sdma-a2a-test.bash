@@ -1,5 +1,6 @@
 #! /usr/bin/env bash
 # Single-node GIN AllToAll perf harness (docker).
+# Image: CentOS Stream 9 + TheRock nightly from nightly.repo.amd.com/rocm/core/tarball.
 # Usage: bash ddai-artifacts/scripts/gin-sdma-a2a-test.bash [NP] [MAX_BYTES]
 # See: ddai-artifacts/docs/gin-sdma-a2a-harness.md
 
@@ -7,8 +8,15 @@ NP=${1:-4}
 MAX_BYTES="${2:-128M}"
 DOCKER_CMD="${DOCKER_CMD:-docker}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-sdma-a2a-mi455}"
+RCCL_IMAGE_INFO="${RCCL_IMAGE_INFO:-1}"
 RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
-GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${TEST2_HOST_SO_SEARCH_DIRS:-/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}"
+# CentOS Stream 9 SUT (MI455): /lib64 first for host rdma-core / libmlx5 bind mounts.
+if [[ -f /etc/centos-release || -f /etc/redhat-release ]]; then
+  : "${GDA_HOST_LIB_DIRS:=/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}"
+else
+  : "${GDA_HOST_LIB_DIRS:=/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+fi
+GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${GDA_HOST_LIB_DIRS}}"
 ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
 
 # Shared measurement iteration counts for tests #1-#5.
@@ -314,6 +322,16 @@ _rccl_setup_test5_mlx5_volumes() {
     return 1
   }
 }
+
+if [[ "${RCCL_IMAGE_INFO}" != 0 ]]; then
+  echo "=== Docker image: ${DOCKER_IMAGE} ==="
+  ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" --format 'Created: {{.Created}}' 2>/dev/null || true
+  ${DOCKER_CMD} run --rm --init "${DOCKER_IMAGE}" sh -lc \
+    'printf "OS: "; (. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}") || echo unknown; \
+     printf "ROCm: "; cat /opt/rocm/.info/version 2>/dev/null || echo unknown; \
+     test -x /opt/rocm/bin/hipcc && /opt/rocm/bin/hipcc --version 2>/dev/null | head -1 || true' \
+    || { echo "FATAL: docker image '${DOCKER_IMAGE}' not runnable"; exit 1; }
+fi
 
 _rccl_setup_rdma_volumes
 if [[ -n "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR:-}}" ]]; then

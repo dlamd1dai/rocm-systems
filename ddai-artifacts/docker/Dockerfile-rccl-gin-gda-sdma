@@ -34,10 +34,12 @@ RUN if [ "${BASE_OS}" = "centos" ]; then \
       && apt-get clean && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# TheRock nightly flattened ROCm stack (replaces apt amdrocm-core7.13).
-# Default: gfx125X-dcgpu 10.1.0a20260822 for MI450/MI455 bring-up.
-ARG ROCM_NIGHTLY_BASE_URL=https://rocm.nightlies.amd.com/tarball-multi-arch
-ARG ROCM_NIGHTLY_VERSION=10.1.0a20260822
+# TheRock nightly flattened ROCm stack from nightly.repo.amd.com (CentOS Stream 9 userland).
+# Index: https://nightly.repo.amd.com/rocm/core/tarball/
+# Default version is resolved by docker-gin-gda-sdma-build.bash (ROCM_NIGHTLY_VERSION=latest).
+# Direct docker build: pass --build-arg ROCM_NIGHTLY_VERSION=<stamp> explicitly.
+ARG ROCM_NIGHTLY_BASE_URL=https://nightly.repo.amd.com/rocm/core/tarball
+ARG ROCM_NIGHTLY_VERSION=10.1.0a20260903
 ARG ROCM_NIGHTLY_FAMILY=gfx125X-dcgpu
 ENV ROCM_PATH=/opt/rocm
 RUN set -eu; \

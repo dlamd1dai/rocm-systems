@@ -9,7 +9,7 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 
 | Path | Purpose |
 |------|---------|
-| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | **CentOS Stream 9** (default) + TheRock nightly ROCm 10.1.0 + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests. Ubuntu: `BASE_OS=ubuntu BASE_IMAGE=ubuntu:24.04` |
+| `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | **CentOS Stream 9** (default) + TheRock nightly from [nightly.repo.amd.com/rocm/core/tarball](https://nightly.repo.amd.com/rocm/core/tarball/) + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests. Ubuntu: `BASE_OS=ubuntu BASE_IMAGE=ubuntu:24.04` |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Build wrapper + optional GPU smoke (Test#5) |
 | `ddai-artifacts/scripts/gin-sdma-a2a-test.bash` | Single-node AllToAll perf/compare harness |
 | `extra-rdma-debs/` | Optional rdma-core / libbng_re / libmlx5 `.rpm` (CentOS) or `.deb` (Ubuntu) |
@@ -71,9 +71,10 @@ Select tests with `RCCL_GIN_RUN_TESTS` (comma list), e.g. `1,5` or `5`.
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `GPU_TARGETS` | `gfx1250` | Passed to rocSHMEM + RCCL + rccl-tests |
-| `ROCM_NIGHTLY_VERSION` | `10.1.0a20260822` | TheRock nightly tarball date stamp |
+| `ROCM_NIGHTLY_VERSION` | `latest` | TheRock nightly tarball date stamp; `latest` auto-resolves from index |
 | `ROCM_NIGHTLY_FAMILY` | `gfx125X-dcgpu` (auto from `GPU_TARGETS`) | Tarball family slice; use `gfx950-dcgpu` for MI355 |
-| `ROCM_NIGHTLY_BASE_URL` | `https://rocm.nightlies.amd.com/tarball-multi-arch` | Override for mirror/air-gap |
+| `ROCM_NIGHTLY_BASE_URL` | `https://nightly.repo.amd.com/rocm/core/tarball` | Override for mirror/air-gap |
+| `RCCL_IMAGE_INFO` | `1` | Print OS + ROCm version from image before tests; set `0` to skip |
 | `COLLECTIVE` | `a2a` | `a2a` = AllToAll-only device kernels; `full` = include AR/AG/BC baselines |
 | `ONLY_FUNCS` | (from COLLECTIVE) | Device kernel generation filter |
 | `RCCL_IMAGE_GIN_SMOKE` | `1` | Post-build Test#5 smoke on `/dev/kfd` |
