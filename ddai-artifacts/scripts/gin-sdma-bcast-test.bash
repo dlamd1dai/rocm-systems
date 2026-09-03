@@ -266,16 +266,22 @@ _src_mount_setup() {
   ${DOCKER_CMD} exec "${_SRC_CID}" bash -c '
     set -e
     dst=/workspace/rccl/src/projects/rccl-tests/src
+    # Broadcast (-D 3) only: do not sync the whole rccl-tests/src tree -- copying
+    # unrelated files (CMakeLists, common.cu, ...) forces a wide rebuild and can
+    # break the incremental link (-lverifiable) in the prebuilt image.
+    bc_files=(broadcast.cu gin_sdma_broadcast_policy.h gin_sdma_devtime.h)
     changed=0
-    for f in /src/projects/rccl-tests/src/*; do
-      b=$(basename "$f")
-      [ -f "$f" ] || continue
+    for b in "${bc_files[@]}"; do
+      f="/src/projects/rccl-tests/src/$b"
+      [ -f "$f" ] || { echo "FATAL: missing $f" >&2; exit 1; }
       if ! cmp -s "$f" "$dst/$b"; then cp "$f" "$dst/$b"; echo "  updated $b"; changed=1; fi
     done
-    [ "$changed" = 0 ] && echo "  (image source already matches SRC_MOUNT)"
+    [ "$changed" = 0 ] && echo "  (image BC sources already match SRC_MOUNT)"
     # broadcast_perf, NOT hipify -- see the SRC_MOUNT note at the top of this script.
-    cmake --build /workspace/rccl-tests --target broadcast_perf -j "$(nproc)" 2>&1 \
-      | grep -E "Hipifying|Built target broadcast_perf|error:" || true
+    if ! cmake --build /workspace/rccl-tests --target broadcast_perf -j "$(nproc)"; then
+      echo "FATAL: broadcast_perf build failed" >&2
+      exit 1
+    fi
   ' || { echo "FATAL: SRC_MOUNT rebuild failed" >&2; exit 1; }
 
   # Fail loudly rather than silently measure the pre-existing binary.
