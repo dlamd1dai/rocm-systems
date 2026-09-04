@@ -1,0 +1,568 @@
+#! /usr/bin/env bash
+# Single-node GIN AllToAll perf harness (docker).
+# Image: CentOS Stream 9 + TheRock nightly from nightly.repo.amd.com/rocm/core/tarball.
+# Usage: bash ddai-artifacts/scripts/gin-sdma-a2a-test.bash [NP] [MAX_BYTES]
+# See: ddai-artifacts/docs/gin-sdma-a2a-harness.md
+
+NP=${1:-4}
+MAX_BYTES="${2:-128M}"
+DOCKER_CMD="${DOCKER_CMD:-docker}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rccl-gin-sdma-a2a-mi455}"
+RCCL_IMAGE_INFO="${RCCL_IMAGE_INFO:-1}"
+RCCL_GIN_RUN_TESTS="${RCCL_GIN_RUN_TESTS:-${RUN_TESTS:-1,5}}"
+# CentOS Stream 9 SUT (MI455): /lib64 first for host rdma-core / libmlx5 bind mounts.
+if [[ -f /etc/centos-release || -f /etc/redhat-release ]]; then
+  : "${GDA_HOST_LIB_DIRS:=/lib64 /usr/lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}"
+else
+  : "${GDA_HOST_LIB_DIRS:=/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64}"
+fi
+GDA_HOST_LIB_DIRS="${TEST2_HOST_SO_SEARCH_DIRS:-${GDA_HOST_LIB_DIRS}}"
+ROCSHMEM_THRESHOLD=$((128 * 1024 * 1024))
+
+# Shared measurement iteration counts for tests #1-#5.
+A2A_WARMUP="${A2A_WARMUP:-5}"
+A2A_ITERS="${A2A_ITERS:-20}"
+
+_run_test() {
+  [[ ",${RCCL_GIN_RUN_TESTS}," == *",$1,"* ]]
+}
+
+_trace_on() {
+  [[ "${RCCL_GIN_ECHO:-1}" == 1 ]] && set -x
+  return 0
+}
+
+_trace_off() {
+  [[ "${RCCL_GIN_ECHO:-1}" == 1 ]] && set +x
+  return 0
+}
+
+if [[ "${DOCKER_ULIMIT_MEMLOCK:-1}" != 0 ]]; then
+  D_MEMLOCK=(--ulimit memlock=-1:-1)
+else
+  D_MEMLOCK=()
+fi
+
+# A SUT can enable a kernel RDMA driver whose userspace provider has unresolved
+# dependencies (seen on MI455: libbng_re-rdmav59.so needs libxdp.so.1, which is
+# not installed). rdma-core then faults inside ibv_get_device_list and every
+# rank dies in ncclCommInitRank; NCCL_IB_DISABLE alone does not help, because
+# RCCL still enumerates verbs devices. Intra-node GIN paths do not need verbs,
+# so withhold the uverbs devices entirely when the provider cannot load.
+_rccl_broken_verbs_provider() {
+  local drv name so
+  shopt -s nullglob
+  for drv in /etc/libibverbs.d/*.driver; do
+    name=$(awk '$1 == "driver" { print $2; exit }' "${drv}" 2>/dev/null)
+    [[ -n "${name}" ]] || continue
+    for so in /usr/lib64/lib"${name}"-rdmav*.so /usr/lib64/libibverbs/lib"${name}"-rdmav*.so; do
+      if ldd "${so}" 2>/dev/null | grep -q "not found"; then
+        shopt -u nullglob
+        printf '%s' "${so}"
+        return 0
+      fi
+    done
+  done
+  shopt -u nullglob
+  return 1
+}
+
+RCCL_VERBS_PREFLIGHT="${RCCL_VERBS_PREFLIGHT:-1}"
+RCCL_VERBS_BROKEN=0
+if [[ "${RCCL_VERBS_PREFLIGHT}" != 0 && -d /dev/infiniband ]]; then
+  _rccl_bad_provider=$(_rccl_broken_verbs_provider) || _rccl_bad_provider=""
+  if [[ -n "${_rccl_bad_provider}" ]]; then
+    RCCL_VERBS_BROKEN=1
+    echo "WARN: RDMA provider ${_rccl_bad_provider} has unresolved dependencies:"
+    ldd "${_rccl_bad_provider}" 2>/dev/null | grep "not found" | sed 's/^/        /'
+    echo "      ibv_get_device_list() faults in this state, so verbs devices are"
+    echo "      withheld from the container and NCCL_IB_DISABLE=1 is forced."
+    echo "      Install the missing package on the host to test verbs paths,"
+    echo "      or set RCCL_VERBS_PREFLIGHT=0 to skip this check."
+    : "${DOCKER_UVERBS:=0}"
+    : "${NCCL_IB_DISABLE:=1}"
+    export NCCL_IB_DISABLE
+  fi
+  unset _rccl_bad_provider
+fi
+
+if [[ "${RCCL_VERBS_BROKEN}" == 1 ]]; then
+  D_INFINIBAND=""
+else
+  D_INFINIBAND="--device /dev/infiniband"
+fi
+
+DOCKER_GPU_COMMON="${D_MEMLOCK[*]} --shm-size 64G --network host --device /dev/dri --device /dev/kfd ${D_INFINIBAND} --ipc host --group-add video --group-add render --cap-add SYS_PTRACE --security-opt seccomp=unconfined --privileged ${DOCKER_EXTRA:-}"
+[[ "${RCCL_VERBS_BROKEN}" == 1 ]] && DOCKER_GPU_COMMON+=" -e NCCL_IB_DISABLE=1"
+
+GDA_UVERBS_ADDED=0
+_rccl_uverbs_seen=""
+_rccl_add_uverbs() {
+  local p="$1" rp
+  [[ -e "${p}" ]] || return 1
+  rp=$(readlink -f "${p}" 2>/dev/null) || return 1
+  [[ -n "${rp}" ]] || rp="${p}"
+  [[ -c "${rp}" ]] || return 1
+  [[ " ${_rccl_uverbs_seen} " == *" ${rp} "* ]] && return 0
+  DOCKER_GPU_COMMON+=" --device ${rp}"
+  _rccl_uverbs_seen+=" ${rp} "
+  GDA_UVERBS_ADDED=$((GDA_UVERBS_ADDED + 1))
+}
+if [[ "${DOCKER_UVERBS:-1}" != 0 ]]; then
+  shopt -s nullglob
+  for _u in /dev/infiniband/uverbs* /dev/uverbs*; do
+    _rccl_add_uverbs "${_u}" || true
+  done
+  shopt -u nullglob
+  if [[ "${GDA_UVERBS_ADDED}" -eq 0 ]]; then
+    for _i in $(seq 0 31); do
+      _rccl_add_uverbs "/dev/infiniband/uverbs${_i}" || true
+      _rccl_add_uverbs "/dev/uverbs${_i}" || true
+    done
+  fi
+fi
+unset _rccl_uverbs_seen _u _i
+
+if [[ "${DOCKER_RDMA_GROUP:-1}" != 0 ]] && getent group rdma >/dev/null 2>&1; then
+  DOCKER_GPU_COMMON+=" --group-add rdma"
+fi
+
+if [[ "${GIN_GDA_DOCKER_IT:-0}" == 1 ]]; then
+  DOCKER_GPU="-it --rm --init ${DOCKER_GPU_COMMON}"
+else
+  DOCKER_GPU="--rm --init ${DOCKER_GPU_COMMON}"
+fi
+
+MPI_OPT="--allow-run-as-root -mca pml ob1 -mca btl self,vader,tcp -mca btl_vader_single_copy_mechanism none -mca hwloc_base_binding_policy none ${MPI_MCA_EXTRA:-}"
+
+GIN_PLUGIN_X=()
+[[ "${USE_EXTERNAL_PLUGIN:-0}" != 1 ]] && GIN_PLUGIN_X=(-x NCCL_GIN_PLUGIN=none)
+
+MPI_BASE=(
+  -x OMPI_ALLOW_RUN_AS_ROOT=1
+  -x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+  -x RCCL_ROCSHMEM_ENABLE=0
+  -x ROCSHMEM_BACKEND=ipc
+  -x ROCSHMEM_DISABLE_MIXED_IPC=1
+  -x ROCSHMEM_DEBUG_LEVEL=info:noversion
+  -x RCCL_ROCSHMEM_THRESHOLD="${ROCSHMEM_THRESHOLD}"
+  -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}"
+  -x NCCL_DEBUG_SUBSYS=INIT,NET
+  -x RCCL_ENABLE_INTRANET=1
+  -x NCCL_DMABUF_ENABLE=1
+  -x NCCL_MSCCL_ENABLE=0
+  -x HSA_NO_SCRATCH_RECLAIM=1
+  -x NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-1}"
+)
+
+# [GIN-CONN-CHECK][TEST] Optional fault-injection passthrough to exercise the
+# LSA signal connectivity fail-loud abort path deterministically.
+[[ -n "${NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK:-}" ]] && \
+  MPI_BASE+=(-x "NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK=${NCCL_GIN_ANVIL_SDMA_CONN_INJECT_FAIL_RANK}")
+
+# [CUMEM-SKIP-FREE][WORKAROUND] MI455/GIN symmetric VMM teardown can double-free
+# or hang in cuMemUnmap/cuMemAddressFree at ncclCommDestroy. Skip driver unmap
+# and let the OS reclaim at process exit (see ncclCuMemSkipFree in alloc.h).
+NCCL_CUMEM_SKIP_FREE="${NCCL_CUMEM_SKIP_FREE:-1}"
+MPI_BASE+=(-x "NCCL_CUMEM_SKIP_FREE=${NCCL_CUMEM_SKIP_FREE}")
+
+DOCKER_TEST2_VOLUMES=""
+DOCKER_TEST5_MLX5_VOLUMES=""
+_rccl_bind_seen=""
+
+_rccl_bind_add() {
+  local src="$1" dst="$2"
+  [[ -n "${src}" && -e "${src}" && -n "${dst}" ]] || return 0
+  [[ " ${_rccl_bind_seen} " == *" ${dst} "* ]] && return 0
+  DOCKER_TEST2_VOLUMES+=" -v ${src}:${dst}:ro"
+  _rccl_bind_seen+=" ${dst} "
+}
+
+_rccl_resolve_lib() {
+  local base="$1" d cand
+  for d in ${GDA_HOST_LIB_DIRS}; do
+    cand="${d}/${base}"
+    [[ -e "${cand}" ]] || continue
+    readlink -f "${cand}" 2>/dev/null || echo "${cand}"
+    return 0
+  done
+  return 1
+}
+
+_rccl_bind_lib_paths() {
+  local base="$1" real d cand
+  real=$(_rccl_resolve_lib "${base}") || return 1
+  for d in ${GDA_HOST_LIB_DIRS}; do
+    cand="${d}/${base}"
+    [[ -e "${cand}" ]] || continue
+    _rccl_bind_add "${real}" "${cand}"
+    [[ "${real}" != "${cand}" ]] && _rccl_bind_add "${real}" "${real}"
+  done
+}
+
+_rccl_bind_mlx5_adjacent() {
+  local vbdir="$1" mlx cand real d
+  for mlx in libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1; do
+    cand="${vbdir}/${mlx}"
+    [[ -e "${cand}" ]] || continue
+    real=$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")
+    for d in ${GDA_HOST_LIB_DIRS}; do
+      _rccl_bind_add "${real}" "${d}/${mlx}"
+    done
+  done
+}
+
+_rccl_setup_rdma_volumes() {
+  local d verbs vbdir plug base nl3 nlrt
+
+  if [[ "${TEST2_BIND_HOST_GNU_DIRS:-${TEST2_BIND_HOST_GNU_DIRS:-0}}" != 0 ]]; then
+    echo "warning: TEST2_BIND_HOST_GNU_DIRS=1 can break librccl if host glibc is older than the image." >&2
+    for d in ${TEST2_BIND_HOST_LIBDIRS:-${TEST2_BIND_HOST_LIBDIRS:-/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu}}; do
+      [[ -d "${d}" ]] && DOCKER_TEST2_VOLUMES+=" -v ${d}:${d}:ro"
+    done
+  fi
+
+  if [[ "${TEST2_BIND_HOST_RDMA_SO:-${TEST2_BIND_HOST_RDMA_SO:-1}}" != 0 ]]; then
+    _rccl_bind_seen=""
+    if [[ -n "${TEST2_BIND_HOST_RDMA_BASE+x}" || -n "${TEST2_BIND_HOST_RDMA_BASE+x}" ]]; then
+      for base in ${TEST2_BIND_HOST_RDMA_BASE:-${TEST2_BIND_HOST_RDMA_BASE:-}} \
+                  ${TEST2_BIND_HOST_RDMA_EXTRA:-${TEST2_BIND_HOST_RDMA_EXTRA:-}} \
+                  libnl-3.so.200 libnl-route-3.so.200; do
+        [[ -n "${base// }" ]] && _rccl_bind_lib_paths "${base}" || true
+      done
+    else
+      for base in librdmacm.so librdmacm.so.1 libibumad.so.3 \
+                  ${TEST2_BIND_HOST_RDMA_EXTRA:-${TEST2_BIND_HOST_RDMA_EXTRA:-}}; do
+        [[ -n "${base// }" ]] && _rccl_bind_lib_paths "${base}" || true
+      done
+      case "${TEST2_BIND_HOST_MLX5_SO:-${TEST2_BIND_HOST_MLX5_SO:-adjacent}}" in
+        1)
+          for base in libmlx5.so libmlx5.so.1 libmlx5-infiniband.so.1 libmlx5dv.so libmlx5dv.so.1; do
+            _rccl_bind_lib_paths "${base}" || true
+          done
+          ;;
+      esac
+    fi
+
+    if verbs=$(_rccl_resolve_lib libibverbs.so.1); then
+      vbdir=$(dirname "${verbs}")
+      for d in ${GDA_HOST_LIB_DIRS}; do
+        _rccl_bind_add "${verbs}" "${d}/libibverbs.so"
+        _rccl_bind_add "${verbs}" "${d}/libibverbs.so.1"
+      done
+      _rccl_bind_add "${verbs}" "${verbs}"
+
+      if nl3=$(_rccl_resolve_lib libnl-3.so.200) && nlrt=$(_rccl_resolve_lib libnl-route-3.so.200); then
+        for d in ${GDA_HOST_LIB_DIRS}; do
+          _rccl_bind_add "${nl3}" "${d}/libnl-3.so.200"
+          _rccl_bind_add "${nlrt}" "${d}/libnl-route-3.so.200"
+        done
+      fi
+
+      plug="${vbdir}/libibverbs"
+      if [[ -d "${plug}" ]]; then
+        for d in ${GDA_HOST_LIB_DIRS}; do
+          _rccl_bind_add "${plug}" "${d}/libibverbs"
+        done
+      fi
+
+      case "${TEST2_BIND_HOST_MLX5_SO:-${TEST2_BIND_HOST_MLX5_SO:-adjacent}}" in
+        0) ;;
+        1) ;;
+        *) _rccl_bind_mlx5_adjacent "${vbdir}" ;;
+      esac
+    fi
+    unset _rccl_bind_seen
+  fi
+
+  if [[ "${TEST2_BIND_HOST_IB_SYSFS:-${TEST2_BIND_HOST_IB_SYSFS:-1}}" != 0 ]]; then
+    for d in /sys/class/infiniband /etc/libibverbs.d; do
+      [[ -e "${d}" ]] && DOCKER_TEST2_VOLUMES+=" -v ${d}:${d}:ro"
+    done
+  fi
+
+  case "${TEST2_BIND_HOST_DEV_IFB:-${TEST2_BIND_HOST_DEV_INFINIBAND:-auto}}" in
+    on) DOCKER_TEST2_VOLUMES+=" -v /dev/infiniband:/dev/infiniband" ;;
+    off) ;;
+    auto)
+      if [[ "${GDA_UVERBS_ADDED:-0}" -eq 0 ]] && { [[ -d /dev/infiniband ]] || [[ -d /sys/class/infiniband ]]; }; then
+        DOCKER_TEST2_VOLUMES+=" -v /dev/infiniband:/dev/infiniband"
+      fi
+      ;;
+    *)
+      echo "error: TEST2_BIND_HOST_DEV_IFB must be auto, on, or off" >&2
+      exit 1
+      ;;
+  esac
+}
+
+_rccl_ver_ge() {
+  local IFS=. a b i ai bi
+  read -r -a a <<< "$1"
+  read -r -a b <<< "$2"
+  for i in 0 1 2 3; do
+    ai=${a[i]:-0}
+    bi=${b[i]:-0}
+    (( 10#${ai} > 10#${bi} )) && return 0
+    (( 10#${ai} < 10#${bi} )) && return 1
+  done
+  return 0
+}
+
+_rccl_skip_test4_auto() {
+  local nic driver fw any_bnxt=0 min="${MIN_BNXT_FW_FOR_GDA:-233.2.104.0}"
+  for nic in /sys/class/net/*; do
+    [[ -e "${nic}" ]] || continue
+    nic=${nic##*/}
+    [[ "${nic}" == lo ]] && continue
+    driver=$(readlink -f "/sys/class/net/${nic}/device/driver" 2>/dev/null)
+    driver=${driver##*/}
+    [[ "${driver}" == bnxt_en ]] || continue
+    any_bnxt=1
+    command -v ethtool >/dev/null 2>&1 || continue
+    fw=$(ethtool -i "${nic}" 2>/dev/null | awk -F': +' '/firmware-version:/{v=$2; gsub(/ .*/,"",v); gsub(/\/.*/,"",v); print v; exit}')
+    [[ -n "${fw}" ]] || continue
+    if ! _rccl_ver_ge "${fw}" "${min}"; then
+      echo "=== RCCL_GIN_GDA: skipping Test#4 (bnxt ${nic} fw ${fw} < ${min}); set TEST4_MODE=run to force ===" >&2
+      return 0
+    fi
+  done
+  if [[ "${any_bnxt}" == 0 ]]; then
+    echo "=== RCCL_GIN_GDA: skipping Test#4 (no bnxt_en); set TEST4_MODE=run to force ===" >&2
+    return 0
+  fi
+  return 1
+}
+
+_should_run_test4() {
+  _run_test 4 || return 1
+  case "${TEST4_MODE:-${TEST4_MODE:-auto}}" in
+    skip) return 1 ;;
+    run) return 0 ;;
+    auto) ! _rccl_skip_test4_auto ;;
+    *)
+      echo "error: TEST4_MODE must be auto, run, or skip" >&2
+      exit 1
+      ;;
+  esac
+}
+
+_rccl_setup_test5_mlx5_volumes() {
+  local dir="$1" cand real base d
+  [[ -d "${dir}" ]] || {
+    echo "error: TEST5_HOST_MLX5_LIB_DIR is not a directory: ${dir}" >&2
+    return 1
+  }
+  _rccl_bind_seen=""
+  shopt -s nullglob
+  for cand in "${dir}"/libmlx5*.so* "${dir}"/libmlx5dv*.so*; do
+    [[ -f "${cand}" ]] || continue
+    real=$(readlink -f "${cand}" 2>/dev/null || echo "${cand}")
+    base=$(basename "${cand}")
+    for d in ${GDA_HOST_LIB_DIRS}; do
+      [[ " ${_rccl_bind_seen} " == *" ${d}/${base} "* ]] && continue
+      DOCKER_TEST5_MLX5_VOLUMES+=" -v ${real}:${d}/${base}:ro"
+      _rccl_bind_seen+=" ${d}/${base} "
+    done
+  done
+  shopt -u nullglob
+  unset _rccl_bind_seen
+  [[ -n "${DOCKER_TEST5_MLX5_VOLUMES}" ]] || {
+    echo "error: no libmlx5*.so* or libmlx5dv*.so* in ${dir}" >&2
+    return 1
+  }
+}
+
+if [[ "${RCCL_IMAGE_INFO}" != 0 ]]; then
+  echo "=== Docker image: ${DOCKER_IMAGE} ==="
+  ${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" --format 'Created: {{.Created}}' 2>/dev/null || true
+  ${DOCKER_CMD} run --rm --init "${DOCKER_IMAGE}" sh -lc \
+    'printf "OS: "; (. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}") || echo unknown; \
+     printf "ROCm: "; cat /opt/rocm/.info/version 2>/dev/null || echo unknown; \
+     test -x /opt/rocm/bin/hipcc && /opt/rocm/bin/hipcc --version 2>/dev/null | head -1 || true' \
+    || { echo "FATAL: docker image '${DOCKER_IMAGE}' not runnable"; exit 1; }
+fi
+
+_rccl_setup_rdma_volumes
+if [[ -n "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR:-}}" ]]; then
+  _rccl_setup_test5_mlx5_volumes "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR}}" || exit 1
+fi
+
+_rccl_test5_mlx5_ok() {
+  [[ -n "${TEST5_HOST_MLX5_LIB_DIR:-${TEST5_HOST_MLX5_LIB_DIR:-}}" ]] && return 0
+  ${DOCKER_CMD} run --rm --init ${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" sh -lc \
+    'for f in /usr/lib64/libmlx5.so.1 /lib/x86_64-linux-gnu/libmlx5.so.1 /usr/lib/x86_64-linux-gnu/libmlx5.so.1; do \
+       test -e "$f" || continue; rf=$(readlink -f "$f"); test -f "$rf" && objdump -T "$rf" | grep -q mlx5dv_reg_dmabuf_mr && exit 0; \
+     done; exit 1' \
+    >/dev/null 2>&1
+}
+
+_should_run_test5() {
+  _run_test 5 || return 1
+  [[ "${TEST5_MODE:-${TEST5_MODE:-run}}" != skip ]] || return 1
+  if [[ "${TEST5_MLX5_PREFLIGHT:-${TEST5_MLX5_PREFLIGHT:-0}}" != 0 ]]; then
+    if ! _rccl_test5_mlx5_ok; then
+      echo "=== RCCL_GIN_GDA: skipping Test#5 (image libmlx5 lacks mlx5dv_reg_dmabuf_mr); set TEST5_MLX5_PREFLIGHT=0 or TEST5_HOST_MLX5_LIB_DIR ===" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Host-initiated A2A baselines (all -D 0).
+_a2a_host_ring() {  # $1=min $2=max
+  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    "${MPI_BASE[@]}" \
+    -x NCCL_CUMEM_ENABLE=0 \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x NCCL_GIN_ENABLE=0 \
+    -x NCCL_GIN_TYPE=0 \
+    -x NCCL_MIN_NCHANNELS="${TEST1_NCHANNELS}" \
+    -x NCCL_MAX_NCHANNELS="${TEST1_NCHANNELS}" \
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 0 -D 0 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
+}
+_a2a_host_ce() {  # $1=min $2=max
+  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    "${MPI_BASE[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x NCCL_GIN_ENABLE=0 \
+    -x NCCL_GIN_TYPE=0 \
+    -x NCCL_CTA_POLICY=ZERO \
+    rccl-tests/alltoall_perf -b "$1" -e "$2" -f 2 -g 1 -R 2 -D 0 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
+}
+
+# --- UT: GIN-SDMA host policy unit tests (no GPU); optional preflight gate ---
+# Validates the shared tier-selection / threshold / chunk logic that the device
+# kernels rely on. Fast, GPU-free but OFF by default: the gin_sdma_policy_test
+# binary is not built into the current image, so the gate would abort the run.
+# Set RUN_POLICY_UT=1 to enable once the binary is present in the image.
+POLICY_UT="${POLICY_UT:-rccl-tests/gin_sdma_policy_test}"
+if [[ "${RUN_POLICY_UT:-0}" != "0" ]]; then
+  echo "=== UT: host policy unit tests (${POLICY_UT}) ==="
+  ${DOCKER_CMD} run --rm --init "${DOCKER_IMAGE}" "${POLICY_UT}" \
+    || { echo "FATAL: GIN-SDMA policy unit tests failed"; exit 1; }
+fi
+
+if _run_test 1; then
+  _trace_on
+  TEST1_NCHANNELS="${TEST1_NCHANNELS:-32}"
+  TEST1_MODE="${TEST1_MODE:-ring}"
+  case "${TEST1_MODE}" in
+    ring)
+      echo "=== Test#1: A2A, ${NP} gpus, Host Initiated RING (channels=${TEST1_NCHANNELS}) ==="
+      _a2a_host_ring 128 "${MAX_BYTES}"
+      ;;
+    ce)
+      echo "=== Test#1: A2A, ${NP} gpus, Host Initiated CE/SDMA ==="
+      _a2a_host_ce 128 "${MAX_BYTES}"
+      ;;
+    hybrid)
+      # RING for <=split, CE/SDMA for >split. Default split 32M; CE phase
+      # starts at the next f2 step (2*split). Override split with
+      # TEST1_HYBRID_SPLIT (bytes).
+      TEST1_HYBRID_SPLIT="${TEST1_HYBRID_SPLIT:-33554432}"
+      _ce_min=$(( TEST1_HYBRID_SPLIT * 2 ))
+      echo "=== Test#1a: A2A, ${NP} gpus, Host Initiated HYBRID/RING (channels=${TEST1_NCHANNELS}) 128..${TEST1_HYBRID_SPLIT} ==="
+      _a2a_host_ring 128 "${TEST1_HYBRID_SPLIT}"
+      echo "=== Test#1b: A2A, ${NP} gpus, Host Initiated HYBRID/CE-SDMA ${_ce_min}..${MAX_BYTES} ==="
+      _a2a_host_ce "${_ce_min}" "${MAX_BYTES}"
+      ;;
+    *)
+      echo "error: TEST1_MODE must be ring, hybrid, or ce" >&2
+      exit 1
+      ;;
+  esac
+  _trace_off
+fi
+
+if _run_test 2; then
+  _trace_on
+  echo "=== Test#2: A2A, ${NP} gpus, GIN Host Proxy (NCCL_GIN_TYPE=2) ==="
+  ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST2_VOLUMES} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    "${MPI_BASE[@]}" \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x NCCL_NET_PLUGIN=none \
+    -x NCCL_ENV_PLUGIN=none \
+    -x ROCSHMEM_SDMA_ENABLED=0 \
+    -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
+    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_TYPE=2 \
+    -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
+  _trace_off
+fi
+
+if _should_run_test4; then
+  _trace_on
+  echo "=== Test#4: A2A, ${NP} gpus, GIN GDA ==="
+  ${DOCKER_CMD} run ${DOCKER_GPU} "${DOCKER_IMAGE}" \
+    mpirun -n "${NP}" ${MPI_OPT} \
+    "${MPI_BASE[@]}" \
+    "${GIN_PLUGIN_X[@]}" \
+    -x NCCL_CUMEM_ENABLE=1 \
+    -x NCCL_NET_PLUGIN=none \
+    -x ROCSHMEM_SDMA_ENABLED=1 \
+    -x NCCL_GIN_ENABLE=1 \
+    -x NCCL_GIN_TYPE=4 \
+    rccl-tests/alltoall_perf -b 128 -e "${MAX_BYTES}" -f 2 -g 1 -R 2 -D 3 -A 1 -V 1 -w "${A2A_WARMUP}" -n "${A2A_ITERS}"
+  _trace_off
+fi
+
+if _should_run_test5; then
+  _trace_on
+  # GinAlltoAllKernel (-D 3): one gin.put per peer + waitSignal + flush.
+  # Anvil-SDMA backend (NCCL_GIN_TYPE=6) uses IPC flat stores for small
+  # messages and SDMA for larger puts (segmented at 128 MiB in the plugin).
+  NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-128}"
+  TEST5_MODE="${TEST5_MODE:-d3}"
+  TEST5_D3_CTA_COUNT="${TEST5_D3_CTA_COUNT:-${TEST5_CTA_COUNT:-1}}"
+  TEST5_D4_CTA_COUNT="${TEST5_D4_CTA_COUNT:-${TEST5_CTA_COUNT:-8}}"
+  TEST5_CUDAGRAPH="${TEST5_CUDAGRAPH:-0}"
+  TEST5_WARMUP="${TEST5_WARMUP:-${A2A_WARMUP}}"
+  TEST5_ITERS="${TEST5_ITERS:-${A2A_ITERS}}"
+  TEST5_GRAPH_ARGS=()
+  if [[ "${TEST5_CUDAGRAPH}" != 0 ]]; then
+    TEST5_GRAPH_ARGS=(-G "${TEST5_CUDAGRAPH}")
+    if [[ "${TEST5_WARMUP}" == 0 ]]; then
+      echo "warning: TEST5_CUDAGRAPH>0 with TEST5_WARMUP=0 can fail graph capture; using -w 1" >&2
+      TEST5_WARMUP=1
+    fi
+  fi
+  _a2a_gin() {  # $1=deviceImpl $2=ctaCount $3=minBytes $4=maxBytes
+    ${DOCKER_CMD} run ${DOCKER_GPU}${DOCKER_TEST5_MLX5_VOLUMES} "${DOCKER_IMAGE}" \
+      mpirun -n "${NP}" ${MPI_OPT} \
+      "${MPI_BASE[@]}" \
+      "${GIN_PLUGIN_X[@]}" \
+      -x NCCL_CUMEM_ENABLE=1 \
+      -x NCCL_NET_PLUGIN=none \
+      -x ROCSHMEM_SDMA_ENABLED=0 \
+      -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
+      -x NCCL_GIN_ENABLE=1 \
+      -x NCCL_GIN_TYPE=6 \
+      -x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}" \
+      -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
+      -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
+      rccl-tests/alltoall_perf -b "$3" -e "$4" -f 2 -g 1 -R 2 -D "$1" -A 1 -V "$2" \
+      -w "${TEST5_WARMUP}" -n "${TEST5_ITERS}" "${TEST5_GRAPH_ARGS[@]}"
+  }
+  case "${TEST5_MODE}" in
+    d3)
+      echo "=== Test#5: A2A, ${NP} gpus, GinAlltoAllKernel -D 3 (NCCL_GIN_TYPE=6, V=${TEST5_D3_CTA_COUNT}, threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}B) ==="
+      _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
+      ;;
+    d4)
+      echo "=== Test#5: A2A, ${NP} gpus, HybridAlltoAllKernel -D 4 (NCCL_GIN_TYPE=6, V=${TEST5_D4_CTA_COUNT}) ==="
+      _a2a_gin 4 "${TEST5_D4_CTA_COUNT}" 128 "${MAX_BYTES}"
+      ;;
+    *)
+      echo "error: TEST5_MODE must be d3 or d4" >&2
+      exit 1
+      ;;
+  esac
+  _trace_off
+fi
