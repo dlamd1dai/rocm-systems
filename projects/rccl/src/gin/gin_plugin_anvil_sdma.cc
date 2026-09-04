@@ -179,13 +179,13 @@ static ncclResult_t ginAnvilListen(void* ctx, int dev, void* handle, void** list
   return ncclSuccess;
 }
 
-static int ginAnvilEnvInt(const char* name, int defaultVal) {
+// Shared by the boolean NCCL_GIN_ANVIL_SDMA_* switches below. An explicit "0"
+// turns the switch off; any other parseable non-zero value turns it on.
+static uint32_t ginAnvilEnvBool(const char* name, uint32_t defaultVal) {
   const char* e = getenv(name);
-  if (e && e[0]) {
-    int v = atoi(e);
-    return v > 0 ? v : defaultVal;
-  }
-  return defaultVal;
+  if (!e || !e[0]) return defaultVal;
+  if (e[0] == '0' && e[1] == '\0') return 0;
+  return atoi(e) != 0 ? 1u : 0u;
 }
 
 // Backend gin.put inline-vs-copy-engine threshold. Parsed as 64-bit so a value
@@ -211,24 +211,15 @@ static int ginAnvilSdmaNumChannels() {
 }
 
 static uint32_t ginAnvilFusedSignalFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL");
-  if (!e || !e[0]) return NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL", NCCL_GIN_ANVIL_SDMA_FUSED_SIGNAL_DEFAULT);
 }
 
 static uint32_t ginAnvilIpcAgentFenceFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_IPC_AGENT_FENCE");
-  if (!e || !e[0]) return 0;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_IPC_AGENT_FENCE", 0);
 }
 
 static uint32_t ginAnvilIpcSignalPeerFromEnv() {
-  const char* e = getenv("NCCL_GIN_ANVIL_SDMA_SIGNAL_IPC");
-  if (!e || !e[0]) return 0;
-  if (e[0] == '0' && e[1] == '\0') return 0;
-  return atoi(e) != 0 ? 1u : 0u;
+  return ginAnvilEnvBool("NCCL_GIN_ANVIL_SDMA_SIGNAL_IPC", 0);
 }
 
 static ncclResult_t ginAnvilConnect(void* ctx, void* handles[], int nranks, int rank, void* listenComm,
