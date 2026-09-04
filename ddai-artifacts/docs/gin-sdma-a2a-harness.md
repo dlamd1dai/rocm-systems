@@ -24,7 +24,7 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 | AllGather smoke | `gin-sdma-ag-test.bash` in build script | **Removed** (A2A-only) |
 | Default NP | 8 | **4** (1p4g MI455 starter) |
 | Default GPU | gfx950 | **gfx1250** (override with `GPU_TARGETS=gfx950` for MI355) |
-| RCCL install | `-DENABLE_ROCSHMEM_GIN=ON` cmake option | **`--rocshmem-gin`** install.sh flag |
+| RCCL install | `-DENABLE_ROCSHMEM_GIN=ON` cmake option | **`--rocshmem-gin`** (device linker **ON**; do not pass `--no-device-linker`) |
 | Image tag | `rccl-gin-gda-sdma-713` | **`rccl-gin-sdma-a2a-mi455`** |
 
 ## Quick start

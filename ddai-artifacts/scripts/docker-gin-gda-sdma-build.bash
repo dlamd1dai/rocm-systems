@@ -101,8 +101,8 @@ ${DOCKER_CMD} build -f ${DOCKERFILE_PATH} -t ${DOCKER_IMAGE} \
     --build-arg RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS=${RCCL_IMAGE_REQUIRE_MLX5_DMABUF_SYMBOLS} \
     --build-arg RCCL_CACHE_BUST=$((RCCL_CACHE_BUST++)) \
     --build-arg ROCSHMEM_CACHE_BUST=$((ROCSHMEM_CACHE_BUST++)) \
-    .
-${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null
+    . || exit 1
+${DOCKER_CMD} image inspect "${DOCKER_IMAGE}" >/dev/null || exit 1
 
 # Post-build runtime smoke: minimal Test#5 (NCCL_GIN_TYPE=6, GinAlltoAllKernel -D 3).
 RCCL_IMAGE_GIN_SMOKE="${RCCL_IMAGE_GIN_SMOKE:-1}"
