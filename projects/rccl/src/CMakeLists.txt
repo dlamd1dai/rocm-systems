@@ -829,12 +829,10 @@ if(ENABLE_DEVICE_LINKER)
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_alltoall_fabric_ll128\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_reduce_scatter_fabric_ll\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_reduce_scatter_fabric_ll128\\.cu\\.cpp$")
-  # ce_reduce.cc is now pure host code (a dispatcher calling into the
-  # per-instantiation launchers generated under gensrc/ce_reduce/, which are
-  # excluded above by the "gensrc/.*\\.cpp$" filter and compiled separately
-  # by cmake/DeviceLinker.cmake). It stays in the main target and is
-  # compiled --offload-host-only like ce_coll.cc.
-  message(STATUS "Device Linker: filtered HIP_SOURCES (removed device .cpp under gensrc/ + subdirs, common.cu, onerank.cu, collectives.cc, dda_all_reduce_ipc.cu.cpp, dda_reduce_scatter_ipc.cu.cpp, dda_all_gather_ipc.cu.cpp, dda_alltoall_ipc.cu.cpp, dda_all_reduce_fabric.cu.cpp, dda_all_reduce_fabric_ll.cu.cpp, dda_reduce_scatter_fabric.cu.cpp, dda_all_gather_fabric.cu.cpp, dda_all_gather_fabric_ll.cu.cpp, dda_alltoall_fabric.cu.cpp)")
+  # gin_anvil_conn_check_device.cc defines __global__ conn-check kernels; compiled
+  # as a standalone fat object by DeviceLinker.cmake (like ce_reduce TUs).
+  list(FILTER HIP_SOURCES EXCLUDE REGEX "gin_anvil_conn_check_device\\.cc$")
+  message(STATUS "Device Linker: filtered HIP_SOURCES (removed device .cpp under gensrc/ + subdirs, common.cu, onerank.cu, collectives.cc, dda_all_reduce_ipc.cu.cpp, dda_reduce_scatter_ipc.cu.cpp, dda_all_gather_ipc.cu.cpp, dda_alltoall_ipc.cu.cpp, dda_all_reduce_fabric.cu.cpp, dda_all_reduce_fabric_ll.cu.cpp, dda_reduce_scatter_fabric.cu.cpp, dda_all_gather_fabric.cu.cpp, dda_all_gather_fabric_ll.cu.cpp, dda_alltoall_fabric.cu.cpp, gin_anvil_conn_check_device.cc)")
 endif()
 
 # Create an initial git_version.cpp file (that will be updated with latest git version)

@@ -1001,6 +1001,36 @@ foreach(_ce_reduce_src IN LISTS _ce_reduce_srcs)
 endforeach()
 
 # ===========================================================================
+# GIN Anvil-SDMA conn-check kernels (ginAnvilConnWrite/CheckKernel).
+# Host launchers and __global__ kernels live in gin_anvil_conn_check_device.cc;
+# the main rccl target compiles with --offload-host-only, so compile this TU
+# standalone with full HIP offload (mirrors ce_reduce fat objects).
+# ===========================================================================
+set(GIN_ANVIL_CONN_CHECK_FAT_OBJ "")
+if(ENABLE_ROCSHMEM_GIN)
+  set(GIN_ANVIL_CONN_CHECK_FAT_OBJ "${DEVICE_BUILD_DIR}/gin_anvil_conn_check_device.o")
+  add_custom_command(
+    OUTPUT  ${GIN_ANVIL_CONN_CHECK_FAT_OBJ}
+    COMMAND ${DL_CLANG}
+      -x hip ${DL_OFFLOAD_ARCH_FLAGS}
+      ${DL_HIP_COMPILER_FLAGS}
+      -DRCCL_DEVICE_LINKER
+      -DENABLE_ROCSHMEM_GIN
+      ${_link_def_flags}
+      ${_host_inc_flags}
+      ${DL_OPT_FLAGS}
+      -std=c++17
+      -fPIC
+      -w
+      -c -o ${GIN_ANVIL_CONN_CHECK_FAT_OBJ}
+      ${HIPIFY_DIR}/src/gin/gin_anvil_conn_check_device.cc
+    DEPENDS ${HIPIFY_DIR}/src/gin/gin_anvil_conn_check_device.cc
+    COMMENT "DL compile: gin_anvil_conn_check_device.cc (GIN conn-check kernels)"
+    VERBATIM
+  )
+endif()
+
+# ===========================================================================
 # Symmetric kernels: per-instantiation device TUs from gensrc/symmetric/.
 # Each instantiation file defines a handful of __global__ ncclSymkDevKernel_*
 # entries. Compiled standalone as multi-arch fat objects, mirroring onerank.o.
@@ -1114,7 +1144,7 @@ endif()
 # Top-level target
 # ===========================================================================
 add_custom_target(device_linker_build ALL
-  DEPENDS ${COMMON_FAT_OBJ} ${ONERANK_FAT_OBJ} ${COLLECTIVES_FAT_OBJ} ${DDA_ALL_REDUCE_IPC_FAT_OBJ} ${DDA_REDUCE_SCATTER_IPC_FAT_OBJ} ${DDA_ALL_GATHER_IPC_FAT_OBJ} ${DDA_ALLTOALL_IPC_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_LL_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_LL128_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_LL_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_LL128_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_LL_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_LL128_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_LL_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_LL128_FAT_OBJ} ${CE_REDUCE_FAT_OBJS} ${SYM_FAT_OBJS} ${GIN_ALLTOALL_SDMA_FAT_OBJ}
+  DEPENDS ${COMMON_FAT_OBJ} ${ONERANK_FAT_OBJ} ${COLLECTIVES_FAT_OBJ} ${DDA_ALL_REDUCE_IPC_FAT_OBJ} ${DDA_REDUCE_SCATTER_IPC_FAT_OBJ} ${DDA_ALL_GATHER_IPC_FAT_OBJ} ${DDA_ALLTOALL_IPC_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_LL_FAT_OBJ} ${DDA_ALL_REDUCE_FABRIC_LL128_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_LL_FAT_OBJ} ${DDA_ALL_GATHER_FABRIC_LL128_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_LL_FAT_OBJ} ${DDA_ALLTOALL_FABRIC_LL128_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_LL_FAT_OBJ} ${DDA_REDUCE_SCATTER_FABRIC_LL128_FAT_OBJ} ${CE_REDUCE_FAT_OBJS} ${SYM_FAT_OBJS} ${GIN_ALLTOALL_SDMA_FAT_OBJ} ${GIN_ANVIL_CONN_CHECK_FAT_OBJ}
 )
 add_dependencies(device_linker_build hipify_all copy_nccl_device_headers)
 if((ENABLE_ROCSHMEM OR ENABLE_ROCSHMEM_GIN) AND TARGET rocshmem_static)
@@ -1128,6 +1158,7 @@ set(DEVICE_LINKER_OBJECTS
   ${ONERANK_FAT_OBJ}
   ${COLLECTIVES_FAT_OBJ}
   ${CE_REDUCE_FAT_OBJS}
+  ${GIN_ANVIL_CONN_CHECK_FAT_OBJ}
   ${DDA_ALL_REDUCE_IPC_FAT_OBJ}
   ${DDA_REDUCE_SCATTER_IPC_FAT_OBJ}
   ${DDA_ALL_GATHER_IPC_FAT_OBJ}
