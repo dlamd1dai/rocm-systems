@@ -28,6 +28,27 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 | RCCL install | `-DENABLE_ROCSHMEM_GIN=ON` cmake option | **`--rocshmem-gin`** (device linker **ON**; do not pass `--no-device-linker`) |
 | Image tag | `rccl-gin-gda-sdma-713` | **`rccl-gin-sdma-a2a-mi455`** |
 
+## Current MI455 SUT
+
+| Item | Value |
+|------|--------|
+| Host | `ctheliosp-1b112-a43-1.mnb.dcgpu` |
+| SSH alias | `mi455-sut` (`~/.ssh/config`, `IdentityFile ~/.ssh/id_rsa`) |
+| User | `dondai` |
+| Docker images on SUT | `rccl-gin-sdma-a2a-mi455[:latest]`, `-asan`, `-dbg` |
+
+```bash
+ssh mi455-sut
+# or
+ssh -i ~/.ssh/id_rsa dondai@ctheliosp-1b112-a43-1.mnb.dcgpu
+```
+
+Copy a rebuilt image from the compile host:
+
+```bash
+docker save rccl-gin-sdma-a2a-mi455 | ssh mi455-sut 'docker load'
+```
+
 ## Quick start
 
 From the repo root:
