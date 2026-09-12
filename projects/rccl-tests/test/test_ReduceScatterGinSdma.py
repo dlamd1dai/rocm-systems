@@ -41,7 +41,8 @@
 #   RCCL_TESTS_RS_XENV           extra "-x K=V" env the backend needs
 #   RCCL_TESTS_RS_EXE            path to reduce_scatter_perf
 #   RCCL_TESTS_RS_CTAS           device CTA pool (-V) (default: 8)
-#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 5, Anvil-SDMA on NCCL 2.30.7)
+#   RCCL_TESTS_RS_GIN_TYPE       NCCL_GIN_TYPE (default: 5, Anvil-SDMA on the
+#                                NCCL 2.30.x line; develop shifts it to 6)
 #   RCCL_TESTS_RS_TIMEOUT_S      per-run hang timeout seconds (default: 900)
 #   RCCL_TESTS_RS_CONN_RETRIES   connectivity-gate re-launches (default: 5)
 
@@ -180,6 +181,28 @@ def test_ReduceScatterGinSdmaCtaLadder(request, per_rank_mib, op, dtype):
     rc, _ = _run_rs_gin_sdma(request, per_rank_mib * MiB, dtype, op)
     assert rc == 0, "ReduceScatter datacheck failed at {} MiB/rank op={} dtype={}".format(
         per_rank_mib, op, dtype)
+
+
+@_rs_skip
+@pytest.mark.parametrize("dtype", ["int32", "float"])
+def test_ReduceScatterGinSdmaLowCtaSdma(request, dtype):
+    # Occupancy-cap pin (< 16 CTAs) selects SDMA-scatter + local reduce.
+    saved = os.environ.get("RCCL_TESTS_RS_XENV", "")
+    extra = "NCCL_GIN_ANVIL_RS_CTAS=4"
+    os.environ["RCCL_TESTS_RS_XENV"] = (saved + " " + extra).strip()
+    global RS_XENV
+    RS_XENV = shlex.split(os.environ["RCCL_TESTS_RS_XENV"])
+    try:
+        rc, _ = _run_rs_gin_sdma(request, 1 * MiB, dtype, "sum")
+        assert rc == 0, "ReduceScatter low-CTA SDMA datacheck failed dtype={}".format(dtype)
+        rc, _ = _run_rs_gin_sdma(request, 8 * MiB, dtype, "sum")
+        assert rc == 0, "ReduceScatter low-CTA SDMA mid-band datacheck failed dtype={}".format(dtype)
+    finally:
+        if saved:
+            os.environ["RCCL_TESTS_RS_XENV"] = saved
+        else:
+            os.environ.pop("RCCL_TESTS_RS_XENV", None)
+        RS_XENV = shlex.split(os.environ.get("RCCL_TESTS_RS_XENV", ""))
 
 
 @_rs_skip
