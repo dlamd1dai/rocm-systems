@@ -14,7 +14,8 @@
 #   RS-C2  GIN Anvil-SDMA ReduceScatter (-D 3, NCCL_GIN_TYPE=5, -V 32): every rank
 #          reads its owned output slice directly from EVERY peer's sendbuff via LSA
 #          and folds the N contributions in ascending source-rank order (bit-for-bit
-#          matching rccl-tests' verifiable oracle). SINGLE-TIER balanced LSA
+#          matching rccl-tests' verifiable oracle). CTA-BUDGET HYBRID: at the
+#          default grid (>= 16 CTAs) this is a balanced LSA
 #          read-reduce for all sizes: a grid-stride loop with FULL N-way peer ILP
 #          + source-0 cross-iteration prefetch, which beats the host ring across the
 #          whole >=64 MiB range and matches host DDA in the medium band. (A legacy
@@ -22,6 +23,14 @@
 #          the 8-way grid-stride path now wins at every size; re-enable it at a
 #          chosen MiB crossover via NCCL_GIN_ANVIL_RS_UNROLL_MIN for regression.)
 #          No scratch, no signals, entry LSA barrier only.
+#          When the launch grid is pinned BELOW 16 CTAs (RS_CTAS=4, which maps to
+#          NCCL_GIN_ANVIL_RS_CTAS), the kernel instead scatters each rank's
+#          contributions with gin.put into a registered scratch window and folds
+#          them with a local SM reduce -- the occupancy-starved case where SDMA
+#          engines do work the CUs cannot. That scratch is the GIN resource
+#          window, which is hipMemAllocationTypeUncached under
+#          HIP_VMM_UNCACHED_MEMORY; see reducescatter-gin-sdma-phase2.md for why
+#          that memory type is the coherence risk this mode is meant to probe.
 #
 # The SM reduction mirrors rccl-tests' verifiable oracle exactly (see
 # gin_sdma_reduce.h), so correctness holds across ops/types; fp8 prod & mulsum
@@ -58,6 +67,12 @@ GIN_RANKS="${GIN_RANKS:-2}"
 #   NUM_CHANNELS: keep 1 (extra SDMA queues give no gain and can deadlock the
 #     GIN put tier at chan>=2).
 DEVICE_CTA_COUNT="${DEVICE_CTA_COUNT:-32}"
+# Launch-grid pin for the CTA-budget hybrid tier (NCCL_GIN_ANVIL_RS_CTAS).
+# Unset => size-adaptive LSA read-reduce ladder (32/48 CTAs). Set BELOW
+# kReduceScatterSdmaCtaCeil (16) -- e.g. RS_CTAS=4 -- to select the GIN/SDMA
+# scatter + local SM reduce path (ginReduceScatterSdmaBody). Independent of
+# -V, which only sizes the device CTA pool and must stay >= RS_CTAS.
+RS_CTAS="${RS_CTAS:-}"
 NUM_CHANNELS="${NUM_CHANNELS:-1}"
 FACTOR="${FACTOR:-2}"
 HOST_NCHANNELS="${HOST_NCHANNELS:-32}"
@@ -166,11 +181,17 @@ fi
 
 # --- RS-C2: GIN Anvil-SDMA ReduceScatter kernel (-D 3, NCCL_GIN_TYPE=5) ---
 if [[ "${RUN_GIN_SDMA}" != "0" ]]; then
-  echo "RS-C2: GIN ReduceScatter -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, op ${OP}, single-tier LSA read-reduce)"
+  if [[ -n "${RS_CTAS}" && "${RS_CTAS}" -lt 16 ]]; then
+    _rs_tier="GIN/SDMA scatter + local reduce (RS_CTAS=${RS_CTAS} < ceil 16)"
+  else
+    _rs_tier="LSA read-reduce${RS_CTAS:+ (RS_CTAS=${RS_CTAS})}"
+  fi
+  echo "RS-C2: GIN ReduceScatter -D 3, ${MIN_BYTES}..${MAX_BYTES} (-R ${GIN_RANKS}, -V ${DEVICE_CTA_COUNT}, op ${OP}, ${_rs_tier})"
   _run mpirun -n "${NP}" ${MPI_OPT_RCCL} "${MPI_BASE[@]}" \
     -x NCCL_GIN_PLUGIN=none -x NCCL_CUMEM_ENABLE=1 -x NCCL_NET_PLUGIN=none \
     -x ROCSHMEM_SDMA_ENABLED=0 -x NCCL_GIN_ENABLE=1 -x NCCL_GIN_TYPE=5 \
     -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${NUM_CHANNELS}" \
+    ${RS_CTAS:+-x NCCL_GIN_ANVIL_RS_CTAS="${RS_CTAS}"} \
     ${THRESHOLD:+-x NCCL_GIN_ANVIL_SDMA_THRESHOLD_REDUCESCATTER="${THRESHOLD}"} \
     -x NCCL_GIN_ANVIL_DEVICE_TIMING="${RS_DEVICE_TIMING}" \
     -x NCCL_GIN_ANVIL_RS_DEVTIME_LOOP="${RS_DEVTIME_LOOP}" \
