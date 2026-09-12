@@ -519,16 +519,18 @@ if _should_run_test5; then
   # Anvil-SDMA backend (NCCL_GIN_TYPE=6) uses IPC flat stores for small
   # messages and SDMA for larger puts (segmented at 128 MiB in the plugin).
   NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-128}"
-  # Fabric LL vs gin.put/SDMA, total bytes. ALLTOALL overrides when set;
-  # otherwise gin-sdma A2A falls back to RCCL_DDA_LL_THRESHOLD. Default the
-  # DDA fallback to 512 KiB so Test#5 uses the measured gfx1250 crossover
-  # (and so images that still copy DdaLLThreshold pick it up).
-  RCCL_DDA_LL_THRESHOLD="${RCCL_DDA_LL_THRESHOLD:-524288}"
-  TEST5_LL_THRESH="${RCCL_DDA_LL_THRESHOLD}"
+  # Fabric LL vs gin.put/SDMA, total bytes. ALLTOALL overrides when set
+  # (explicit 0 disables LL). Unset uses the library default (256 KiB).
+  RCCL_DDA_LL_THRESHOLD="${RCCL_DDA_LL_THRESHOLD:-65536}"
+  TEST5_LL_THRESH="${RCCL_GIN_FABRIC_LL_THRESHOLD_ALLTOALL:-262144}"
   TEST5_ALLTOALL_LL_X=()
   if [[ -n "${RCCL_GIN_FABRIC_LL_THRESHOLD_ALLTOALL+isset}" ]]; then
     TEST5_ALLTOALL_LL_X=(-x "RCCL_GIN_FABRIC_LL_THRESHOLD_ALLTOALL=${RCCL_GIN_FABRIC_LL_THRESHOLD_ALLTOALL}")
     TEST5_LL_THRESH="${RCCL_GIN_FABRIC_LL_THRESHOLD_ALLTOALL}"
+  fi
+  TEST5_MAX_BPP_X=()
+  if [[ -n "${RCCL_GIN_FABRIC_LL_A2A_MAX_BPP:-}" ]]; then
+    TEST5_MAX_BPP_X=(-x "RCCL_GIN_FABRIC_LL_A2A_MAX_BPP=${RCCL_GIN_FABRIC_LL_A2A_MAX_BPP}")
   fi
   TEST5_MODE="${TEST5_MODE:-d3}"
   TEST5_D3_CTA_COUNT="${TEST5_D3_CTA_COUNT:-${TEST5_CTA_COUNT:-1}}"
@@ -557,6 +559,7 @@ if _should_run_test5; then
       -x NCCL_GIN_TYPE=6 \
       -x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}" \
       "${TEST5_ALLTOALL_LL_X[@]}" \
+      "${TEST5_MAX_BPP_X[@]}" \
       -x RCCL_DDA_LL_THRESHOLD="${RCCL_DDA_LL_THRESHOLD}" \
       -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
@@ -565,7 +568,7 @@ if _should_run_test5; then
   }
   case "${TEST5_MODE}" in
     d3)
-      echo "=== Test#5: A2A, ${NP} gpus, GinAlltoAllKernel -D 3 (NCCL_GIN_TYPE=6, V=${TEST5_D3_CTA_COUNT}, sdmaPut=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}B, llThresh=${TEST5_LL_THRESH}B) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GinAlltoAllKernel -D 3 (NCCL_GIN_TYPE=6, V=${TEST5_D3_CTA_COUNT}, sdmaPut=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}B, llThresh=${TEST5_LL_THRESH}B, maxBpp=${RCCL_GIN_FABRIC_LL_A2A_MAX_BPP:-4}) ==="
       _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     d4)
