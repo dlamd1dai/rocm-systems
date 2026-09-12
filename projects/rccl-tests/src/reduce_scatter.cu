@@ -165,11 +165,17 @@ testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequ
         fprintf(stderr, "This test requires GIN support, but GIN support is not enabled for this communicator.\n");
         return testInvalidUsage;
       }
-      // Cover both the -V/deviceCtaCount launch and the size-adaptive CTA count the
-      // kernel self-selects (reduceScatterCtas, up to reduceScatterMaxCtas()),
-      // decoupled from -V -- the read-reduce indexes devComm.lsaBarrier by blockIdx.x.
-      const int rsBarCtas = (deviceCtaCount > gin_sdma_reducescatter::reduceScatterMaxCtas())
-                              ? deviceCtaCount : gin_sdma_reducescatter::reduceScatterMaxCtas();
+      // Cover the -V/deviceCtaCount launch, the size-adaptive count the kernel
+      // self-selects (reduceScatterCtas, up to reduceScatterMaxCtas()) decoupled
+      // from -V, AND an explicit NCCL_GIN_ANVIL_RS_CTAS pin, which
+      // reduceScatterLaunchCtas honours up to 128. The kernel indexes
+      // devComm.lsaBarrier -- and the SDMA tier's GIN signals -- by blockIdx.x, so
+      // a pin above the registered pool would over-launch and corrupt/hang.
+      const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
+      const int rsLaunchCtas = gin_sdma_reducescatter::reduceScatterLaunchCtas(0, rsCtasEnv);
+      int rsBarCtas = gin_sdma_reducescatter::reduceScatterMaxCtas();
+      if (deviceCtaCount > rsBarCtas) rsBarCtas = deviceCtaCount;
+      if (rsLaunchCtas > rsBarCtas) rsBarCtas = rsLaunchCtas;
       gin_sdma_reducescatter::DevReqs dr = gin_sdma_reducescatter::reduceScatterDevReqs(rsBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
@@ -180,9 +186,7 @@ testResult_t ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequ
       // below kReduceScatterSdmaCtaCeil so GetDevCommRequirements matches the
       // kernel's usesSdmaTier predicate.
       {
-        const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
-        const int launchCtas = gin_sdma_reducescatter::reduceScatterLaunchCtas(0, rsCtasEnv);
-        if (gin_sdma_reducescatter::usesSdmaTier(launchCtas)) {
+        if (gin_sdma_reducescatter::usesSdmaTier(rsLaunchCtas)) {
           g_rsScratchBytes = gin_sdma_reducescatter::reduceScatterSdmaScratchBytes(
               commProperties.nRanks, gin_sdma_reducescatter::kReduceScatterSdmaSlotMaxDefault);
           g_rsScratchReq = {};
@@ -215,8 +219,14 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
   switch(deviceImpl) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7)
     case 3: { // single-tier LSA read-reduce: barriers only, no scratch
-      const int rsBarCtas = (deviceCtaCount > gin_sdma_reducescatter::reduceScatterMaxCtas())
-                              ? deviceCtaCount : gin_sdma_reducescatter::reduceScatterMaxCtas();
+      // Same sizing rule as the >=2.29 arm: an explicit NCCL_GIN_ANVIL_RS_CTAS pin
+      // must be covered too, or a pin above the pool over-launches the blockIdx-
+      // indexed barriers. (No scratch here, so the SDMA tier stays unreachable.)
+      const size_t rsCtasEnv = ReduceScatterParseCtasEnv("NCCL_GIN_ANVIL_RS_CTAS");
+      const int rsLaunchCtas = gin_sdma_reducescatter::reduceScatterLaunchCtas(0, rsCtasEnv);
+      int rsBarCtas = gin_sdma_reducescatter::reduceScatterMaxCtas();
+      if (deviceCtaCount > rsBarCtas) rsBarCtas = deviceCtaCount;
+      if (rsLaunchCtas > rsBarCtas) rsBarCtas = rsLaunchCtas;
       gin_sdma_reducescatter::DevReqs dr = gin_sdma_reducescatter::reduceScatterDevReqs(rsBarCtas);
       reqs->barrierCount = dr.barrierCount;
       reqs->lsaBarrierCount = dr.lsaBarrierCount;
@@ -281,26 +291,39 @@ __device__ __forceinline__ void ginReduceScatterSdmaBody(ncclWindow_t sendwin, s
   const int nRanks = devComm.nRanks;
   const size_t sliceBytes = count * sizeof(T);
   const int ginContext = 0;
-  const unsigned int signalIndex = (unsigned int)blockIdx.x;
+  const int peerStride = (int)gridDim.x;
+  // Put index and wait index are DIFFERENT quantities and must not be conflated.
+  // The put loop below gives block b exactly those r with r == b (mod gridDim),
+  // so the put to rank r is issued by block (r % gridDim) and increments signal
+  // index (r % gridDim) *on r*. gridDim is uniform across ranks, so all nRanks
+  // senders targeting this rank bump the same index here: rank % gridDim.
+  const unsigned int putSignalIndex = (unsigned int)blockIdx.x;
+  const unsigned int waitSignalIndex = (unsigned int)(devComm.rank % peerStride);
   ncclGin gin { devComm, ginContext };
-  const uint64_t signalValue = gin.readSignal(signalIndex);
+  // Baseline must be sampled BEFORE the world barrier: after it a peer's put can
+  // already land, and a late sample would wait for nRanks beyond an inflated base.
+  const uint64_t signalValue = gin.readSignal(waitSignalIndex);
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
 
-  const int peerStride = gridDim.x;
   const size_t dstBase = ncclGetResourceBufferOffset(scratchHandle);
   for (int r = blockIdx.x + (int)threadIdx.x * peerStride; r < nRanks;
        r += peerStride * (int)blockDim.x) {
     gin.put(ncclTeamWorld(devComm), r,
         devComm.resourceWindow, dstBase + (size_t)devComm.rank * sliceBytes,
         sendwin, sendoffset + (size_t)r * sliceBytes,
-        sliceBytes, ncclGin_SignalInc{signalIndex});
+        sliceBytes, ncclGin_SignalInc{putSignalIndex});
   }
   __syncthreads();
 
-  if (blockIdx.x == (devComm.rank % peerStride))
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + (uint64_t)nRanks);
+  // EVERY block waits. The fold below reads all nRanks slots, but only blocks
+  // with blockIdx < nRanks issue any put, so guarding this wait on a single
+  // block let the surplus blocks race straight into unwritten scratch -- the
+  // per-blockIdx lsaBarrier cannot substitute, as it orders block b ACROSS
+  // ranks, never blocks within a rank. waitSignal is a non-destructive
+  // wait-until->=, so all CTAs polling one index is safe and needs no decrement.
+  gin.waitSignal(ncclCoopCta(), waitSignalIndex, signalValue + (uint64_t)nRanks);
   gin.flush(ncclCoopCta());
 
   ncclTeam lsa = ncclTeamLsa(devComm);
