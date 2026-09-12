@@ -282,49 +282,76 @@ bool ReduceScatterGetDevCommRequirements(int deviceImpl, ncclDevCommRequirements
 // (see the file-top note). The sdmaThreshold/scratch launch args are retained for
 // ABI compatibility but unused.
 // Low-occupancy SDMA-scatter + local reduce. Each rank GIN-puts send slice r to
-// rank r's resource-window slot [myRank], waits for nRanks inbound completions,
-// then SM-reduces the N local slots into recvbuff (same ascending-source fold as
-// the LSA path). waitSignal + flush make the SDMA writes visible before the
-// local LSA barrier joins sibling CTAs onto the reduce.
+// rank r's resource-window slot [myRank], waits for the inbound completions, then
+// SM-reduces the N local slots into recvbuff (same ascending-source fold as the
+// LSA path). waitSignal + flush make the SDMA writes visible before the local LSA
+// barrier joins sibling CTAs onto the reduce.
+//
+// PARTITIONING: by output CHUNK, not by peer. Block b owns the byte range
+// [b*chunk, b*chunk+chunkLen) of the per-rank slice and drives it end to end --
+// it puts that range to every peer, waits for that range from every peer, then
+// folds only that range. This is what makes the wait sound, and it is not
+// interchangeable with a peer-partitioned put:
+//
+//   * Signal index == blockIdx, so index b is touched ONLY by puts issued by
+//     block b of the senders. The entry barrier is an ncclBarrierSession indexed
+//     by blockIdx, i.e. it syncs block b across ranks. Together those two facts
+//     order every sender's block b strictly after THIS rank's block b has
+//     sampled its baseline, which is the only reason readSignal is race-free.
+//     Sampling any index other than blockIdx has no such ordering: a late block
+//     can sample after peer puts have already landed, inflating its baseline, and
+//     then wait for nRanks increments that will never come (observed as a hang).
+//   * Every block has inbound traffic on its own index (one arrival per sender),
+//     so every block has something to wait for. Under the old peer-partitioned
+//     put, rank R was targeted exclusively by block (R % gridDim) of the senders,
+//     so only ONE index per rank ever moved and only that one block could wait --
+//     while every block folded all nRanks slots. The surplus blocks read scratch
+//     that no put had written yet. The per-blockIdx lsaBarrier below cannot
+//     substitute for the missing wait: it orders block b ACROSS ranks, never
+//     blocks within a rank.
+//   * Block b folds exactly the range it waited for. Folding outside that range
+//     would again read bytes whose arrival nothing has proven.
+//
+// chunk is 128 B aligned so every put and every 16 B fold pack stays aligned.
+// sliceBytes and gridDim are uniform across ranks, so a block whose chunk is
+// empty is empty on every rank: it puts nothing, is sent nothing, waits for
+// nothing and folds nothing, consistently everywhere.
 template <typename T>
 __device__ __forceinline__ void ginReduceScatterSdmaBody(ncclWindow_t sendwin, size_t sendoffset, ncclWindow_t recvwin, size_t recvoffset, size_t count, struct ncclDevComm devComm, int redOp, ncclDevResourceHandle scratchHandle) {
   const int nRanks = devComm.nRanks;
   const size_t sliceBytes = count * sizeof(T);
   const int ginContext = 0;
-  const int peerStride = (int)gridDim.x;
-  // Put index and wait index are DIFFERENT quantities and must not be conflated.
-  // The put loop below gives block b exactly those r with r == b (mod gridDim),
-  // so the put to rank r is issued by block (r % gridDim) and increments signal
-  // index (r % gridDim) *on r*. gridDim is uniform across ranks, so all nRanks
-  // senders targeting this rank bump the same index here: rank % gridDim.
-  const unsigned int putSignalIndex = (unsigned int)blockIdx.x;
-  const unsigned int waitSignalIndex = (unsigned int)(devComm.rank % peerStride);
+  const int nBlocks = (int)gridDim.x;
+  const size_t chunk =
+      ((sliceBytes + (size_t)nBlocks - 1) / (size_t)nBlocks + 127) & ~(size_t)127;
+  const size_t chunkOff = (size_t)blockIdx.x * chunk;
+  const size_t chunkLen = (chunkOff >= sliceBytes)
+                            ? 0
+                            : ((sliceBytes - chunkOff < chunk) ? sliceBytes - chunkOff : chunk);
+
   ncclGin gin { devComm, ginContext };
-  // Baseline must be sampled BEFORE the world barrier: after it a peer's put can
-  // already land, and a late sample would wait for nRanks beyond an inflated base.
-  const uint64_t signalValue = gin.readSignal(waitSignalIndex);
+  // Own index only, and strictly BEFORE the barrier below -- see the header note.
+  const uint64_t signalValue = gin.readSignal(blockIdx.x);
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
 
   const size_t dstBase = ncclGetResourceBufferOffset(scratchHandle);
-  for (int r = blockIdx.x + (int)threadIdx.x * peerStride; r < nRanks;
-       r += peerStride * (int)blockDim.x) {
-    gin.put(ncclTeamWorld(devComm), r,
-        devComm.resourceWindow, dstBase + (size_t)devComm.rank * sliceBytes,
-        sendwin, sendoffset + (size_t)r * sliceBytes,
-        sliceBytes, ncclGin_SignalInc{putSignalIndex});
+  if (chunkLen != 0) {
+    for (int r = (int)threadIdx.x; r < nRanks; r += (int)blockDim.x) {
+      gin.put(ncclTeamWorld(devComm), r,
+          devComm.resourceWindow, dstBase + (size_t)devComm.rank * sliceBytes + chunkOff,
+          sendwin, sendoffset + (size_t)r * sliceBytes + chunkOff,
+          chunkLen, ncclGin_SignalInc{(unsigned int)blockIdx.x});
+    }
   }
   __syncthreads();
 
-  // EVERY block waits. The fold below reads all nRanks slots, but only blocks
-  // with blockIdx < nRanks issue any put, so guarding this wait on a single
-  // block let the surplus blocks race straight into unwritten scratch -- the
-  // per-blockIdx lsaBarrier cannot substitute, as it orders block b ACROSS
-  // ranks, never blocks within a rank. waitSignal is a non-destructive
-  // wait-until->=, so all CTAs polling one index is safe and needs no decrement.
-  gin.waitSignal(ncclCoopCta(), waitSignalIndex, signalValue + (uint64_t)nRanks);
-  gin.flush(ncclCoopCta());
+  // chunkLen is block-uniform, so these CTA-collective calls stay convergent.
+  if (chunkLen != 0) {
+    gin.waitSignal(ncclCoopCta(), blockIdx.x, signalValue + (uint64_t)nRanks);
+    gin.flush(ncclCoopCta());
+  }
 
   ncclTeam lsa = ncclTeamLsa(devComm);
   ncclLsaBarrierSession<ncclCoopCta> lsaBar { ncclCoopCta(), devComm, lsa, devComm.lsaBarrier, blockIdx.x };
@@ -333,11 +360,13 @@ __device__ __forceinline__ void ginReduceScatterSdmaBody(ncclWindow_t sendwin, s
   constexpr int VEC = (sizeof(T) <= 16) ? (int)(16 / sizeof(T)) : 1;
   struct alignas(16) Pack { T e[VEC]; };
   Pack* dstP = (Pack*)ncclGetLocalPointer(recvwin, recvoffset);
-  const size_t nPacks = count / (size_t)VEC;
   char* scratchBase = (char*)ncclGetResourceBufferLocalPointer(devComm, scratchHandle);
-  const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-  const int nthreads = blockDim.x * gridDim.x;
-  for (size_t pk = (size_t)tid; pk < nPacks; pk += (size_t)nthreads) {
+  // Exactly this block's chunk -- the only bytes its waitSignal proved landed.
+  // chunkOff is 128 B aligned so it divides sizeof(Pack); a sub-pack tail at the
+  // very end is dropped as before (count is a multiple of VEC in practice).
+  const size_t pkBegin = chunkOff / sizeof(Pack);
+  const size_t pkEnd = (chunkOff + chunkLen) / sizeof(Pack);
+  for (size_t pk = pkBegin + (size_t)threadIdx.x; pk < pkEnd; pk += (size_t)blockDim.x) {
     T acc[VEC];
     Pack v0 = ((const Pack*)(scratchBase + 0 * sliceBytes))[pk];
     #pragma unroll
