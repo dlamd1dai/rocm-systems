@@ -276,6 +276,10 @@ using gin::fabric::kGinFabricLlA2ADefaultMaxBpp;
 using gin::fabric::ginFabricLlAlltoAllBlocksPerPeer;
 using gin::fabric::ginFabricLlAlltoAllEligible;
 
+static bool AlltoAllGinFabricLlTypeOk(ncclDataType_t type) {
+  return type == ncclFloat32 || type == ncclFloat16 || type == ncclBfloat16;
+}
+
 // Cap on fabric-LL blocks-per-peer (1–8). Default 4. Hard max 8.
 static int AlltoAllGinFabricLlMaxBpp() {
   static int cached = -1;
@@ -305,7 +309,7 @@ struct AlltoAllFabricLlGateCache {
 static bool AlltoAllGinFabricLLEligibleHost(ncclDevComm* devComm, size_t count, ncclDataType_t type) {
   static AlltoAllFabricLlGateCache cache{};
   if (!devComm || devComm->ginHandles[0] == nullptr) return false;
-  const bool dtypeOk = (type == ncclFloat32 || type == ncclFloat16 || type == ncclBfloat16);
+  const bool dtypeOk = AlltoAllGinFabricLlTypeOk(type);
   if (!dtypeOk || count == 0) return false;
 
   if (cache.valid && cache.devComm == devComm && cache.count == count && cache.type == type) {
@@ -612,12 +616,14 @@ testResult_t AlltoAllRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, 
 #if defined(ENABLE_DEVICE_API) && NCCL_VERSION_CODE >= NCCL_VERSION(2,28,7) && defined(NCCL_OS_LINUX)
       case 3: {
         ncclDevComm* devComm = (ncclDevComm*)comm;
-        if (type == ncclFloat32) {
-          TESTCHECK(AlltoAllLaunchGinA2A<float>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
-        } else if (type == ncclFloat16) {
-          TESTCHECK(AlltoAllLaunchGinA2A<half>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
-        } else if (type == ncclBfloat16) {
-          TESTCHECK(AlltoAllLaunchGinA2A<bf16>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
+        if (AlltoAllGinFabricLlTypeOk(type)) {
+          if (type == ncclFloat32) {
+            TESTCHECK(AlltoAllLaunchGinA2A<float>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
+          } else if (type == ncclFloat16) {
+            TESTCHECK(AlltoAllLaunchGinA2A<half>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
+          } else {
+            TESTCHECK(AlltoAllLaunchGinA2A<bf16>(sendbuff, sendoffset, recvbuff, recvoffset, count, devComm, stream));
+          }
         } else {
           TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(GinAlltoAllPutKernel, type, op), sendbuff, sendoffset,
                                            recvbuff, recvoffset, count, type, op, root, comm, stream));

@@ -217,12 +217,17 @@ if (ENABLE_DEVICE_API)
     add_definitions(-DENABLE_DEVICE_API)
 endif()
 
+# Mono-repo RCCL sources for device-API / GIN headers. Not gated on rocshmem.
+get_filename_component(_mono_root "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
+if (NOT RCCL_SOURCE_DIR AND EXISTS "${_mono_root}/projects/rccl/CMakeLists.txt")
+    set(RCCL_SOURCE_DIR "${_mono_root}/projects/rccl")
+endif()
+
 if (ENABLE_ROCSHMEM_GIN)
     message(STATUS "rocshmem GIN backend support enabled")
     add_definitions(-DENABLE_ROCSHMEM_GIN)
 
     # Auto-detect paths from mono-repo layout
-    get_filename_component(_mono_root "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
     if (NOT ROCSHMEM_INSTALL_DIR)
         if(EXISTS "${_mono_root}/projects/rccl/ext/rocshmem/lib/librocshmem.a")
             set(ROCSHMEM_INSTALL_DIR "${_mono_root}/projects/rccl/ext/rocshmem")
@@ -231,9 +236,6 @@ if (ENABLE_ROCSHMEM_GIN)
             message(FATAL_ERROR "ENABLE_ROCSHMEM_GIN is ON but ROCSHMEM_INSTALL_DIR is not set "
                     "and no install found at ${_mono_root}/projects/rccl/ext/rocshmem")
         endif()
-    endif()
-    if (NOT RCCL_SOURCE_DIR AND EXISTS "${_mono_root}/projects/rccl/CMakeLists.txt")
-        set(RCCL_SOURCE_DIR "${_mono_root}/projects/rccl")
     endif()
     if (NOT ROCSHMEM_SOURCE_DIR AND EXISTS "${_mono_root}/projects/rocshmem/CMakeLists.txt")
         set(ROCSHMEM_SOURCE_DIR "${_mono_root}/projects/rocshmem")
