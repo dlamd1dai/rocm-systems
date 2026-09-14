@@ -193,6 +193,7 @@ set(SRC_FILES
   include/gin/gin_host_anvil_sdma.h
   include/gin/gin_fabric_a2a_host.h
   include/gin/gin_fabric_a2a_publish.h
+  include/gin/gin_devcomm_rollback.h
   include/hip_rocm_version_info.h
   include/ibvcore.h
   include/ibvsymbols.h

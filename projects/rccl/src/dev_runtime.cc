@@ -21,6 +21,7 @@
 #include "gin/gin_host_win_stub.h"
 #else
 #include "gin/gin_host.h"
+#include "gin/gin_devcomm_rollback.h"
 #endif
 #ifdef ENABLE_ROCSHMEM_GIN
 #include "gin/gin_host_anvil_sdma.h"
@@ -1844,11 +1845,7 @@ fail:
   if (ginDevCommReady) {
     (void)ncclGinDevCommFree(comm, outDevComm);
     ginDevCommReady = false;
-    outDevComm->ginContextCount = 0;
-    memset(outDevComm->ginHandles, 0, sizeof(outDevComm->ginHandles));
-    memset(outDevComm->ginNetDeviceTypes, 0, sizeof(outDevComm->ginNetDeviceTypes));
-    outDevComm->resourceWindow = nullptr;
-    outDevComm->resourceWindow_inlined = {};
+    ncclGinDevCommClearGinFields(outDevComm);
   }
   CUDACHECKIGNORE(cudaThreadExchangeStreamCaptureMode(&captureMode));
   return ret;

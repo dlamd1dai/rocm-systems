@@ -39,6 +39,7 @@ struct State {
   bool fabricVmmQueryOk = true;
   bool fabricRetainOk = true;
   int bootstrapDissentingRank = -1;
+  bool cuMemEnabled = true;
 };
 
 struct FakeSdmaOpaque {
@@ -68,6 +69,7 @@ void SetFabricPeerStride(size_t stride) { g.fabricPeerStride = stride; }
 void SetFabricVmmQueryOk(bool ok) { g.fabricVmmQueryOk = ok; }
 void SetFabricRetainOk(bool ok) { g.fabricRetainOk = ok; }
 void SetBootstrapDissentingRank(int rank) { g.bootstrapDissentingRank = rank; }
+void SetCuMemEnabled(bool enabled) { g.cuMemEnabled = enabled; }
 
 }  // namespace GinAnvilPluginStubs
 
@@ -243,10 +245,12 @@ extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle)
 
 #include "algorithms/dda/fabric/fabric_init.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
+#include "nccl_device/gin/anvil_sdma/gin_fabric_ll_policy.h"
 
 bool ginAnvilUseFabricMem(struct ncclComm* comm) {
-  (void)comm;
-  return GinAnvilPluginStubs::g.useFabricMem;
+  if (comm == nullptr) return false;
+  return ginAnvilUseFabricMemPredicate(GinAnvilPluginStubs::g.useFabricMem, comm->clique.size, comm->nRanks,
+                                       GinAnvilPluginStubs::g.cuMemEnabled);
 }
 
 ncclFabricMemHandler::ncclFabricMemHandler(void* bootstrap, int rank, int nranks, struct ncclMemManager* manager)
