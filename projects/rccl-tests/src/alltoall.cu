@@ -274,7 +274,7 @@ using bf16 = __nv_bfloat16;
 using gin::fabric::kGinFabricLlAgMaxBlocksPerPeer;
 using gin::fabric::kGinFabricLlA2ADefaultMaxBpp;
 using gin::fabric::ginFabricLlAlltoAllBlocksPerPeer;
-using gin::fabric::ginFabricLlAlltoAllSizeOk;
+using gin::fabric::ginFabricLlAlltoAllEligible;
 
 // Cap on fabric-LL blocks-per-peer (1–8). Default 4. Hard max 8.
 static int AlltoAllGinFabricLlMaxBpp() {
@@ -292,18 +292,52 @@ static int AlltoAllGinFabricLlMaxBpp() {
   return cached;
 }
 
+struct AlltoAllFabricLlGateCache {
+  ncclDevComm* devComm;
+  size_t count;
+  ncclDataType_t type;
+  bool eligible;
+  bool valid;
+};
+
 // --device_timing still uses a gin.put-only 1D timed kernel; skip it when the
 // production path would take fabric LL. Production does not use this helper.
 static bool AlltoAllGinFabricLLEligibleHost(ncclDevComm* devComm, size_t count, ncclDataType_t type) {
+  static AlltoAllFabricLlGateCache cache{};
   if (!devComm || devComm->ginHandles[0] == nullptr) return false;
-  if (!(type == ncclFloat32 || type == ncclFloat16 || type == ncclBfloat16) || count == 0) return false;
+  const bool dtypeOk = (type == ncclFloat32 || type == ncclFloat16 || type == ncclBfloat16);
+  if (!dtypeOk || count == 0) return false;
+
+  if (cache.valid && cache.devComm == devComm && cache.count == count && cache.type == type) {
+    return cache.eligible;
+  }
+
+  cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(nullptr, &captureStatus) == cudaSuccess &&
+      captureStatus != cudaStreamCaptureStatusNone) {
+    return cache.valid && cache.devComm == devComm ? cache.eligible : false;
+  }
+
   ncclGinAnvilSdmaGPUContext ctx{};
   if (cudaMemcpy(&ctx, devComm->ginHandles[0], sizeof(ctx), cudaMemcpyDeviceToHost) != cudaSuccess) {
     return false;
   }
-  if (ctx.layoutMagic != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC || ctx.fabricA2AEnabled == 0) return false;
-  return ginFabricLlAlltoAllSizeOk(devComm->nRanks, count * wordSize(type), ctx.fabricA2ALlThreshold,
-                                   ctx.fabricA2AScratchBytes);
+  if (ctx.layoutMagic != NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC || ctx.fabricA2AEnabled == 0) {
+    cache = {devComm, count, type, false, true};
+    return false;
+  }
+
+  ncclGinFabricA2ALane lane{};
+  lane.enabled = 1;
+  lane.peerScratch = ctx.fabricA2APeerScratch;
+  lane.llEpoch = ctx.fabricA2ALlEpoch;
+  lane.llEpochLen = ctx.fabricA2ALlEpochLen;
+  lane.scratchBytes = ctx.fabricA2AScratchBytes;
+  lane.llThreshold = ctx.fabricA2ALlThreshold;
+
+  const bool eligible = ginFabricLlAlltoAllEligible(lane, devComm->nRanks, count, wordSize(type), dtypeOk);
+  cache = {devComm, count, type, eligible, true};
+  return eligible;
 }
 #endif
 

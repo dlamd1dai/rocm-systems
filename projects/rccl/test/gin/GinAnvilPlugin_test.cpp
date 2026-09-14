@@ -503,6 +503,25 @@ TEST_F(GinAnvilPluginTest, QueryFabricA2ALaneGuards) {
   EXPECT_EQ(lane.enabled, 0);
 }
 
+TEST_F(GinAnvilPluginTest, RegMrSym_FabricMixedVoteAborts) {
+  GinAnvilPluginStubs::SetUseFabricMem(true);
+  GinAnvilPluginStubs::SetFabricVmmQueryOk(true);
+  GinAnvilPluginStubs::SetFabricRetainOk(true);
+  GinAnvilPluginStubs::SetBootstrapDissentingRank(1);
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll, 4);
+
+  void* data = reinterpret_cast<void*>(0x80001000ULL);
+  void* mh = nullptr;
+  void* gh = nullptr;
+  EXPECT_EQ(plugin_.regMrSym(coll, data, 4096, 0, 0, &mh, &gh), ncclSystemError);
+
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
 TEST_F(GinAnvilPluginTest, RegMrSym_FabricRefcountAndExchangeFail) {
   GinAnvilPluginStubs::SetUseFabricMem(true);
   GinAnvilPluginStubs::SetFabricVmmQueryOk(true);
