@@ -5,9 +5,11 @@
  ************************************************************************/
 
 #include "gin/gin_fabric_a2a_host.h"
-#include "gin/gin_devcomm_rollback.h"
+
+#include "alloc.h"
 #include "bootstrap.h"
 #include "comm.h"
+#include "gin/gin_devcomm_rollback.h"
 #include "nccl_device/impl/comm__types.h"
 
 #include <cstring>

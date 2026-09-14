@@ -8,15 +8,18 @@
 
 #include "gin_anvil_plugin_test_stubs.h"
 
-#include <gin_anvil/sdma_factory.h>
-
 #include "alloc.h"
+#include "algorithms/dda/fabric/fabric_init.h"
+#include "algorithms/dda/fabric/fabric_mem_handler.h"
 #include "bootstrap.h"
 #include "debug.h"
 #include "dev_runtime.h"
+#include "nccl_device/gin/anvil_sdma/gin_fabric_ll_policy.h"
 
+#include <gin_anvil/sdma_factory.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_runtime_api.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -243,19 +246,23 @@ extern "C" int gin_anvil_sdma_get_channel_stride(gin_anvil_sdma_handle_t handle)
   return handle ? reinterpret_cast<GinAnvilPluginStubs::FakeSdmaOpaque*>(handle)->sdmaChannelStride : 0;
 }
 
-#include "algorithms/dda/fabric/fabric_init.h"
-#include "algorithms/dda/fabric/fabric_mem_handler.h"
-#include "nccl_device/gin/anvil_sdma/gin_fabric_ll_policy.h"
-
 bool ginAnvilUseFabricMem(struct ncclComm* comm) {
   if (comm == nullptr) return false;
   return ginAnvilUseFabricMemPredicate(GinAnvilPluginStubs::g.useFabricMem, comm->clique.size, comm->nRanks,
                                        GinAnvilPluginStubs::g.cuMemEnabled);
 }
 
-ncclFabricMemHandler::ncclFabricMemHandler(void* bootstrap, int rank, int nranks, struct ncclMemManager* manager)
-  : bootstrap_(bootstrap), rank_(rank), nranks_(nranks), manager_(manager), selfPtr_(nullptr), selfHandle_{},
-    selfSize_(0), memPtrs_(static_cast<size_t>(nranks), nullptr), exchanged_(false) {}
+ncclFabricMemHandler::ncclFabricMemHandler(void* bootstrap, int rank, int nranks,
+                                           struct ncclMemManager* manager)
+    : bootstrap_(bootstrap),
+      rank_(rank),
+      nranks_(nranks),
+      manager_(manager),
+      selfPtr_(nullptr),
+      selfHandle_{},
+      selfSize_(0),
+      memPtrs_(static_cast<size_t>(nranks), nullptr),
+      exchanged_(false) {}
 
 ncclFabricMemHandler::~ncclFabricMemHandler() {}
 
@@ -278,6 +285,7 @@ ncclResult_t ncclFabricMemHandler::exchangeMemPtrs() {
 ncclResult_t ncclFabricMemHandler::getPeerDeviceMemPtr(int peerRank, void** outPeerPtr) const {
   if (!outPeerPtr || peerRank < 0 || peerRank >= nranks_) return ncclInvalidArgument;
   uintptr_t base = reinterpret_cast<uintptr_t>(GinAnvilPluginStubs::g.fabricPeerBase);
-  *outPeerPtr = reinterpret_cast<void*>(base + static_cast<uintptr_t>(peerRank) * GinAnvilPluginStubs::g.fabricPeerStride);
+  *outPeerPtr = reinterpret_cast<void*>(
+      base + static_cast<uintptr_t>(peerRank) * GinAnvilPluginStubs::g.fabricPeerStride);
   return ncclSuccess;
 }
