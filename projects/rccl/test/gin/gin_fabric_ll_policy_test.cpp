@@ -141,3 +141,13 @@ TEST(GinFabricLLPolicy, FabricMemPredicate) {
   EXPECT_FALSE(ginAnvilUseFabricMemPredicate(true, 4, 4, false));
   EXPECT_TRUE(ginAnvilUseFabricMemPredicate(true, 4, 4, true));
 }
+
+TEST(GinFabricLLPolicy, FabricMemFromPartsArchCliqueCuMem) {
+  using gin::fabric::ginAnvilUseFabricMemFromParts;
+  EXPECT_TRUE(ginAnvilUseFabricMemFromParts(/*mnnvl=*/true, /*gfx1250=*/true, /*clique=*/4, /*nRanks=*/4,
+                                            /*cuMem=*/true));
+  EXPECT_FALSE(ginAnvilUseFabricMemFromParts(true, /*gfx1250=*/false, 4, 4, true));
+  EXPECT_FALSE(ginAnvilUseFabricMemFromParts(/*mnnvl=*/false, true, 4, 4, true));
+  EXPECT_FALSE(ginAnvilUseFabricMemFromParts(true, true, /*clique=*/2, 4, true));
+  EXPECT_FALSE(ginAnvilUseFabricMemFromParts(true, true, 4, 4, /*cuMem=*/false));
+}

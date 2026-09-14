@@ -70,6 +70,11 @@ inline bool ginAnvilUseFabricMemPredicate(bool ddaFabricPath, int cliqueSize, in
   return ddaFabricPath && cliqueSize == nRanks && cuMemEnabled;
 }
 
+// Host composition of ginAnvilUseFabricMem: MNNVL + gfx1250 is ncclDdaUseFabricPath.
+inline bool ginAnvilUseFabricMemFromParts(bool mnnvl, bool gfx1250, int cliqueSize, int nRanks, bool cuMemEnabled) {
+  return ginAnvilUseFabricMemPredicate(mnnvl && gfx1250, cliqueSize, nRanks, cuMemEnabled);
+}
+
 inline size_t pickGinFabricLLThresholdAlltoAll(bool alltoallSet, unsigned long long alltoallVal) {
   if (alltoallSet) return (size_t)alltoallVal;
   return kGinFabricLlAlltoAllThresholdDefault;

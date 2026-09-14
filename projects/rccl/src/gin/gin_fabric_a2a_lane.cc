@@ -5,7 +5,7 @@
  ************************************************************************/
 
 #include "gin/gin_fabric_a2a_host.h"
-#include "alloc.h"
+#include "gin/gin_devcomm_rollback.h"
 #include "bootstrap.h"
 #include "comm.h"
 #include "nccl_device/impl/comm__types.h"
@@ -32,6 +32,12 @@ void ncclGinFabricA2ALaneErase(void* ginHandle) {
 void ncclGinFabricA2ALaneClearAll() {
   std::lock_guard<std::mutex> lock(ginFabricA2ALaneMutex);
   ginFabricA2ALanes.clear();
+}
+
+void ncclGinDevCommRollback(struct ncclDevComm* outDevComm) {
+  if (outDevComm == nullptr) return;
+  ncclGinFabricA2ALaneErase(outDevComm->ginHandles[0]);
+  ncclGinDevCommClearGinFields(outDevComm);
 }
 
 ncclResult_t ncclGinFabricA2ALaneAgreeEnabled(struct ncclComm* comm, int localEnabled, int* allEnabled) {

@@ -31,6 +31,9 @@ ncclResult_t ncclGinQueryFabricA2ALane(struct ncclDevComm const* devComm, struct
 void ncclGinFabricA2ALanePublish(void* ginHandle, ncclGinFabricA2ALane const& lane);
 void ncclGinFabricA2ALaneErase(void* ginHandle);
 void ncclGinFabricA2ALaneClearAll();
+// Erase the lane keyed by ginHandles[0] and zero GIN fields on a failed
+// ncclDevrCommCreateInternal path (after ncclGinDevCommSetup succeeded).
+void ncclGinDevCommRollback(struct ncclDevComm* outDevComm);
 // AND-reduce localEnabled across comm->bootstrap (comm->nRanks / comm->rank).
 ncclResult_t ncclGinFabricA2ALaneAgreeEnabled(struct ncclComm* comm, int localEnabled, int* allEnabled);
 #endif

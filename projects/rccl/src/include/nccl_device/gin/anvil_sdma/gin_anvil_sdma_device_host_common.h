@@ -16,6 +16,8 @@ struct ncclGinAnvilIpcBufEntry;
 
 /** Must match host plugin and device kernel build; checked on device. */
 #define NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC 0xA6E17112u
+// Host/device layout size. Bump LAYOUT_MAGIC when this changes.
+#define NCCL_GIN_ANVIL_SDMA_GPU_CONTEXT_SIZE 152
 
 /** Default SDMA threshold (bytes). Transfers of at most this size use inlined IPC flat stores;
  *  larger transfers use direct Anvil SDMA. */
@@ -57,6 +59,11 @@ struct ncclGinAnvilSdmaGPUContext {
   int fabricA2ALlEpochLen;
   uint32_t fabricA2AEnabled;
 };
+
+#if defined(__cplusplus)
+static_assert(sizeof(ncclGinAnvilSdmaGPUContext) == NCCL_GIN_ANVIL_SDMA_GPU_CONTEXT_SIZE,
+              "ncclGinAnvilSdmaGPUContext layout changed; bump NCCL_GIN_ANVIL_SDMA_LAYOUT_MAGIC");
+#endif
 
 struct ncclGinAnvilSdmaMemHandle {
   uintptr_t baseAddr;     // Symmetric LSA flat VA for this rank

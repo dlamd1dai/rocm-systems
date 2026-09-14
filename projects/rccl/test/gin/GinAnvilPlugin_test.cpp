@@ -10,6 +10,7 @@
 
 #include "gin/gin_host_anvil_sdma.h"
 #include "gin/gin_fabric_a2a_host.h"
+#include "gin/gin_devcomm_rollback.h"
 #include "comm.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_ipc_table.h"
 #include "nccl_device/gin/anvil_sdma/gin_anvil_sdma_device_host_common.h"
@@ -279,6 +280,7 @@ TEST_F(GinAnvilPluginTest, CreateContext_EnvAndCounters) {
 TEST_F(GinAnvilPluginTest, CreateContext_PublishesDeviceFabricA2ALane) {
   GinAnvilPluginStubs::SetUseFabricMem(true);
   mockComm_.comm.nRanks = 4;
+  mockComm_.comm.clique.size = 4;
   mockComm_.comm.ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
   mockComm_.comm.ddaPeerPtrsDev = reinterpret_cast<void**>(0x2000);
   mockComm_.comm.ddaLLEpochDev = reinterpret_cast<uint32_t*>(0x3000);
@@ -477,6 +479,66 @@ TEST_F(GinAnvilPluginTest, CloseColl_AfterSignalBind) {
   plugin_.finalize(ictx);
 }
 
+TEST_F(GinAnvilPluginTest, CreateContext_FabricMemCliqueMismatchDisablesLane) {
+  GinAnvilPluginStubs::SetUseFabricMem(true);
+  mockComm_.comm.ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+  mockComm_.comm.ddaPeerPtrsDev = reinterpret_cast<void**>(0x2000);
+  mockComm_.comm.ddaLLEpochDev = reinterpret_cast<uint32_t*>(0x3000);
+  mockComm_.comm.ddaScratch = reinterpret_cast<void*>(0x4000);
+  mockComm_.comm.ddaScratchBytes = static_cast<size_t>(512) * 1024 * 1024;
+  mockComm_.comm.ddaLLEpochLen = 32;
+  mockComm_.comm.clique.size = 2;
+
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll, 4);
+
+  ncclGinConfig_t cfg{};
+  void* ginCtx = nullptr;
+  ncclNetDeviceHandle_v11_t* devHandle = nullptr;
+  ASSERT_EQ(plugin_.createContext(coll, &cfg, &ginCtx, &devHandle), ncclSuccess);
+
+  ncclGinAnvilSdmaGPUContext hostCtx{};
+  ASSERT_EQ(hipMemcpy(&hostCtx, devHandle->handle, sizeof(hostCtx), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(hostCtx.fabricA2AEnabled, 0u);
+
+  plugin_.destroyContext(ginCtx);
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
+TEST_F(GinAnvilPluginTest, CreateContext_FabricMemCuMemOffDisablesLane) {
+  GinAnvilPluginStubs::SetUseFabricMem(true);
+  GinAnvilPluginStubs::SetCuMemEnabled(false);
+  mockComm_.comm.nRanks = 4;
+  mockComm_.comm.clique.size = 4;
+  mockComm_.comm.ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+  mockComm_.comm.ddaPeerPtrsDev = reinterpret_cast<void**>(0x2000);
+  mockComm_.comm.ddaLLEpochDev = reinterpret_cast<uint32_t*>(0x3000);
+  mockComm_.comm.ddaScratch = reinterpret_cast<void*>(0x4000);
+  mockComm_.comm.ddaScratchBytes = static_cast<size_t>(512) * 1024 * 1024;
+  mockComm_.comm.ddaLLEpochLen = 32;
+
+  void* ictx = nullptr;
+  initCtx(&ictx);
+  void* coll = nullptr;
+  connectColl(ictx, &coll, 4);
+
+  ncclGinConfig_t cfg{};
+  void* ginCtx = nullptr;
+  ncclNetDeviceHandle_v11_t* devHandle = nullptr;
+  ASSERT_EQ(plugin_.createContext(coll, &cfg, &ginCtx, &devHandle), ncclSuccess);
+
+  ncclGinAnvilSdmaGPUContext hostCtx{};
+  ASSERT_EQ(hipMemcpy(&hostCtx, devHandle->handle, sizeof(hostCtx), hipMemcpyDeviceToHost), hipSuccess);
+  EXPECT_EQ(hostCtx.fabricA2AEnabled, 0u);
+
+  plugin_.destroyContext(ginCtx);
+  plugin_.closeColl(coll);
+  plugin_.finalize(ictx);
+}
+
 TEST_F(GinAnvilPluginTest, QueryFabricA2ALaneGuards) {
   EXPECT_EQ(ncclGinQueryFabricA2ALane(nullptr, nullptr), ncclInvalidArgument);
 
@@ -503,8 +565,35 @@ TEST_F(GinAnvilPluginTest, QueryFabricA2ALaneGuards) {
   EXPECT_EQ(lane.enabled, 0);
 }
 
+TEST_F(GinAnvilPluginTest, DevCommRollbackErasesLaneAndClearsHandles) {
+  void* handle = reinterpret_cast<void*>(0xBEEF);
+  ncclGinFabricA2ALane published{};
+  published.enabled = 1;
+  published.llThreshold = 4096;
+  ncclGinFabricA2ALanePublish(handle, published);
+
+  ncclDevComm dev{};
+  dev.ginHandles[0] = handle;
+  dev.ginHandles[1] = reinterpret_cast<void*>(0x1);
+  dev.ginContextCount = 3;
+  dev.ginNetDeviceTypes[0] = 6;
+  dev.resourceWindow = reinterpret_cast<ncclWindow_t>(0x2);
+
+  ncclGinDevCommRollback(&dev);
+
+  ncclGinFabricA2ALane lane{};
+  EXPECT_EQ(ncclGinQueryFabricA2ALane(&dev, &lane), ncclSuccess);
+  EXPECT_EQ(lane.enabled, 0);
+  EXPECT_EQ(dev.ginHandles[0], nullptr);
+  EXPECT_EQ(dev.ginHandles[1], nullptr);
+  EXPECT_EQ(dev.ginContextCount, 0u);
+  EXPECT_EQ(dev.ginNetDeviceTypes[0], 0);
+  EXPECT_EQ(dev.resourceWindow, nullptr);
+}
+
 TEST_F(GinAnvilPluginTest, RegMrSym_FabricMixedVoteAborts) {
   GinAnvilPluginStubs::SetUseFabricMem(true);
+  mockComm_.comm.clique.size = 4;
   GinAnvilPluginStubs::SetFabricVmmQueryOk(true);
   GinAnvilPluginStubs::SetFabricRetainOk(true);
   GinAnvilPluginStubs::SetBootstrapDissentingRank(1);
@@ -524,6 +613,7 @@ TEST_F(GinAnvilPluginTest, RegMrSym_FabricMixedVoteAborts) {
 
 TEST_F(GinAnvilPluginTest, RegMrSym_FabricRefcountAndExchangeFail) {
   GinAnvilPluginStubs::SetUseFabricMem(true);
+  mockComm_.comm.clique.size = 1;
   GinAnvilPluginStubs::SetFabricVmmQueryOk(true);
   GinAnvilPluginStubs::SetFabricRetainOk(true);
   void* ictx = nullptr;

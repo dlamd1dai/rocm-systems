@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "common/ProcessIsolatedTestRunner.hpp"
+#include "gin/gin_devcomm_rollback.h"
 
 extern int rcclTestHipMemAddressFreeCount;
 
@@ -250,4 +251,21 @@ TEST(SkipCuMemFreePolicy, IsolatedArchAndEnvBranches) {
           })
           .setVariable("RCCL_TEST_GCN_ARCH", "gfx900")
           .clearVariable("NCCL_CUMEM_SKIP_FREE"));
+}
+
+TEST(GinDevCommRollback, ClearGinFieldsZerosHandlesWithoutGpu) {
+  ncclDevComm dev{};
+  dev.ginHandles[0] = reinterpret_cast<void*>(0x1);
+  dev.ginHandles[1] = reinterpret_cast<void*>(0x2);
+  dev.ginContextCount = 4;
+  dev.ginNetDeviceTypes[0] = 6;
+  dev.resourceWindow = reinterpret_cast<ncclWindow_t>(0x3);
+
+  ncclGinDevCommClearGinFields(&dev);
+
+  EXPECT_EQ(dev.ginHandles[0], nullptr);
+  EXPECT_EQ(dev.ginHandles[1], nullptr);
+  EXPECT_EQ(dev.ginContextCount, 0u);
+  EXPECT_EQ(dev.ginNetDeviceTypes[0], 0);
+  EXPECT_EQ(dev.resourceWindow, nullptr);
 }
