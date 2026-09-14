@@ -24,5 +24,6 @@ void SetFabricPeerBase(void* ptr);
 void SetFabricPeerStride(size_t stride);
 void SetFabricVmmQueryOk(bool ok);
 void SetFabricRetainOk(bool ok);
+void SetBootstrapDissentingRank(int rank);
 
 }  // namespace GinAnvilPluginStubs

@@ -17,6 +17,7 @@
 #include "rccl_common.h"
 #include "nccl_device/gin/anvil_sdma/gin_fabric_ll_policy.h"
 #include "gin/gin_fabric_a2a_host.h"
+#include "gin/gin_fabric_a2a_publish.h"
 #include "compiler.h"
 #include <cmath>
 #include <cstring>
@@ -349,26 +350,13 @@ ncclResult_t ncclGinDevCommSetup(struct ncclComm* comm, struct ncclDevCommRequir
   // Fabric LL lane lives off ncclDevComm (host table keyed by ginHandles[0]).
   // ginAnvilUseFabricMem already requires a single clique; the clique WARN is unreachable.
   if (ginState->ginType == NCCL_GIN_TYPE_ANVIL_SDMA && ginAnvilUseFabricMem(comm)) {
-    ncclGinFabricA2ALane lane{};
-    const gin::fabric::GinFabricA2ACommState commState{
-        comm->ddaFabricMemHandler,
-        (void**)comm->ddaPeerPtrsDev,
-        comm->ddaLLEpochDev,
-        comm->ddaScratch,
-        comm->ddaScratchBytes,
-        comm->ddaLLEpochLen,
-        comm->nRanks};
+    GinFabricA2ALaneBuildResult built{};
     const size_t llThreshold = gin::fabric::resolveGinFabricLLThresholdAlltoAll();
-    const int localEnabled =
-        gin::fabric::ginFabricA2ALaneTryBuild(commState, rcclParamDdaLL() != 0, llThreshold, &lane) ? 1 : 0;
-    int allEnabled = 0;
-    if (ncclGinFabricA2ALaneAgreeEnabled(comm, localEnabled, &allEnabled) != ncclSuccess || !allEnabled) {
-      if (comm->ddaFabricMemHandler == nullptr || comm->ddaPeerPtrsDev == nullptr ||
-          comm->ddaLLEpochDev == nullptr || comm->ddaScratch == nullptr) {
-        WARN("GIN A2A: fabric small-msg lane unavailable: missing DDA fabric resources");
-      }
+    NCCLCHECKGOTO(ginFabricA2ALaneBuildAndAgree(comm, rcclParamDdaLL() != 0, llThreshold, &built), ret, end);
+    if (!built.allEnabled) {
+      ginFabricA2AWarnIfLaneUnavailable(comm, built.allEnabled);
     } else {
-      ncclGinFabricA2ALanePublish(devComm->ginHandles[0], lane);
+      ncclGinFabricA2ALanePublish(devComm->ginHandles[0], built.lane);
       INFO(NCCL_INIT, "GIN A2A: fabric LL small-msg lane enabled (nRanks=%d scratchBytes=%zu llThreshold=%zu)",
            comm->nRanks, comm->ddaScratchBytes, llThreshold);
     }

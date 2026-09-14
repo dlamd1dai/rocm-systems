@@ -14,6 +14,7 @@
 
 #include "gin/gin_host_anvil_sdma.h"
 #include "gin/gin_fabric_a2a_host.h"
+#include "gin/gin_fabric_a2a_publish.h"
 #include "algorithms/dda/fabric/fabric_init.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
 #include "alloc.h"
@@ -125,6 +126,68 @@ struct GinAnvilFabricVote {
   int published;
   uint64_t offset;
 };
+
+struct GinAnvilMrPublishTail {
+  uintptr_t baseAddr;
+  uintptr_t vmmStride;
+};
+
+static ncclResult_t ginAnvilPublishSdmaMemHandleTail(ginAnvilCollCtx* cctx, struct ncclComm* comm,
+                                                     ginAnvilMemHandle* mh, uintptr_t* remote_vas_host,
+                                                     GinAnvilMrPublishTail const& tail, void** mhandle,
+                                                     void** ginHandle) {
+  mh->remote_vas_dev = nullptr;
+  mh->devHandle = nullptr;
+
+  int publishOk = 1;
+  if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
+    mh->devHandle = nullptr;
+    publishOk = 0;
+  }
+  if (publishOk && remote_vas_host == nullptr) publishOk = 0;
+  if (publishOk) {
+    if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess ||
+        hipMemcpy(mh->remote_vas_dev, remote_vas_host, sizeof(uintptr_t) * (size_t)cctx->nranks,
+                  hipMemcpyHostToDevice) != hipSuccess) {
+      publishOk = 0;
+    }
+  }
+  if (comm != nullptr) {
+    const ncclResult_t ag = ginAnvilAllgatherOk(comm, publishOk);
+    if (ag != ncclSuccess) {
+      if (mh->remote_vas_dev) {
+        CUDACHECKIGNORE(hipFree(mh->remote_vas_dev));
+        mh->remote_vas_dev = nullptr;
+      }
+      if (mh->devHandle) {
+        CUDACHECKIGNORE(hipFree(mh->devHandle));
+        mh->devHandle = nullptr;
+      }
+      return ag;
+    }
+  }
+  if (!publishOk) {
+    if (mh->remote_vas_dev) {
+      CUDACHECKIGNORE(hipFree(mh->remote_vas_dev));
+      mh->remote_vas_dev = nullptr;
+    }
+    if (mh->devHandle) {
+      CUDACHECKIGNORE(hipFree(mh->devHandle));
+      mh->devHandle = nullptr;
+    }
+    return ncclSystemError;
+  }
+
+  ncclGinAnvilSdmaMemHandle hostMh;
+  hostMh.baseAddr = tail.baseAddr;
+  hostMh.remote_vas = mh->remote_vas_dev;
+  hostMh.vmmStride = tail.vmmStride;
+  (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
+
+  *mhandle = mh;
+  *ginHandle = mh->devHandle;
+  return ncclSuccess;
+}
 
 static ncclResult_t ginAnvilAllgatherFabricVote(struct ncclComm* comm, GinAnvilFabricVote local,
                                                 int* allPublished) {
@@ -553,66 +616,33 @@ static ncclResult_t ginAnvilRegMrSymFabric(ginAnvilCollCtx* cctx, void* data, si
   mh->lsaSelfAddr = data;
   mh->size = size;
   mh->fabricMem = true;
-  mh->remote_vas_dev = nullptr;
-  mh->devHandle = nullptr;
 
-  int publishOk = 1;
-  if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
-    mh->devHandle = nullptr;
-    publishOk = 0;
-  }
-  if (publishOk) {
-    remote_vas_host = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
-    if (!remote_vas_host) publishOk = 0;
-  }
-  if (publishOk) {
-    for (int pe = 0; pe < cctx->nranks; pe++) {
-      void* peerPtr = nullptr;
-      if (handler->getPeerDeviceMemPtr(pe, &peerPtr) != ncclSuccess || peerPtr == nullptr) {
-        publishOk = 0;
-        break;
-      }
-      remote_vas_host[pe] = reinterpret_cast<uintptr_t>(peerPtr) + offset;
-    }
-  }
-  if (publishOk) {
-    if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess ||
-        hipMemcpy(mh->remote_vas_dev, remote_vas_host, sizeof(uintptr_t) * (size_t)cctx->nranks,
-                  hipMemcpyHostToDevice) != hipSuccess) {
-      publishOk = 0;
-    }
-  }
-  {
-    ncclResult_t ag = ginAnvilAllgatherOk(comm, publishOk);
-    if (ag != ncclSuccess) publishOk = 0;
-  }
-  if (!publishOk) {
-    if (mh->remote_vas_dev) {
-      CUDACHECKIGNORE(hipFree(mh->remote_vas_dev));
-      mh->remote_vas_dev = nullptr;
-    }
-    if (remote_vas_host) free(remote_vas_host);
-    if (mh->devHandle) {
-      CUDACHECKIGNORE(hipFree(mh->devHandle));
-      mh->devHandle = nullptr;
-    }
+  remote_vas_host = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
+  if (!remote_vas_host) {
     std::lock_guard<std::mutex> lock(pluginMutex);
     ginAnvilFabricRefDropLocked(key);
     return ncclSystemError;
   }
-  free(remote_vas_host);
-
-  {
-    ncclGinAnvilSdmaMemHandle hostMh;
-    hostMh.baseAddr = reinterpret_cast<uintptr_t>(data);
-    hostMh.remote_vas = mh->remote_vas_dev;
-    hostMh.vmmStride = 0;
-    (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
+  for (int pe = 0; pe < cctx->nranks; pe++) {
+    void* peerPtr = nullptr;
+    if (handler->getPeerDeviceMemPtr(pe, &peerPtr) != ncclSuccess || peerPtr == nullptr) {
+      free(remote_vas_host);
+      std::lock_guard<std::mutex> lock(pluginMutex);
+      ginAnvilFabricRefDropLocked(key);
+      return ncclSystemError;
+    }
+    remote_vas_host[pe] = reinterpret_cast<uintptr_t>(peerPtr) + offset;
   }
 
-  *mhandle = mh;
-  *ginHandle = mh->devHandle;
-  return ncclSuccess;
+  const ncclResult_t publishRet =
+      ginAnvilPublishSdmaMemHandleTail(cctx, comm, mh, remote_vas_host,
+                                       GinAnvilMrPublishTail{reinterpret_cast<uintptr_t>(data), 0}, mhandle, ginHandle);
+  free(remote_vas_host);
+  if (publishRet != ncclSuccess) {
+    std::lock_guard<std::mutex> lock(pluginMutex);
+    ginAnvilFabricRefDropLocked(key);
+  }
+  return publishRet;
 }
 
 static ncclResult_t ginAnvilRegMrSymLsa(ginAnvilCollCtx* cctx, void* data, size_t size, ginAnvilMemHandle* mh,
@@ -646,43 +676,19 @@ static ncclResult_t ginAnvilRegMrSymLsa(ginAnvilCollCtx* cctx, void* data, size_
   mh->lsaSelfAddr = lsaSelfAddr;
   mh->size = size;
   mh->fabricMem = false;
-  mh->remote_vas_dev = nullptr;
-
-  if (hipMalloc(&mh->devHandle, sizeof(ncclGinAnvilSdmaMemHandle)) != hipSuccess) {
-    return ncclSystemError;
-  }
 
   const ptrdiff_t stride = (ptrdiff_t)devr->bigSize;
   uintptr_t* remote_vas_host = (uintptr_t*)malloc(sizeof(uintptr_t) * (size_t)cctx->nranks);
-  if (!remote_vas_host) {
-    CUDACHECKIGNORE(hipFree(mh->devHandle));
-    return ncclSystemError;
-  }
+  if (!remote_vas_host) return ncclSystemError;
   for (int pe = 0; pe < cctx->nranks; pe++) {
     remote_vas_host[pe] = (uintptr_t)lsaSelfAddr + static_cast<ptrdiff_t>(pe - devr->lsaSelf) * stride;
   }
-  if (hipMalloc(&mh->remote_vas_dev, sizeof(uintptr_t) * (size_t)cctx->nranks) != hipSuccess ||
-      hipMemcpy(mh->remote_vas_dev, remote_vas_host, sizeof(uintptr_t) * (size_t)cctx->nranks, hipMemcpyHostToDevice) !=
-        hipSuccess) {
-    if (mh->remote_vas_dev) {
-      CUDACHECKIGNORE(hipFree(mh->remote_vas_dev));
-      mh->remote_vas_dev = nullptr;
-    }
-    free(remote_vas_host);
-    CUDACHECKIGNORE(hipFree(mh->devHandle));
-    return ncclSystemError;
-  }
+
+  const ncclResult_t publishRet = ginAnvilPublishSdmaMemHandleTail(
+      cctx, nullptr, mh, remote_vas_host, GinAnvilMrPublishTail{(uintptr_t)lsaSelfAddr, (uintptr_t)stride}, mhandle,
+      ginHandle);
   free(remote_vas_host);
-
-  ncclGinAnvilSdmaMemHandle hostMh;
-  hostMh.baseAddr = (uintptr_t)lsaSelfAddr;
-  hostMh.remote_vas = mh->remote_vas_dev;
-  hostMh.vmmStride = stride;
-  (void)hipMemcpy(mh->devHandle, &hostMh, sizeof(ncclGinAnvilSdmaMemHandle), hipMemcpyHostToDevice);
-
-  *mhandle = mh;
-  *ginHandle = mh->devHandle;
-  return ncclSuccess;
+  return publishRet;
 }
 
 static ncclResult_t ginAnvilRegMrSym(void* collComm, void* data, size_t size, int type, uint64_t mrFlags,
@@ -920,25 +926,16 @@ static ncclResult_t ginAnvilCreateContext(void* collComm, ncclGinConfig_t* confi
   ctx->gpuCtxHost.fabricA2AEnabled = 0;
 
   if (ginAnvilUseFabricMem(cctx->comm)) {
+    GinFabricA2ALaneBuildResult built{};
     const size_t llThreshold = gin::fabric::resolveGinFabricLLThresholdAlltoAll();
-    const gin::fabric::GinFabricA2ACommState commState{
-        cctx->comm->ddaFabricMemHandler,
-        (void**)cctx->comm->ddaPeerPtrsDev,
-        cctx->comm->ddaLLEpochDev,
-        cctx->comm->ddaScratch,
-        cctx->comm->ddaScratchBytes,
-        cctx->comm->ddaLLEpochLen,
-        cctx->comm->nRanks};
-    ncclGinFabricA2ALane lane{};
-    const int localEnabled =
-        gin::fabric::ginFabricA2ALaneTryBuild(commState, rcclParamDdaLL() != 0, llThreshold, &lane) ? 1 : 0;
-    int allEnabled = 0;
-    if (ncclGinFabricA2ALaneAgreeEnabled(cctx->comm, localEnabled, &allEnabled) == ncclSuccess && allEnabled) {
-      ctx->gpuCtxHost.fabricA2APeerScratch = lane.peerScratch;
-      ctx->gpuCtxHost.fabricA2ALlEpoch = lane.llEpoch;
-      ctx->gpuCtxHost.fabricA2AScratchBytes = lane.scratchBytes;
-      ctx->gpuCtxHost.fabricA2ALlThreshold = lane.llThreshold;
-      ctx->gpuCtxHost.fabricA2ALlEpochLen = lane.llEpochLen;
+    ret = ginFabricA2ALaneBuildAndAgree(cctx->comm, rcclParamDdaLL() != 0, llThreshold, &built);
+    if (ret != ncclSuccess) goto fail;
+    if (built.allEnabled) {
+      ctx->gpuCtxHost.fabricA2APeerScratch = built.lane.peerScratch;
+      ctx->gpuCtxHost.fabricA2ALlEpoch = built.lane.llEpoch;
+      ctx->gpuCtxHost.fabricA2AScratchBytes = built.lane.scratchBytes;
+      ctx->gpuCtxHost.fabricA2ALlThreshold = built.lane.llThreshold;
+      ctx->gpuCtxHost.fabricA2ALlEpochLen = built.lane.llEpochLen;
       ctx->gpuCtxHost.fabricA2AEnabled = 1;
     }
   }

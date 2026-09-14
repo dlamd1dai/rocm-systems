@@ -38,6 +38,7 @@ struct State {
   size_t fabricPeerStride = 0x1000;
   bool fabricVmmQueryOk = true;
   bool fabricRetainOk = true;
+  int bootstrapDissentingRank = -1;
 };
 
 struct FakeSdmaOpaque {
@@ -66,6 +67,7 @@ void SetFabricPeerBase(void* ptr) { g.fabricPeerBase = ptr; }
 void SetFabricPeerStride(size_t stride) { g.fabricPeerStride = stride; }
 void SetFabricVmmQueryOk(bool ok) { g.fabricVmmQueryOk = ok; }
 void SetFabricRetainOk(bool ok) { g.fabricRetainOk = ok; }
+void SetBootstrapDissentingRank(int rank) { g.bootstrapDissentingRank = rank; }
 
 }  // namespace GinAnvilPluginStubs
 
@@ -147,6 +149,8 @@ ncclResult_t bootstrapAllGather(void* commState, void* allData, int size) {
     for (int i = 0; i < n; ++i) {
       if (devs[i] < 0) devs[i] = 0;
     }
+    const int dr = GinAnvilPluginStubs::g.bootstrapDissentingRank;
+    if (dr >= 0 && dr < n) devs[dr] = 0;
   }
   return ncclSuccess;
 }
