@@ -10,7 +10,7 @@
 # (shared NFS, or this script rsyncs the stage to HOST2).
 #
 # Usage:
-#   HOST2=ctheliosp-1b112-a43-2.mnb.dcgpu bash gin-sdma-a2a-mi455-baremetal-2p8g.bash
+#   HOST2=ctheliosp-rck-g02-j07-02.rck.dcgpu bash gin-sdma-a2a-mi455-baremetal-2p8g.bash
 #   HOSTS=host1:4,host2:4 MAX_BYTES=64M WARMUP=0 ITERS=1 bash gin-sdma-a2a-mi455-baremetal-2p8g.bash
 #   HOSTFILE=/path/hostfile bash gin-sdma-a2a-mi455-baremetal-2p8g.bash
 #   NCCL_IB_DISABLE=0 bash gin-sdma-a2a-mi455-baremetal-2p8g.bash   # if verbs/RoCE is healthy
@@ -181,7 +181,7 @@ if [[ "${NCCL_IB_DISABLE}" == 1 ]]; then
   echo "NOTE: NCCL_IB_DISABLE=1 (MI455 verbs often SEGV). Inter-node AllToAll then needs MNNVL/fabric. Set NCCL_IB_DISABLE=0 if RoCE/IB is healthy."
 fi
 
-MPI_OPT=(--allow-run-as-root -n "${NP}"
+MPI_OPT=(-n "${NP}"
   --map-by "ppr:${PPN}:node"
   --bind-to none
   -mca pml ob1 -mca btl self,vader,tcp

@@ -35,15 +35,15 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 
 | Item | Value |
 |------|--------|
-| Host | `ctheliosp-1b112-a43-1.mnb.dcgpu` |
-| SSH alias | `mi455-sut` (`~/.ssh/config`, `IdentityFile ~/.ssh/id_rsa`) |
+| Host | `ctheliosp-rck-g02-j07-01.rck.dcgpu` (node 1), `ctheliosp-rck-g02-j07-02.rck.dcgpu` (node 2) |
+| SSH alias | `mi455-sut` / `mi455-sut-2` (`~/.ssh/config`, `IdentityFile ~/.ssh/id_rsa`) |
 | User | `dondai` |
-| Docker images on SUT | `rccl-gin-sdma-a2a-mi455[:latest]`, `-asan`, `-dbg` |
+| Docker images on SUT | none yet (copy `rccl-gin-sdma-a2a-mi455` from the compile host) |
 
 ```bash
 ssh mi455-sut
 # or
-ssh -i ~/.ssh/id_rsa dondai@ctheliosp-1b112-a43-1.mnb.dcgpu
+ssh -i ~/.ssh/id_rsa dondai@ctheliosp-rck-g02-j07-01.rck.dcgpu
 ```
 
 Copy a rebuilt image from the compile host:

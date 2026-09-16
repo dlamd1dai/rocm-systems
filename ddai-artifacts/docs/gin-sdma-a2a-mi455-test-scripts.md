@@ -6,7 +6,8 @@ These notes cover the **MI455** launchers under `ddai-artifacts/scripts/`.
 Docker image tag: `rccl-gin-sdma-a2a-mi455`. Device-API kernel: `GinAlltoAllKernel`
 (`-D 3`), `NCCL_GIN_TYPE=6`.
 
-Default 1-node SUT: `ctheliosp-1b112-a43-1.mnb.dcgpu` (ssh alias `mi455-sut`).
+Default 1-node SUT: `ctheliosp-rck-g02-j07-01.rck.dcgpu` (ssh alias `mi455-sut`).
+2p8g pair: `ctheliosp-rck-g02-j07-01.rck.dcgpu` + `ctheliosp-rck-g02-j07-02.rck.dcgpu` (`mi455-sut` / `mi455-sut-2`).
 
 | Script | Mode | Shape | What it runs |
 |--------|------|-------|----------------|
@@ -77,7 +78,7 @@ directory must exist at the **same path** on both nodes (`rsync` unless
 Keep `gin-sdma-a2a-mi455-baremetal-func.bash` next to this script (staging).
 
 ```bash
-HOST2=ctheliosp-1b112-a43-2.mnb.dcgpu \
+HOST2=ctheliosp-rck-g02-j07-02.rck.dcgpu \
   bash ddai-artifacts/scripts/gin-sdma-a2a-mi455-baremetal-2p8g.bash
 
 HOST2=peer MAX_BYTES=64M WARMUP=0 ITERS=1 \

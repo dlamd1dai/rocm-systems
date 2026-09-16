@@ -2,7 +2,7 @@
 # Baremetal 1-process-per-GPU / 4-GPU functional sweep of GIN Anvil-SDMA AllToAll
 # (NCCL_GIN_TYPE=6, GinAlltoAllKernel -D 3) from 128 B to 4 GiB.
 #
-# Intended SUT: ctheliosp-1b112-a43-1.mnb.dcgpu (ssh alias mi455-sut).
+# Intended SUT: ctheliosp-rck-g02-j07-01.rck.dcgpu (ssh alias mi455-sut).
 # This script launches host mpirun against /dev/kfd (no docker run). By default
 # it stages alltoall_perf, librccl, OpenMPI, and the image ROCm userland from
 # DOCKER_IMAGE so the binary matches the PR build. Override ALLTOALL_PERF and
