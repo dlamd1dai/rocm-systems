@@ -198,6 +198,14 @@ fi
 
 [[ -e /dev/kfd ]] || { echo "error: /dev/kfd missing; this is not a GPU node" >&2; exit 1; }
 
+# Used by the 2p8g launcher to reuse this script's image staging without running.
+if [[ "${GIN_A2A_STAGE_ONLY:-0}" == 1 ]]; then
+  echo "Staged ALLTOALL_PERF=${ALLTOALL_PERF}"
+  echo "Staged MPIRUN=${MPIRUN}"
+  echo "Staged STAGE=${STAGE}"
+  exit 0
+fi
+
 MPI_OPT=(--allow-run-as-root -n "${NP}"
   -mca pml ob1 -mca btl self,vader,tcp
   -mca btl_vader_single_copy_mechanism none
