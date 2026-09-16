@@ -86,6 +86,15 @@ if [[ "${RCCL_VERBS_PREFLIGHT}" != 0 && -d /dev/infiniband ]]; then
   unset _rccl_bad_provider
 fi
 
+# Intra-node GIN A2A on MI455 does not need verbs. Honor a caller-forced
+# NCCL_IB_DISABLE even when the preflight did not flag a broken provider
+# (ibv_get_device_list still SEGV on a missing libxdp/bng_re dep).
+if [[ "${NCCL_IB_DISABLE:-0}" == 1 ]]; then
+  RCCL_VERBS_BROKEN=1
+  : "${DOCKER_UVERBS:=0}"
+  export NCCL_IB_DISABLE=1
+fi
+
 if [[ "${RCCL_VERBS_BROKEN}" == 1 ]]; then
   D_INFINIBAND=""
 else
