@@ -13,6 +13,9 @@ Ported and reconciled from `users/dondai/gin-stage3b-sdma-ag-nccl-2.30.7-wip` fo
 | `ddai-artifacts/docker/Dockerfile-rccl-gin-gda-sdma` | **CentOS Stream 9** (default) + TheRock nightly from [nightly.repo.amd.com/rocm/core/tarball](https://nightly.repo.amd.com/rocm/core/tarball/) + rocSHMEM SDMA + RCCL `--rocshmem-gin` + rccl-tests. Ubuntu: `BASE_OS=ubuntu BASE_IMAGE=ubuntu:24.04` |
 | `ddai-artifacts/scripts/docker-gin-gda-sdma-build.bash` | Build wrapper + optional GPU smoke (Test#5) |
 | `ddai-artifacts/scripts/gin-sdma-a2a-test.bash` | Single-node AllToAll perf/compare harness |
+| `ddai-artifacts/scripts/gin-sdma-a2a-mi455-baremetal-func.bash` | Bare-metal 1p4g host `mpirun` functional sweep |
+| `ddai-artifacts/scripts/gin-sdma-a2a-mi455-baremetal-2p8g.bash` | Bare-metal 2p8g host `mpirun` (see [gin-sdma-a2a-mi455-test-scripts.md](gin-sdma-a2a-mi455-test-scripts.md)) |
+| `ddai-artifacts/scripts/gin-sdma-a2a-mi455-run-all.bash` | 1p4g UT + harness matrix on the MI455 SUT |
 | `extra-rdma-debs/` | Optional rdma-core / libbng_re / libmlx5 `.rpm` (CentOS) or `.deb` (Ubuntu) |
 | `ddai-artifacts/c/ddai-rocshmem-hoststub.c` | Host stub for unit tests when rocSHMEM host lib is not linked |
 
@@ -65,6 +68,8 @@ bash ddai-artifacts/scripts/gin-sdma-a2a-test.bash 4 128M
 
 # GIN device API only (Test#5)
 RCCL_GIN_RUN_TESTS=5 bash ddai-artifacts/scripts/gin-sdma-a2a-test.bash 4 1M
+
+# Bare-metal 1p4g / 2p8g (host mpirun): see gin-sdma-a2a-mi455-test-scripts.md
 ```
 
 ## Test matrix (`gin-sdma-a2a-test.bash`)
