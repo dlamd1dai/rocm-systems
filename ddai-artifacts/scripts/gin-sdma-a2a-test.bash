@@ -516,7 +516,7 @@ fi
 if _should_run_test5; then
   _trace_on
   # GinAlltoAllKernel (-D 3): one gin.put per peer + waitSignal + flush.
-  # Anvil-SDMA backend (NCCL_GIN_TYPE=6) uses IPC flat stores for small
+  # Anvil-SDMA backend (NCCL_GIN_TYPE=7) uses IPC flat stores for small
   # messages and SDMA for larger puts (segmented at 128 MiB in the plugin).
   NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD:-128}"
   TEST5_MODE="${TEST5_MODE:-d3}"
@@ -543,7 +543,7 @@ if _should_run_test5; then
       -x ROCSHMEM_SDMA_ENABLED=0 \
       -x NCCL_DEBUG="${NCCL_DEBUG:-VERSION}" \
       -x NCCL_GIN_ENABLE=1 \
-      -x NCCL_GIN_TYPE=6 \
+      -x NCCL_GIN_TYPE=7 \
       -x NCCL_GIN_ANVIL_SDMA_THRESHOLD="${NCCL_GIN_ANVIL_SDMA_THRESHOLD}" \
       -x NCCL_GIN_ANVIL_SDMA_NUM_CHANNELS="${TEST5_NUM_CHANNELS:-1}" \
       -x HSA_FORCE_FINE_GRAIN_PCIE=1 \
@@ -552,11 +552,11 @@ if _should_run_test5; then
   }
   case "${TEST5_MODE}" in
     d3)
-      echo "=== Test#5: A2A, ${NP} gpus, GinAlltoAllKernel -D 3 (NCCL_GIN_TYPE=6, V=${TEST5_D3_CTA_COUNT}, threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}B) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, GinAlltoAllKernel -D 3 (NCCL_GIN_TYPE=7, V=${TEST5_D3_CTA_COUNT}, threshold=${NCCL_GIN_ANVIL_SDMA_THRESHOLD}B) ==="
       _a2a_gin 3 "${TEST5_D3_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     d4)
-      echo "=== Test#5: A2A, ${NP} gpus, HybridAlltoAllKernel -D 4 (NCCL_GIN_TYPE=6, V=${TEST5_D4_CTA_COUNT}) ==="
+      echo "=== Test#5: A2A, ${NP} gpus, HybridAlltoAllKernel -D 4 (NCCL_GIN_TYPE=7, V=${TEST5_D4_CTA_COUNT}) ==="
       _a2a_gin 4 "${TEST5_D4_CTA_COUNT}" 128 "${MAX_BYTES}"
       ;;
     *)
