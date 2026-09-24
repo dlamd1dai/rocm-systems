@@ -1,0 +1,53 @@
+	librccl.so.1 => /pr12137/librccl.so.1 (0x000077d154000000)
+# rccl-tests version 2.19.6-Unknown  rccl-headers=23102 rccl-library=23102
+# Collective test starting: alltoall_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 1073741824 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid     20 on smci350-rck-g03-d07-21 device  0 [0000:05:00] AMD Instinct MI350X
+#  Rank  1 Group  0 Pid     21 on smci350-rck-g03-d07-21 device  1 [0000:15:00] AMD Instinct MI350X
+#  Rank  2 Group  0 Pid     22 on smci350-rck-g03-d07-21 device  2 [0000:65:00] AMD Instinct MI350X
+#  Rank  3 Group  0 Pid     23 on smci350-rck-g03-d07-21 device  3 [0000:75:00] AMD Instinct MI350X
+#  Rank  4 Group  0 Pid     24 on smci350-rck-g03-d07-21 device  4 [0000:85:00] AMD Instinct MI350X
+#  Rank  5 Group  0 Pid     25 on smci350-rck-g03-d07-21 device  5 [0000:95:00] AMD Instinct MI350X
+#  Rank  6 Group  0 Pid     26 on smci350-rck-g03-d07-21 device  6 [0000:e5:00] AMD Instinct MI350X
+#  Rank  7 Group  0 Pid     27 on smci350-rck-g03-d07-21 device  7 [0000:f5:00] AMD Instinct MI350X
+RCCL version : 2.31.2-Unknown 
+HIP version  : 7.16.26332-0000000
+ROCm version : 10.1.0.0-9999-d134b782
+Hostname     : smci350-rck-g03-d07-21
+Librccl path : /pr12137/librccl.so.1
+#
+#                                                                          out-of-place                           in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong      algo     proto   nchannels 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)                                      
+         128             4     float    none      -1    17.60    0.01    0.01       0    17.29    0.01    0.01    N/A A2A-GIN    SIMPLE           0
+         256             8     float    none      -1    17.66    0.01    0.01       0    17.72    0.01    0.01    N/A A2A-GIN    SIMPLE           0
+         512            16     float    none      -1    18.78    0.03    0.02       0    19.07    0.03    0.02    N/A A2A-GIN    SIMPLE           0
+        1024            32     float    none      -1    21.41    0.05    0.04       0    22.44    0.05    0.04    N/A A2A-GIN    SIMPLE           0
+        2048            64     float    none      -1    27.08    0.08    0.07       0    28.55    0.07    0.06    N/A A2A-GIN    SIMPLE           0
+        4096           128     float    none      -1    26.80    0.15    0.13       0    26.76    0.15    0.13    N/A A2A-GIN    SIMPLE           0
+        8192           256     float    none      -1    26.74    0.31    0.27       0    26.64    0.31    0.27    N/A A2A-GIN    SIMPLE           0
+       16384           512     float    none      -1    26.73    0.61    0.54       0    26.75    0.61    0.54    N/A A2A-GIN    SIMPLE           0
+       32768          1024     float    none      -1    26.97    1.21    1.06       0    26.96    1.22    1.06    N/A A2A-GIN    SIMPLE           0
+       65536          2048     float    none      -1    27.09    2.42    2.12       0    26.88    2.44    2.13    N/A A2A-GIN    SIMPLE           0
+      131072          4096     float    none      -1    27.06    4.84    4.24       0    27.14    4.83    4.23    N/A A2A-GIN    SIMPLE           0
+      262144          8192     float    none      -1    27.55    9.51    8.32       0    27.92    9.39    8.22    N/A A2A-GIN    SIMPLE           0
+      524288         16384     float    none      -1    28.69   18.27   15.99       0    28.59   18.34   16.05    N/A A2A-GIN    SIMPLE           0
+     1048576         32768     float    none      -1    30.85   33.99   29.74       0    30.66   34.20   29.92    N/A A2A-GIN    SIMPLE           0
+     2097152         65536     float    none      -1    33.07   63.41   55.49       0    32.85   63.84   55.86    N/A A2A-GIN    SIMPLE           0
+     4194304        131072     float    none      -1    37.54  111.72   97.75       0    37.43  112.06   98.05    N/A A2A-GIN    SIMPLE           0
+     8388608        262144     float    none      -1    46.64  179.87  157.39       0    46.47  180.52  157.95    N/A A2A-GIN    SIMPLE           0
+    16777216        524288     float    none      -1    64.34  260.77  228.17       0    68.85  243.68  213.22    N/A A2A-GIN    SIMPLE           0
+    33554432       1048576     float    none      -1   100.89  332.58  291.01       0   100.41  334.19  292.41    N/A A2A-GIN    SIMPLE           0
+    67108864       2097152     float    none      -1   171.87  390.46  341.66       0   171.87  390.46  341.65    N/A A2A-GIN    SIMPLE           0
+   134217728       4194304     float    none      -1   315.29  425.70  372.49       0   314.96  426.14  372.87    N/A A2A-GIN    SIMPLE           0
+   268435456       8388608     float    none      -1   602.19  445.77  390.05       0   601.88  446.00  390.25    N/A A2A-GIN    SIMPLE           0
+   536870912      16777216     float    none      -1  1176.15  456.47  399.41       0  1176.13  456.47  399.41    N/A A2A-GIN    SIMPLE           0
+  1073741824      33554432     float    none      -1  2321.82  462.46  404.65       0  2322.34  462.35  404.56    N/A A2A-GIN    SIMPLE           0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 116.449 
+#
+# Collective test concluded: alltoall_perf
+#
+
