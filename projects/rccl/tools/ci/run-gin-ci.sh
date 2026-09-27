@@ -23,7 +23,7 @@
 #   GIN_PYTEST_RS_TIMEOUT Wall-clock cap for ReduceScatter pytest (default: 3600s)
 #   GIN_PYTEST_HW_CASES  Broadcast mpirun cases under -k GinSdma (default: 9).
 #                  Offline parser/tier guards do not launch and are not counted.
-#   GIN_PYTEST_RS_HW_CASES  ReduceScatter GinSdma mpirun cases (default: 15).
+#   GIN_PYTEST_RS_HW_CASES  ReduceScatter GinSdma mpirun cases (default: 19).
 #   RCCL_TESTS_BCAST_GIN_TYPE / RCCL_TESTS_RS_GIN_TYPE
 #                  NCCL_GIN_TYPE for Broadcast / ReduceScatter pytest (default: 7,
 #                  NCCL_GIN_TYPE_ANVIL_SDMA)
@@ -47,8 +47,9 @@ GIN_PYTEST_RS_TIMEOUT="${GIN_PYTEST_RS_TIMEOUT:-3600s}"
 # (2 sizes x 3 dtypes) + scatter-allgather + 2 hang guards.
 GIN_PYTEST_HW_CASES="${GIN_PYTEST_HW_CASES:-9}"
 # Hardware launches in test_ReduceScatterGinSdma.py: 12 CTA-ladder
-# (6 size/op pairs x 2 dtypes) + 3 hang-guard dtypes.
-GIN_PYTEST_RS_HW_CASES="${GIN_PYTEST_RS_HW_CASES:-15}"
+# (6 size/op pairs x 2 dtypes) + 4 low-CTA SDMA (2 sizes x 2 dtypes)
+# + 3 hang-guard dtypes.
+GIN_PYTEST_RS_HW_CASES="${GIN_PYTEST_RS_HW_CASES:-19}"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 WORKDIR="$(cd "${script_dir}/../../../.." && pwd)"
