@@ -77,6 +77,7 @@ set(COMMON_FILES
   gin_sdma_broadcast_policy.h
   gin_sdma_devtime.h
   gin_sdma_devtime_host.h
+  gin_sdma_reduce.h
   nccl1_compat.h
   rccl_compat.h
   rccl_float8.h
@@ -199,6 +200,14 @@ add_rccl_test(gather)
 add_rccl_test(hypercube)
 add_rccl_test(reduce_scatter)
 add_rccl_test(reduce)
+if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
+    # GIN-SDMA Reduce (reduce_perf -D 3): same device-RDC link as broadcast_perf
+    # so GinReduceKernel resolves librccl's device API against a GIN-enabled build.
+    target_compile_options(reduce_perf PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
+    target_link_libraries(reduce_perf PRIVATE
+        -Wl,--whole-archive roc::rocshmem -Wl,--no-whole-archive)
+    target_link_options(reduce_perf PRIVATE -fgpu-rdc --hip-link -rdynamic)
+endif()
 add_rccl_test(scatter)
 add_rccl_test(sendrecv)
 add_rccl_test(all_reduce_bias)
