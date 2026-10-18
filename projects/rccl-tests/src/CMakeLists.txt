@@ -196,6 +196,17 @@ if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
     target_link_options(broadcast_perf PRIVATE -fgpu-rdc --hip-link -rdynamic)
 endif()
 add_rccl_test(gather)
+if (ENABLE_ROCSHMEM_GIN AND TARGET roc::rocshmem)
+    # GIN-SDMA hybrid Gather (gather_perf -D 3): same device-RDC link as
+    # all_gather_perf so GinHybridGatherKernel resolves the GIN device backend.
+    if (ENABLE_DEVICE_API)
+      target_compile_definitions(gather_perf PRIVATE ENABLE_DEVICE_API)
+    endif()
+    target_compile_options(gather_perf PRIVATE -fgpu-rdc $<$<CONFIG:Debug>:-ggdb -O0>)
+    target_link_libraries(gather_perf PRIVATE
+        -Wl,--whole-archive roc::rocshmem -Wl,--no-whole-archive)
+    target_link_options(gather_perf PRIVATE -fgpu-rdc --hip-link -rdynamic)
+endif()
 add_rccl_test(hypercube)
 add_rccl_test(reduce_scatter)
 add_rccl_test(reduce)
