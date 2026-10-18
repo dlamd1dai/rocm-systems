@@ -1,0 +1,74 @@
+host: banff-cyxtera-cx56-5
+date: 2026-10-17T00:41:12-05:00
+source_sha:
+76244020a63979c54278e386606f6fdd91e6c8ea
+test(rccl): add MI350P PCIe coverage and an optional CI job (#13054)
+librccl: /home/dondai/mi-red-perf/rccl-install/lib/librccl.so.1
+
+1p8g: 1 node, 8 physical MI300X GPUs in SPX/NPS1 (8 visible devices, no partition selection needed).
+Launch: 8 MPI ranks, 1 GPU per rank (-g 1).
+Sizes: -b 128 -e 4G -f 2. rccl-tests G means 1024^3, so 4G is 4294967296 bytes.
+
+COMMAND:
+LD_LIBRARY_PATH=$HOME/mi-red-perf/rccl-install/lib:/opt/rocm/lib:/opt/ompi4/lib \
+NCCL_DEBUG=VERSION \
+/opt/ompi4/bin/mpirun --bind-to numa -np 8 \
+  -x LD_LIBRARY_PATH -x NCCL_DEBUG \
+  /home/dondai/mi-red-perf/rccl-tests/build/reduce_perf -b 128 -e 4G -f 2 -g 1
+
+OUTPUT:
+# rccl-tests version 2.19.6-:+ rccl-headers=23203 rccl-library=23203
+# Collective test starting: reduce_perf
+# nThread 1 nGpus 1 minBytes 128 maxBytes 4294967296 step: 2(factor) warmup iters: 1 iters: 20 agg iters: 1 validation: 1 graph: 0 unalign: 0
+#
+# Using devices
+#  Rank  0 Group  0 Pid 3366069 on banff-cyxtera-cx56-5 device  0 [0000:0c:00] AMD Instinct MI300X
+#  Rank  1 Group  0 Pid 3366070 on banff-cyxtera-cx56-5 device  1 [0000:22:00] AMD Instinct MI300X
+#  Rank  2 Group  0 Pid 3366071 on banff-cyxtera-cx56-5 device  2 [0000:38:00] AMD Instinct MI300X
+#  Rank  3 Group  0 Pid 3366072 on banff-cyxtera-cx56-5 device  3 [0000:5c:00] AMD Instinct MI300X
+#  Rank  4 Group  0 Pid 3366073 on banff-cyxtera-cx56-5 device  4 [0000:9f:00] AMD Instinct MI300X
+#  Rank  5 Group  0 Pid 3366074 on banff-cyxtera-cx56-5 device  5 [0000:af:00] AMD Instinct MI300X
+#  Rank  6 Group  0 Pid 3366075 on banff-cyxtera-cx56-5 device  6 [0000:bf:00] AMD Instinct MI300X
+#  Rank  7 Group  0 Pid 3366076 on banff-cyxtera-cx56-5 device  7 [0000:df:00] AMD Instinct MI300X
+RCCL version : 2.32.3-Unknown 
+HIP version  : 7.2.26015-fc0010cf6a
+ROCm version : 7.2.0.0-43-fc0010cf6a
+Hostname     : banff-cyxtera-cx56-5
+Librccl path : /home/dondai/mi-red-perf/rccl-install/lib/librccl.so.1
+#
+#                                                                          out-of-place                           in-place
+#       size         count      type   redop    root     time   algbw   busbw  #wrong     time   algbw   busbw  #wrong 
+#        (B)    (elements)                               (us)  (GB/s)  (GB/s)             (us)  (GB/s)  (GB/s)          
+         128            32     float     sum       0    13.13    0.01    0.01       0    11.38    0.01    0.01       0
+         256            64     float     sum       0    13.44    0.02    0.02       0    12.48    0.02    0.02       0
+         512           128     float     sum       0    13.91    0.04    0.04       0    13.01    0.04    0.04       0
+        1024           256     float     sum       0    11.50    0.09    0.09       0    10.82    0.09    0.09       0
+        2048           512     float     sum       0    12.57    0.16    0.16       0    12.68    0.16    0.16       0
+        4096          1024     float     sum       0    12.74    0.32    0.32       0    12.97    0.32    0.32       0
+        8192          2048     float     sum       0    12.48    0.66    0.66       0    12.70    0.65    0.65       0
+       16384          4096     float     sum       0    17.58    0.93    0.93       0    16.12    1.02    1.02       0
+       32768          8192     float     sum       0    16.83    1.95    1.95       0    16.42    2.00    2.00       0
+       65536         16384     float     sum       0    21.26    3.08    3.08       0    20.56    3.19    3.19       0
+      131072         32768     float     sum       0    24.95    5.25    5.25       0    23.45    5.59    5.59       0
+      262144         65536     float     sum       0    23.81   11.01   11.01       0    23.81   11.01   11.01       0
+      524288        131072     float     sum       0    34.63   15.14   15.14       0    34.67   15.12   15.12       0
+     1048576        262144     float     sum       0    46.14   22.73   22.73       0    45.65   22.97   22.97       0
+     2097152        524288     float     sum       0    52.29   40.11   40.11       0    52.09   40.26   40.26       0
+     4194304       1048576     float     sum       0    62.34   67.29   67.29       0    61.79   67.88   67.88       0
+     8388608       2097152     float     sum       0    79.31  105.77  105.77       0    78.82  106.43  106.43       0
+    16777216       4194304     float     sum       0   112.31  149.39  149.39       0   111.10  151.01  151.01       0
+    33554432       8388608     float     sum       0   188.97  177.57  177.57       0   185.86  180.53  180.53       0
+    67108864      16777216     float     sum       0   310.76  215.95  215.95       0   306.47  218.98  218.98       0
+   134217728      33554432     float     sum       0   589.32  227.75  227.75       0   576.82  232.69  232.69       0
+   268435456      67108864     float     sum       0  1086.69  247.02  247.02       0  1066.66  251.66  251.66       0
+   536870912     134217728     float     sum       0  2162.50  248.26  248.26       0  2117.66  253.52  253.52       0
+  1073741824     268435456     float     sum       0  4098.70  261.97  261.97       0  4044.30  265.50  265.50       0
+  2147483648     536870912     float     sum       0  8213.37  261.46  261.46       0  8148.12  263.56  263.56       0
+  4294967296    1073741824     float     sum       0  15768.5  272.38  272.38       0  15790.8  271.99  271.99       0
+# Out of bounds values : 0 OK
+# Avg bus bandwidth    : 90.4322 
+#
+# Collective test concluded: reduce_perf
+#
+
+REDUCE_PERF_RC=0
