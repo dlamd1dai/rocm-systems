@@ -365,7 +365,9 @@ ncclResult_t ncclDevrFinalize(struct ncclComm* comm) {
       // so this is now expected to succeed. Surface failures instead of
       // masking with CUCHECKIGNORE — a regression in the drain path should
       // not be silently swallowed (AICOMRCCL-835).
-      // Temporary ROCM-30633 skip (gfx1250 or NCCL_CUMEM_SKIP_FREE=1); see rcclSkipLsaFlatAddressFree in alloc.h.
+      // RCCL-specific: temporary ROCM-30633 skip (gfx1250 or NCCL_CUMEM_SKIP_FREE=1);
+      // see rcclSkipLsaFlatAddressFree in alloc.h. The NCCL 2.31.2 sync dropped this
+      // once; keep it across future syncs.
       CUdeviceptr flatAddr = reinterpret_cast<CUdeviceptr>(devr->lsaFlatBase);
       size_t flatBytes = devr->lsaSize * devr->bigSize;
       devr->lsaFlatBase = nullptr;
